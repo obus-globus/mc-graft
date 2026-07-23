@@ -109,6 +109,12 @@ public final class LateAttachVerifier {
             Map<String,String[]> removedFields, Map<String,List<String[]>> droppedIfaces) {
         try {
             ClassNode c=new ClassNode(); new ClassReader(bytes).accept(c,0);
+            // The class's OWN declared fields. A reference to a field this class declares itself (owner == this class)
+            // is that local field — never a relocated TARGET field — even when this class extends a target whose
+            // same-named field was relocated (e.g. a mixin class that `extends TargetSuper` and declares a @Unique
+            // field of its own). Without this guard the removed-ref hierarchy walk false-flags the mixin's own field.
+            Set<String> ownFields=new HashSet<>();
+            for(FieldNode f:c.fields) ownFields.add(f.name+" "+f.desc);
             for(FieldNode f:c.fields) scanDesc(owner,artifact,f.name,f.desc,droppedIfaces);
             for(MethodNode m:c.methods) {
                 scanDesc(owner,artifact,m.name,m.desc,droppedIfaces);
@@ -116,7 +122,8 @@ public final class LateAttachVerifier {
                 for(AbstractInsnNode p=m.instructions.getFirst();p!=null;p=p.getNext()) {
                     if(p instanceof FieldInsnNode fi) {
                         scanDesc(owner,artifact,m.name,fi.desc,droppedIfaces);
-                        checkField(owner,artifact,m.name,fi.owner,fi.name,fi.desc,removedFields);
+                        if(!(fi.owner.equals(c.name) && ownFields.contains(fi.name+" "+fi.desc)))
+                            checkField(owner,artifact,m.name,fi.owner,fi.name,fi.desc,removedFields);
                     }
                     else if(p instanceof MethodInsnNode mi) {
                         scanDesc(owner,artifact,m.name,mi.desc,droppedIfaces);
