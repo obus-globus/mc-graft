@@ -51,4 +51,10 @@ interface LoaderPlatform {
 
     /** Coupling #6: read an agent-bundle resource by path (e.g. lb-mixin-targets.txt); null if absent. */
     byte[] bundleResource(String path);
+
+    /** (Fabric-only, opt-in) Register the payload as a synthetic ModContainer in the live Fabric loader so a mod that
+     *  reads its OWN metadata at init — e.g. FabricLoader.getModContainer(id).orElseThrow().getMetadata() — resolves.
+     *  Late-attach builds the loader's mod list before the payload exists, so without this such a lookup throws. No-op
+     *  on loaders without a Fabric mod registry (vanilla/NeoForge). payloadJar is the staged payload jar path. */
+    default void registerPayloadMod(PayloadConfig cfg, Path payloadJar) {}
 }

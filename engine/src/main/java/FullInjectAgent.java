@@ -53,6 +53,7 @@ public class FullInjectAgent {
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
+        if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, lbBundle);   // so the mod's self-metadata lookups resolve
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
             +(cfg.hasEventBootstrap()?" eventBootstrap="+cfg.evtStart+(cfg.hasReadinessProbe()?" (async)":" (sync)"):""));

@@ -334,6 +334,53 @@ final class FabricPlatform implements LoaderPlatform {
         try (InputStream in = knot.getResourceAsStream(path)) { return in==null?null:in.readAllBytes(); } catch(Throwable t){ return null; }
     }
 
+    /** Register the payload as a synthetic ModContainer in the live Fabric loader (opt-in via bootstrap.registerMod
+     *  Container). Late-attach builds the loader's mod list before the payload exists, so a mod that reads its own
+     *  metadata at init (FabricLoader.getModContainer(id).orElseThrow()) throws. Parse its fabric.mod.json into a
+     *  LoaderModMetadata, wrap it in a ModCandidate/ModContainer, and insert into FabricLoaderImpl's modMap+mods.
+     *  Best-effort + idempotent: any failure is logged, not fatal (the injection itself already succeeded). */
+    public void registerPayloadMod(PayloadConfig cfg, Path payloadJar) {
+        try {
+            Class<?> FLI = fc("net.fabricmc.loader.impl.FabricLoaderImpl");
+            Object inst = FLI.getField("INSTANCE").get(null);
+            Object opt = FLI.getMethod("getModContainer", String.class).invoke(inst, cfg.id);
+            if (opt instanceof java.util.Optional<?> o && o.isPresent()) {
+                InjectionLogger.info("ModContainer '"+cfg.id+"' already present; skipping synthetic registration"); return;
+            }
+            byte[] fmj;   // read straight from the payload jar (precise — avoids other mods' fabric.mod.json on the loader)
+            try (JarFile jf = new JarFile(payloadJar.toFile())) {
+                JarEntry e = jf.getJarEntry("fabric.mod.json");
+                if (e == null) throw new IllegalStateException("payload jar has no fabric.mod.json");
+                try (InputStream in = jf.getInputStream(e)) { fmj = in.readAllBytes(); }
+            }
+            Class<?> parser = fc("net.fabricmc.loader.impl.metadata.ModMetadataParser");
+            Class<?> voC = fc("net.fabricmc.loader.impl.metadata.VersionOverrides");
+            Class<?> doC = fc("net.fabricmc.loader.impl.metadata.DependencyOverrides");
+            Class<?> lmmC = fc("net.fabricmc.loader.impl.metadata.LoaderModMetadata");
+            Object vo = voC.getConstructor().newInstance();
+            Object dov = doC.getConstructor(Path.class).newInstance(Path.of(System.getProperty("java.io.tmpdir")));
+            Object meta = parser.getMethod("parseMetadata", InputStream.class, String.class, List.class, voC, doC, boolean.class)
+                .invoke(null, new ByteArrayInputStream(fmj), cfg.id, new ArrayList<String>(), vo, dov, false);
+            Class<?> mcC = fc("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
+            Method createPlain = mcC.getDeclaredMethod("createPlain", List.class, lmmC, boolean.class, java.util.Collection.class);
+            createPlain.setAccessible(true);
+            Object cand = createPlain.invoke(null, List.of(payloadJar), meta, false, List.of());
+            Object container = fc("net.fabricmc.loader.impl.ModContainerImpl").getConstructor(mcC).newInstance(cand);
+            Field modMapF = FLI.getDeclaredField("modMap"); modMapF.setAccessible(true);
+            @SuppressWarnings("unchecked") Map<String,Object> modMap = (Map<String,Object>) modMapF.get(inst);
+            modMap.put(cfg.id, container);
+            Field modsF = FLI.getDeclaredField("mods"); modsF.setAccessible(true);
+            @SuppressWarnings("unchecked") List<Object> mods = (List<Object>) modsF.get(inst);
+            try { mods.add(container); }
+            catch (UnsupportedOperationException e) { List<Object> nm = new ArrayList<>(mods); nm.add(container); modsF.set(inst, nm); }
+            String ver = "?"; try { ver = String.valueOf(lmmC.getMethod("getVersion").invoke(meta)); } catch(Throwable ignore){}
+            InjectionLogger.info("registered synthetic ModContainer for '"+cfg.id+"' ("+ver+")");
+        } catch (Throwable t) {
+            Throwable c = t instanceof InvocationTargetException && t.getCause()!=null ? t.getCause() : t;
+            InjectionLogger.warn("registerModContainer for '"+cfg.id+"' failed (mod self-metadata lookups may throw): "+c.getClass().getSimpleName()+": "+c.getMessage());
+        }
+    }
+
     // ---- reflection helpers -----------------------------------------------------------------------------------------
     private byte[] getRawClassBytes(String internal){ try { return (byte[]) mGetRawBytes.invoke(delegate, internal); } catch(Throwable t){ return null; } }
     private byte[] getPreMixinClassBytes(String internal){ try { return (byte[]) mGetPreMixinBytes.invoke(delegate, internal); } catch(Throwable t){ return null; } }

@@ -50,6 +50,9 @@ public final class PayloadConfig {
     // mid-attach is deferred rather than racing a half-initialized client. null -> the join-gate feature is disabled.
     // (bootstrap.joinGate.screen=net/minecraft/client/gui/screens/ConnectScreen)
     public final String joinGateScreen;
+    // (Fabric) register the payload as a synthetic ModContainer so a mod that reads its own metadata at init (e.g.
+    // FabricLoader.getModContainer(id).orElseThrow()) works on late-attach. (bootstrap.registerModContainer=true)
+    public final boolean registerModContainer;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
@@ -74,6 +77,7 @@ public final class PayloadConfig {
         payloadPackages = csv(p.getProperty("payload.packages", ""));
         gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
+        registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());
     }
 
     /** True when the payload owns a class under one of its declared package roots. Empty roots -> false (callers then
