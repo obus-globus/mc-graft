@@ -1,5 +1,14 @@
 import java.util.zip.ZipFile
 
+buildscript {
+    repositories { mavenCentral() }
+    // ASM on the buildscript classpath so the target-derivation below can read @Mixin annotations from the payload jar.
+    dependencies {
+        classpath("org.ow2.asm:asm:9.10.1")
+        classpath("org.ow2.asm:asm-tree:9.10.1")
+    }
+}
+
 plugins { java }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -52,11 +61,12 @@ tasks.withType<JavaCompile>().configureEach { options.release.set(25) }
 // agentJar — assemble the self-contained injection agent for a given payload.
 //
 //   ./gradlew agentJar -Ppayload=/path/to/mod.jar [-PpayloadLibs=/dir/of/lib/jars] [-PmixinTargets=/path/targets.txt]
-//                      [-PagentName=mymod-inject-agent.jar]
+//                      [-PbootstrapConfig=/path/override.properties] [-PagentName=mymod-inject-agent.jar]
 //
-// The payload's mixin config names, access-widener and client entrypoint are read from its fabric.mod.json at attach
-// time (the agent does the derivation); this build only needs the jar(s). `mixinTargets` (the converter's target class
-// list) is optional — if omitted the agent derives it from the payload's mixin configs.
+// The payload's mixin config names, access-widener and entrypoints are read from its fabric.mod.json; the converter's
+// TARGET-class list is auto-derived from the @Mixin annotations of the classes those configs declare. So a plain
+// `agentJar -Ppayload=mod.jar` needs nothing else. `-PmixinTargets` overrides the derived list (for a mod whose
+// targets need refmap remapping this build can't resolve).
 // ---------------------------------------------------------------------------------------------------------------------
 tasks.register<Jar>("agentJar") {
     group = "mc-graft"
@@ -93,15 +103,22 @@ tasks.register<Jar>("agentJar") {
     val graftProps = layout.buildDirectory.file("agent-tmp/graft.properties").get().asFile
     val bootstrapOverride = (project.findProperty("bootstrapConfig") as String?)?.let { file(it) }
     from(graftProps)
+
+    // Converter TARGET-class list, bundled as mixin-targets.txt. By DEFAULT it is derived from the payload's @Mixin
+    // annotations (see deriveMixinTargets); pass -PmixinTargets=<file> to override with an explicit list.
+    val mixinTargetsOverride = (project.findProperty("mixinTargets") as String?)?.let { f ->
+        file(f).also { if (!it.isFile) throw GradleException("mixinTargets not found: $it") }
+    }
+    val targetsOut = layout.buildDirectory.file("agent-tmp/mixin-targets.txt").get().asFile
+    from(targetsOut)
+
     doFirst {
         graftProps.parentFile.mkdirs()
         graftProps.writeText(deriveGraftProperties(payloadJar, bootstrapOverride))
-    }
-
-    // Optional explicit converter target list (the converter's TARGET class list). Bundled as mixin-targets.txt.
-    (project.findProperty("mixinTargets") as String?)?.let { mt ->
-        val f = file(mt); if (!f.isFile) throw GradleException("mixinTargets not found: $f")
-        from(f) { rename { "mixin-targets.txt" } }
+        val targets = if (mixinTargetsOverride != null) mixinTargetsOverride.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+                      else deriveMixinTargets(payloadJar, mixinConfigsOf(payloadJar))
+        targetsOut.writeText(targets.joinToString("\n") + "\n")
+        println("mc-graft targets: ${targets.size} class(es)" + if (mixinTargetsOverride != null) " (from -PmixinTargets)" else " (auto-derived from @Mixin annotations)")
     }
 
     // Payload mod jar (as agent-libs/payload.jar) + any extra lib jars it owns; the agent stages these onto the live loader.
@@ -155,4 +172,59 @@ fun deriveGraftProperties(payloadJar: File, bootstrapOverride: File?): String {
         "entrypoints(main=${epList("main")}, client=${epList("client")})" +
         if (bootstrapOverride != null) " +override(${bootstrapOverride.name})" else "")
     return sb.toString()
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Auto-derive the converter's TARGET-class list from the payload's mixins: for each mixin config, read the mixin
+// classes it declares and pull the target types out of their @Mixin(value=..., targets=...) annotation. Covers the
+// common case (mods that use @Mixin(Target.class) and/or official-mapping target strings); pass -PmixinTargets to
+// override for mods whose targets need refmap remapping the build can't resolve.
+// ---------------------------------------------------------------------------------------------------------------------
+fun mixinConfigsOf(payloadJar: File): List<String> {
+    val json = ZipFile(payloadJar).use { zf ->
+        val e = zf.getEntry("fabric.mod.json") ?: return emptyList()
+        zf.getInputStream(e).bufferedReader().readText()
+    }
+    @Suppress("UNCHECKED_CAST")
+    val fmj = groovy.json.JsonSlurper().parseText(json) as Map<String, Any?>
+    return (fmj["mixins"] as? List<*>)?.mapNotNull { m ->
+        when (m) { is String -> m; is Map<*, *> -> m["config"] as? String; else -> null }
+    } ?: emptyList()
+}
+
+fun deriveMixinTargets(payloadJar: File, mixinConfigs: List<String>): List<String> {
+    val targets = linkedSetOf<String>()
+    ZipFile(payloadJar).use { zf ->
+        for (cfg in mixinConfigs) {
+            val ce = zf.getEntry(cfg) ?: continue
+            @Suppress("UNCHECKED_CAST")
+            val json = groovy.json.JsonSlurper().parse(zf.getInputStream(ce)) as Map<String, Any?>
+            val pkg = (json["package"] as? String)?.replace('.', '/') ?: continue
+            val names = listOf("mixins", "client", "server").flatMap { k ->
+                (json[k] as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
+            }
+            for (mn in names) {
+                val me = zf.getEntry("$pkg/${mn.replace('.', '/')}.class") ?: continue
+                val cn = org.objectweb.asm.tree.ClassNode()
+                org.objectweb.asm.ClassReader(zf.getInputStream(me).readBytes())
+                    .accept(cn, org.objectweb.asm.ClassReader.SKIP_CODE or org.objectweb.asm.ClassReader.SKIP_DEBUG or org.objectweb.asm.ClassReader.SKIP_FRAMES)
+                val anns = (cn.invisibleAnnotations ?: emptyList()) + (cn.visibleAnnotations ?: emptyList())
+                val mixin = anns.firstOrNull { it.desc == "Lorg/spongepowered/asm/mixin/Mixin;" } ?: continue
+                val vals = mixin.values ?: continue
+                var i = 0
+                while (i + 1 < vals.size) {
+                    val key = vals[i] as? String; val v = vals[i + 1]; i += 2
+                    when (key) {
+                        "value" -> (v as? List<*>)?.forEach { t ->
+                            if (t is org.objectweb.asm.Type && t.sort == org.objectweb.asm.Type.OBJECT) targets.add(t.className)
+                        }
+                        "targets" -> (v as? List<*>)?.forEach { t ->
+                            if (t is String && t.isNotBlank()) targets.add(t.replace('/', '.'))   // official-mapping / already-production names
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return targets.sorted()
 }

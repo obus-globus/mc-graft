@@ -24,18 +24,24 @@ fail-closed verifier gates every conversion; nothing is published until the whol
 # JDK 25 required (agent is compiled to Java 25 bytecode; Sponge-Mixin derives its CompatibilityLevel from it).
 export JAVA_HOME=/path/to/jdk-25
 
+# Minimal: everything else is derived from the mod jar.
+./gradlew agentJar -Ppayload=/path/to/mod.jar
+
+# Full options:
 ./gradlew agentJar \
   -Ppayload=/path/to/mod.jar \                    # the Fabric mod to inject (required)
   -PpayloadLibs=/dir/of/its/runtime/libs \         # optional: the mod's own dependency jars
-  -PmixinTargets=/path/to/targets.txt \            # optional: explicit converter target-class list
   -PbootstrapConfig=/path/to/override.properties \ # optional: init override for entrypoint-less mods
+  -PmixinTargets=/path/to/targets.txt \            # optional: override the auto-derived target list
   -PagentName=mymod-agent.jar
 # -> build/agent/mymod-agent.jar
 ```
 
 The build reads the payload's `fabric.mod.json` and emits `graft.properties` into the agent (mixin configs,
-access-widener, mod id, client/main entrypoints). The engine reads that at attach time — so **grafting a different mod
-is just a different `-Ppayload`**.
+access-widener, mod id, client/main entrypoints), and **auto-derives the converter's target-class list** from the
+`@Mixin(...)` annotations of the classes those mixin configs declare. So **grafting a different mod is just a different
+`-Ppayload`** — no target list to maintain. `-PmixinTargets` is only for the rare mod whose targets need refmap
+remapping the build can't resolve.
 
 ## Attach it
 
@@ -67,7 +73,7 @@ probe before publishing the retransforms. See `examples/liquidbounce/bootstrap.p
 
 ## Examples
 
-- `examples/wurst/` — Wurst 7 (a normal `ModInitializer` mod): `-Ppayload=Wurst-*.jar -PmixinTargets=...`, no override.
+- `examples/wurst/` — Wurst 7 (a normal `ModInitializer` mod): just `-Ppayload=Wurst-*.jar`, everything else derived.
 - `examples/liquidbounce/` — LiquidBounce (no entrypoint; event-driven): add `-PbootstrapConfig=examples/liquidbounce/bootstrap.properties`.
 
 ## Status
