@@ -326,6 +326,9 @@ public class FullInjectAgent {
             java.util.Set<String> dropped = new java.util.TreeSet<>(om); dropped.removeAll(rm);
             java.util.Set<String> added = new java.util.TreeSet<>(rm); added.removeAll(om);
             InjectionLogger.warn("  diag "+internal+": rewrite dropped methods "+dropped+" ; added "+added);
+            int mark = LateAttachVerifier.issueMark();
+            boolean ok = LateAttachVerifier.verifyCaller(internal, o, rw, RetransformConverter.GADDED, RetransformConverter.GFIELD, RetransformConverter.GIFACE);
+            InjectionLogger.warn("  diag verifyCaller="+ok+" newIssues="+LateAttachVerifier.issuesSince(mark));
         } catch (Throwable t) { InjectionLogger.warn("  diag "+internal+" failed: "+rootMsg(t)); }
     }
     static java.util.Set<String> methodSet(byte[] b){ org.objectweb.asm.tree.ClassNode c=new org.objectweb.asm.tree.ClassNode(); new ClassReader(b).accept(c,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);

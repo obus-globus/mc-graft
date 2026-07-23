@@ -55,6 +55,9 @@ public final class LateAttachVerifier {
     }
 
     public static boolean hasErrors() { return errorCount() > 0; }
+    public static int issueMark(){ return ISSUES.size(); }
+    public static java.util.List<String> issuesSince(int mark){ java.util.List<String> out=new java.util.ArrayList<>();
+        for(int i=Math.max(0,mark);i<ISSUES.size();i++){ Issue is=ISSUES.get(i); out.add(is.code()+"/"+is.artifact()+": "+is.message()); } return out; }
     public static int errorCount() { int n=0; for(Issue i:ISSUES) if(i.severity.equals("ERROR")) n++; return n; }
     /** Non-fatal codes: best-effort late-attach residue (an individual hook that could not be (re)transformed live,
      *  e.g. ChatComponent's field-adding mixin, or an incidental on-load transform miss). These are recorded and
