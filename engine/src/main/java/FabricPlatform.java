@@ -73,6 +73,12 @@ final class FabricPlatform implements LoaderPlatform {
             if (isLb) { lbBundle = o; addToClassPath(o, payloadPrefixes(o).toArray(new String[0])); }
             else addToClassPath(o);
             pushed++;
+            // Stage this jar's bundled (jar-in-jar) dependencies too — the Fabric loader would; late-attach must.
+            for (Path nested : FullInjectAgent.extractNestedJars(o, tmp)) {
+                String nb = nested.getFileName().toString();
+                if (onCp.contains(nb.toLowerCase()) || isLoaderProvided(nb)) { skipped++; continue; }
+                addToClassPath(nested); pushed++;
+            }
         } }
         if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         InjectionLogger.info("staged onto Knot: pushed "+pushed+" jar(s), skipped "+skipped+" already-present; Knot="+knot);

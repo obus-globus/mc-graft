@@ -22,7 +22,12 @@ plugins { java }
 
 repositories {
     mavenCentral()
-    maven("https://maven.fabricmc.net/") { name = "FabricMC" }   // sponge-mixin
+    maven("https://maven.fabricmc.net/") { name = "FabricMC" }   // sponge-mixin, fabric-api, fabric-language-kotlin
+    // Modrinth Maven for `maven.modrinth:<slug>:<version>` payload-dependency coordinates.
+    exclusiveContent {
+        forRepository { maven("https://api.modrinth.com/maven") { name = "Modrinth" } }
+        filter { includeGroup("maven.modrinth") }
+    }
 }
 
 val asmVersion = "9.10.1"
@@ -121,9 +126,26 @@ tasks.register<Jar>("agentJar") {
         println("mc-graft targets: ${targets.size} class(es)" + if (mixinTargetsOverride != null) " (from -PmixinTargets)" else " (auto-derived from @Mixin annotations)")
     }
 
-    // Payload mod jar (as agent-libs/payload.jar) + any extra lib jars it owns; the agent stages these onto the live loader.
+    // Payload dependencies declared in the properties — `payload.dependencies=<coords>` in the -PbootstrapConfig file
+    // (comma-separated Maven coordinates; use maven.modrinth:<slug>:<version> for Modrinth mods) and/or -PpayloadDeps.
+    // Resolved from Maven (Central / FabricMC / Modrinth) and bundled non-transitively; the agent stages them AND their
+    // jar-in-jar contents onto the loader, so a payload gets the dependency mods it needs even on a bare instance.
+    val depCoords: List<String> = buildList {
+        (project.findProperty("payloadDeps") as String?)?.split(",")?.forEach { c -> c.trim().takeIf(String::isNotEmpty)?.let { add(it) } }
+        bootstrapOverride?.takeIf { it.isFile }?.readLines()
+            ?.firstOrNull { it.trim().startsWith("payload.dependencies=") }
+            ?.substringAfter("=")?.split(",")?.forEach { c -> c.trim().takeIf(String::isNotEmpty)?.let { add(it) } }
+    }.distinct()
+    val depFiles: FileCollection =
+        if (depCoords.isEmpty()) files()
+        else configurations.detachedConfiguration(*depCoords.map { dependencies.create(it) }.toTypedArray())
+            .also { it.isTransitive = false }
+    if (depCoords.isNotEmpty()) logger.lifecycle("mc-graft payload.dependencies: $depCoords")
+
+    // Payload mod jar (as agent-libs/payload.jar) + declared dependency jars + any extra lib jars it owns.
     into("agent-libs") {
         from(payloadJar) { rename { "payload.jar" } }
+        from(depFiles)
         (project.findProperty("payloadLibs") as String?)?.let { libs ->
             val d = file(libs)
             if (d.isDirectory) from(fileTree(d) { include("*.jar") }) else from(file(libs))

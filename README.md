@@ -63,7 +63,19 @@ payload.mixins             comma-separated mixin config json names
 payload.entrypoints.main   ModInitializer classes (fabric "main")
 payload.entrypoints.client ClientModInitializer classes (fabric "client")
 payload.mixins.neoforge    optional NeoForge-specific mixin config set
+payload.dependencies       external dependency mods to stage, as Maven coordinates (see below)
 ```
+
+**Dependencies.** Late-attach bypasses the Fabric loader, which is what normally unpacks a mod's bundled
+(jar-in-jar) dependencies and its declared dependency mods. mc-graft handles both:
+
+- the agent **recursively stages jar-in-jar** — the payload's own bundled libraries (and any staged dependency mod's
+  nested libraries, e.g. `fabric-language-kotlin` bundling the Kotlin stdlib) are extracted and put on the loader
+  automatically; and
+- **`payload.dependencies`** (in the `-PbootstrapConfig` file, comma-separated Maven coordinates — use
+  `maven.modrinth:<slug>:<version>` for Modrinth mods) declares *external* dependency mods; the build resolves them
+  from Maven Central / FabricMC / Modrinth and bundles them so the agent can stage them on a bare instance.
+  `-PpayloadDeps=<coords>` does the same from the command line, and `-PpayloadLibs=<dir>` bundles local jars directly.
 
 **Bootstrap.** By default the agent initializes the mod by calling its declared Fabric entrypoints
 (`onInitialize` / `onInitializeClient`) — the standard path, and all a normal mod needs. A mod with **no entrypoint**

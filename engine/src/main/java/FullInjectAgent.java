@@ -596,4 +596,24 @@ public class FullInjectAgent {
         return raced==null?resolved:raced;
     }
     static String rootMsg(Throwable t){ while(t.getCause()!=null)t=t.getCause(); return t.getClass().getSimpleName()+": "+t.getMessage(); }
+
+    /** Recursively extract a jar's Fabric jar-in-jar dependencies (META-INF/jars/&lt;name&gt;.jar) into {@code tmpDir},
+     *  returning every nested jar at all levels. Late-attach bypasses the Fabric loader, which is what normally unpacks
+     *  and classpaths a mod's bundled dependencies — so the injector does it here, letting the payload (and any staged
+     *  dependency mod, e.g. fabric-language-kotlin bundling the Kotlin stdlib) bring its own libraries. */
+    static java.util.List<java.nio.file.Path> extractNestedJars(java.nio.file.Path jar, java.nio.file.Path tmpDir) {
+        java.util.List<java.nio.file.Path> out = new ArrayList<>();
+        try (java.util.jar.JarFile jf = new java.util.jar.JarFile(jar.toFile())) {
+            for (var en = jf.entries(); en.hasMoreElements();) {
+                java.util.jar.JarEntry e = en.nextElement(); String n = e.getName();
+                if (!n.startsWith("META-INF/jars/") || !n.endsWith(".jar") || e.isDirectory()) continue;
+                java.nio.file.Path o = tmpDir.resolve(new File(n).getName());
+                try (InputStream in = jf.getInputStream(e)) { java.nio.file.Files.copy(in, o, java.nio.file.StandardCopyOption.REPLACE_EXISTING); }
+                o.toFile().deleteOnExit();
+                out.add(o);
+                out.addAll(extractNestedJars(o, tmpDir));   // nested-of-nested
+            }
+        } catch (Throwable t) { InjectionLogger.warn("jar-in-jar extract failed for "+jar.getFileName()+" -> "+rootMsg(t)); }
+        return out;
+    }
 }

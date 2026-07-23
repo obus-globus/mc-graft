@@ -65,6 +65,11 @@ final class NeoForgePlatform implements LoaderPlatform {
             try (InputStream in = jf.getInputStream(e)) { Files.copy(in, o, StandardCopyOption.REPLACE_EXISTING); } o.toFile().deleteOnExit();
             if (isLb) { lbBundle = o; scanPackages(o, ownedPkgs); }
             urls.add(o.toUri().toURL()); pushed++;
+            // Stage this jar's bundled (jar-in-jar) dependencies too, onto the same LbLoader.
+            for (java.nio.file.Path nested : FullInjectAgent.extractNestedJars(o, tmp)) {
+                if (isLoaderProvided(nested.getFileName().toString())) { skipped++; continue; }
+                scanPackages(nested, ownedPkgs); urls.add(nested.toUri().toURL()); pushed++;
+            }
         } }
         if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         ownedPkgs.add(SIDECAR_PKG);                                              // relocated sidecars are defined + resolved here

@@ -44,7 +44,13 @@ final class VanillaPlatform implements LoaderPlatform {
             if (!n.startsWith("agent-libs/") || !n.endsWith(".jar")) continue; Path o = tmp.resolve(new File(n).getName());
             try (InputStream in = jf.getInputStream(e)) { Files.copy(in, o, StandardCopyOption.REPLACE_EXISTING); }
             if(n.equals("agent-libs/payload.jar")) lbBundle=o;
-            inst.appendToSystemClassLoaderSearch(new JarFile(o.toFile())); } }
+            inst.appendToSystemClassLoaderSearch(new JarFile(o.toFile()));
+            // Stage this jar's bundled (jar-in-jar) dependencies too (the payload's own libs + any dep mod's nested libs).
+            for (java.nio.file.Path nested : FullInjectAgent.extractNestedJars(o, tmp)) {
+                String nb = nested.getFileName().toString().toLowerCase();
+                if (nb.startsWith("asm-") || nb.startsWith("asm.") || nb.contains("sponge-mixin") || nb.contains("mixinextras")) continue; // agent already provides these
+                inst.appendToSystemClassLoaderSearch(new JarFile(nested.toFile()));
+            } } }
         if(lbBundle==null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         Thread.currentThread().setContextClassLoader(sys);
         try { Class.forName("vspike.McefNative").getMethod("stageIfBundled", File.class, String.class).invoke(null, agentJar, InjectionLogger.PREFIX); } catch (Throwable t) {}
