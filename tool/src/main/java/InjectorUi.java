@@ -48,7 +48,6 @@ public final class InjectorUi extends JFrame {
     private final JTextArea logArea = new JTextArea();
     private final JButton refreshButton = new JButton("Refresh");
     private final JButton injectButton = new JButton("Inject LiquidBounce");
-    private final JButton uninjectButton = new JButton("Uninject");
     private final JProgressBar progressBar = new JProgressBar(0, 100);
     private SwingWorker<Void, String> logTailWorker;
     private volatile boolean tailingInjectionLog;
@@ -139,13 +138,8 @@ public final class InjectorUi extends JFrame {
         JPanel actions = new JPanel(new BorderLayout(10, 8));
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         refreshButton.addActionListener(event -> refreshProcesses());
-        uninjectButton.addActionListener(event -> uninject());
-        uninjectButton.setToolTipText("<html>Removes LiquidBounce from the selected client &mdash; shuts it down (browser, listeners) and reverts the game bytecode back to vanilla.<br><br>"
-                + "<b>Note:</b> you cannot inject again into the same client afterwards &mdash; restart it first.<br>"
-                + "Uninject also does <b>not</b> remove LiquidBounce from the process memory (its classes stay loaded until the client exits).</html>");
         injectButton.addActionListener(event -> inject());
         buttons.add(refreshButton);
-        buttons.add(uninjectButton);
         buttons.add(injectButton);
         progressBar.setStringPainted(true);
         progressBar.setString("Ready");
@@ -166,7 +160,6 @@ public final class InjectorUi extends JFrame {
     private void updateInjectEnabled() {
         boolean ready = processTable.getSelectedRow() >= 0 && new File(agentField.getText().trim()).isFile();
         injectButton.setEnabled(ready);
-        uninjectButton.setEnabled(ready);
     }
 
     private void browseForAgent() {
@@ -229,10 +222,9 @@ public final class InjectorUi extends JFrame {
         }.execute();
     }
 
-    private void inject() { attachAgent(false); }
-    private void uninject() { attachAgent(true); }
+    private void inject() { attachAgent(); }
 
-    private void attachAgent(boolean uninject) {
+    private void attachAgent() {
         int selected = processTable.getSelectedRow();
         if (selected < 0) return;
         MinecraftProcess process = processModel.row(selected);
@@ -242,10 +234,10 @@ public final class InjectorUi extends JFrame {
                     "Missing agent", JOptionPane.ERROR_MESSAGE);
             return;
         }
-        String verb = uninject ? "uninjection" : "injection";
-        String Verb = uninject ? "Uninjection" : "Injection";
+        String verb = "injection";
+        String Verb = "Injection";
 
-        appendLog("Starting " + verb + (uninject ? " from PID " : " into PID ") + process.pid + ".");
+        appendLog("Starting " + verb + " into PID " + process.pid + ".");
         tailingInjectionLog = false;
         File injectionLog;
         try {
@@ -254,7 +246,7 @@ public final class InjectorUi extends JFrame {
             // the path and passes it to the agent, so predictability buys nothing.
             injectionLog = Files.createTempFile("liquidbounce-" + verb + "-" + process.pid + "-", ".log").toFile();
             injectionLog.deleteOnExit();
-            startInjectionLogTail(injectionLog, uninject);
+            startInjectionLogTail(injectionLog);
             appendLog("Dedicated " + verb + " log: " + injectionLog.getAbsolutePath());
         } catch (Exception logFailure) {
             injectionLog = null;
@@ -264,25 +256,22 @@ public final class InjectorUi extends JFrame {
         final int dataMode = dataModeCombo.getSelectedIndex();   // 0=game dir, 1=working dir, 2=custom
         final String dataDir = dataDirField.getText().trim();    // captured on the EDT
         final boolean tolerateFailures = tolerateFailuresCheck.isSelected();
-        setBusy(true, uninject ? "Attaching (uninject) ..." : "Attaching ...", 15);
+        setBusy(true, "Attaching ...", 15);
         new SwingWorker<Void, LogUpdate>() {
             @Override protected Void doInBackground() throws Exception {
                 StringBuilder args = new StringBuilder();
-                if (uninject) args.append("mode=uninject");
                 if (finalInjectionLog != null) {
-                    if (args.length() > 0) args.append(AGENT_ARG_SEP);
                     args.append("logFile=").append(finalInjectionLog.getAbsolutePath());
                 }
-                if (!uninject) {   // 0 (game dir) -> no gameDir arg (agent resolves it); 1 -> "." (working dir); 2 -> custom path.
-                    String gameDir = dataMode == 1 ? "." : (dataMode == 2 && !dataDir.isEmpty()) ? dataDir : null;
-                    if (gameDir != null) {
-                        if (args.length() > 0) args.append(AGENT_ARG_SEP);
-                        args.append("gameDir=").append(gameDir);
-                    }
-                    if (tolerateFailures) {   // modded loaders: skip an other-mod target that fails to transform instead of aborting
-                        if (args.length() > 0) args.append(AGENT_ARG_SEP);
-                        args.append("tolerateBaselineFailures=true");
-                    }
+                // 0 (game dir) -> no gameDir arg (agent resolves it); 1 -> "." (working dir); 2 -> custom path.
+                String gameDir = dataMode == 1 ? "." : (dataMode == 2 && !dataDir.isEmpty()) ? dataDir : null;
+                if (gameDir != null) {
+                    if (args.length() > 0) args.append(AGENT_ARG_SEP);
+                    args.append("gameDir=").append(gameDir);
+                }
+                if (tolerateFailures) {   // modded loaders: skip an other-mod target that fails to transform instead of aborting
+                    if (args.length() > 0) args.append(AGENT_ARG_SEP);
+                    args.append("tolerateBaselineFailures=true");
                 }
                 String agentArgs = args.toString();
                 Injector.inject(Long.toString(process.pid), jar, agentArgs, message -> {
@@ -306,9 +295,8 @@ public final class InjectorUi extends JFrame {
                 try {
                     get();
                     if (tailingInjectionLog) {
-                        appendLog(uninject ? "Agent delivered; waiting for uninjection to finish."
-                                : "Agent delivered; waiting for LiquidBounce initialization to finish.");
-                        setProgressIfHigher(70, uninject ? "Uninjecting ..." : "Initializing LiquidBounce ...");
+                        appendLog("Agent delivered; waiting for LiquidBounce initialization to finish.");
+                        setProgressIfHigher(70, "Initializing LiquidBounce ...");
                     } else {
                         appendLog(Verb + " completed successfully (target log unavailable). ");
                         progressBar.setValue(100);
@@ -335,11 +323,11 @@ public final class InjectorUi extends JFrame {
         }.execute();
     }
 
-    private void startInjectionLogTail(File logFile, boolean uninject) {
+    private void startInjectionLogTail(File logFile) {
         if (logTailWorker != null && !logTailWorker.isDone()) logTailWorker.cancel(true);
         tailingInjectionLog = true;
         long startOffset = logFile.length();
-        String successMarker = uninject ? "UNINJECT complete" : "LiquidBounce initialization completed";
+        String successMarker = "LiquidBounce initialization completed";
         logTailWorker = new SwingWorker<>() {
             private boolean sawSuccess;
 
@@ -358,12 +346,9 @@ public final class InjectorUi extends JFrame {
                         if (isInjectionLogLine(line)) publish(line);
                         if (line.contains(successMarker)) {
                             sawSuccess = true;
-                            if (uninject) break;
                             deadline = Math.min(deadline, System.currentTimeMillis() + 15_000L);
                         }
-                        if (uninject) {
-                            if (line.contains("uninject failed") || line.contains("Game crashed")) break;
-                        } else if (line.contains("[LB-INJECT]")
+                        if (line.contains("[LB-INJECT]")
                                 && (line.contains("restored original state") || line.contains("initialization failed"))
                                 || line.contains("Game crashed")) {
                             break;
@@ -376,19 +361,18 @@ public final class InjectorUi extends JFrame {
             @Override protected void process(List<String> lines) {
                 for (String line : lines) {
                     appendInjectionLog(line);
-                    if (!uninject) applyInjectionProgress(line);
+                    applyInjectionProgress(line);
                 }
             }
 
             @Override protected void done() {
-                String label = uninject ? "uninjection" : "injection";
                 if (!isCancelled() && sawSuccess) {
                     progressBar.setValue(100);
-                    progressBar.setString(uninject ? "LiquidBounce uninjected" : "LiquidBounce injection complete");
-                    appendLog("LiquidBounce " + label + " completed successfully.");
+                    progressBar.setString("LiquidBounce injection complete");
+                    appendLog("LiquidBounce injection completed successfully.");
                 } else if (!isCancelled() && progressBar.getValue() < 100) {
-                    appendLog("Stopped waiting for the " + label + " completion marker.");
-                    progressBar.setString(uninject ? "Uninjection log monitoring ended" : "Injection log monitoring ended");
+                    appendLog("Stopped waiting for the injection completion marker.");
+                    progressBar.setString("Injection log monitoring ended");
                 }
                 tailingInjectionLog = false;
                 setBusy(false, progressBar.getString(), progressBar.getValue());
@@ -445,7 +429,7 @@ public final class InjectorUi extends JFrame {
         agentField.setEnabled(!busy);
         progressBar.setValue(progress);
         progressBar.setString(text);
-        if (busy) { injectButton.setEnabled(false); uninjectButton.setEnabled(false); } else updateInjectEnabled();
+        if (busy) injectButton.setEnabled(false); else updateInjectEnabled();
     }
 
     private void appendLog(String message) {
