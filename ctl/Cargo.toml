@@ -16,3 +16,6 @@ opt-level = "z"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui = "0.28"
+rfd = "0.14"

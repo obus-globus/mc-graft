@@ -5,6 +5,7 @@
 
 mod attach;
 mod build;
+mod gui;
 mod procs;
 
 use clap::{Parser, Subcommand};
@@ -17,14 +18,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ARG_SEP: char = '\u{1}';
 
 #[derive(Parser)]
-#[command(name = "mcgraft", version, about = "Control mc-graft: find Minecraft JVMs and inject the agent.")]
+#[command(name = "mcgraft", version, about = "Control mc-graft: build agents, find Minecraft JVMs, and inject.")]
 struct Cli {
+    /// With no subcommand, the graphical UI opens.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the graphical UI (also the default when run with no subcommand).
+    Ui,
     /// List running (attachable) JVMs; Minecraft instances are marked.
     List,
     /// Build the mc-graft agent jar for a payload mod (drives Gradle's agentJar task).
@@ -89,10 +93,15 @@ struct InjectArgs {
 
 fn main() {
     match Cli::parse().cmd {
-        Cmd::List => cmd_list(),
-        Cmd::Build(a) => cmd_build(a),
-        Cmd::Inject(a) => cmd_inject(a),
-        Cmd::Logs { file, follow } => {
+        None | Some(Cmd::Ui) => {
+            if let Err(e) = gui::run() {
+                die(&e);
+            }
+        }
+        Some(Cmd::List) => cmd_list(),
+        Some(Cmd::Build(a)) => cmd_build(a),
+        Some(Cmd::Inject(a)) => cmd_inject(a),
+        Some(Cmd::Logs { file, follow }) => {
             if let Err(e) = follow_log(&file, 0, follow, Instant::now() + Duration::from_secs(600)) {
                 die(&e);
             }
@@ -106,7 +115,7 @@ fn cmd_list() {
         println!("No attachable JVMs found.");
         return;
     }
-    println!("{:>8}  {:<3}  {:<12}  {}", "PID", "MC", "MC VER", "MAIN / COMMAND");
+    println!("{:>8}  {:<3}  {:<12}  MAIN / COMMAND", "PID", "MC", "MC VER");
     for j in &jvms {
         let mark = if j.is_minecraft { "yes" } else { "" };
         let ver = j.mc_version.clone().unwrap_or_default();
