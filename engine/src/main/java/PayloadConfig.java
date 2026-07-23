@@ -28,6 +28,9 @@ public final class PayloadConfig {
 
     public final String id, accessWidener;
     public final List<String> mixinConfigs, neoforgeMixins, mainEntrypoints, clientEntrypoints;
+    // built-in registries the payload writes into during init (e.g. minecraft:sound_event) — thawed narrowly and kept
+    // open across a resource reload, instead of thawing every registry (which collides with the reload's re-freeze).
+    public final List<String> thawRegistries;
     // event-bootstrap override (null when absent -> the agent calls the declared entrypoints instead)
     public final String evtManager, evtManagerInstance, evtBase, evtStart, evtStartInstance, evtCall;
     // optional readiness probe for an ASYNC event-bootstrap (the target retransforms are published only once the mod
@@ -56,6 +59,7 @@ public final class PayloadConfig {
         readyInstance = p.getProperty("bootstrap.ready.instance", "INSTANCE").trim();
         readyMethod = p.getProperty("bootstrap.ready.method", "isInitialized").trim();
         reloadResources = Boolean.parseBoolean(p.getProperty("bootstrap.reloadResources", "false").trim());
+        thawRegistries = csv(p.getProperty("bootstrap.thawRegistries", ""));
     }
 
     /** True when an async readiness probe is configured (publish retransforms only after the mod reports ready). */

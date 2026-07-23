@@ -215,10 +215,12 @@ public class FullInjectAgent {
             Object mc = mcCls.getMethod("getInstance").invoke(null);
             Runnable kick = () -> { RegistryThawSession thaw=null; try {
                 if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("Bootstrap class preflight produced verification errors");
-                // A resource-reload-driven init runs inside MC's own reload lifecycle, which reloads+refreezes tags —
-                // a RegistryThawSession would leave them unfrozen and the reload throws "Tags already present before
-                // freezing". So skip the thaw for that path; MC owns the registry state during the reload.
+                // Off the reload path: thaw ALL registries so the payload can register into them post-freeze.
+                // On the reload path: thawing everything collides with the reload re-freezing the dynamic RegistryAccess
+                // ("Tags already present"), so thaw ONLY the specific built-in registries the payload writes to
+                // (bootstrap.thawRegistries, e.g. minecraft:sound_event) and keep that narrow thaw open across the reload.
                 if (!cfg.reloadResources) thaw = RegistryThawSession.begin();
+                else if (!cfg.thawRegistries.isEmpty()) thaw = RegistryThawSession.begin(cfg.thawRegistries);
                 bootstrapPayload(cfg);
                 if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("payload init produced verification errors");
                 if (cfg.reloadResources) {
@@ -443,35 +445,91 @@ public class FullInjectAgent {
     static final class RegistryThawSession implements AutoCloseable {
         final java.lang.reflect.Field frozen;
         final IdentityHashMap<Object,Boolean> original;
+        // A thawed registry (frozen=false) still has its tag set bound, so any later re-freeze (e.g. the resource
+        // reload rebuilding ClientRegistryLayer's RegistryAccess) hits MappedRegistry.freeze's "Tags already present
+        // before freezing" guard. To stay compatible we temporarily swap allTags to an unbound TagSet for the thaw
+        // window and restore it on close (unless something rebound it meanwhile). Best-effort: null field -> skip.
+        java.lang.reflect.Field allTagsField;
+        java.lang.reflect.Method tagsUnbound, tagsIsBound;
+        final IdentityHashMap<Object,Object> tagBackup = new IdentityHashMap<>();
         final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
         volatile boolean restored;
         RegistryThawSession(java.lang.reflect.Field frozen, IdentityHashMap<Object,Boolean> original){this.frozen=frozen;this.original=original;}
-        static RegistryThawSession begin() throws Exception {
+        static RegistryThawSession begin() throws Exception { return begin(java.util.List.of()); }
+        /** Thaw the built-in registries so the payload can register into them post-freeze. With an empty scope, thaw
+         *  ALL of them (used off the reload path). With a scope (registry ids like "minecraft:sound_event"), thaw ONLY
+         *  those — needed on the resource-reload path, where thawing everything collides with the reload re-freezing
+         *  the dynamic RegistryAccess ("Tags already present before freezing"); a bare reload does not re-freeze the
+         *  static registries the payload actually writes to. */
+        static RegistryThawSession begin(java.util.List<String> scope) throws Exception {
             Class<?> bir=Class.forName("net.minecraft.core.registries.BuiltInRegistries",false,SYS);
             java.lang.reflect.Field wr=bir.getDeclaredField("WRITABLE_REGISTRY");wr.setAccessible(true);Object root=wr.get(null);
             Class<?> mapped=Class.forName("net.minecraft.core.MappedRegistry",false,SYS);
             java.lang.reflect.Field fz=mapped.getDeclaredField("frozen");fz.setAccessible(true);
+            boolean all = scope==null || scope.isEmpty();
             IdentityHashMap<Object,Boolean> states=new IdentityHashMap<>();
-            if(mapped.isInstance(root))states.put(root,fz.getBoolean(root));
-            for(Object reg:(Iterable<?>)root)if(mapped.isInstance(reg))states.put(reg,fz.getBoolean(reg));
+            if(all){
+                if(mapped.isInstance(root))states.put(root,fz.getBoolean(root));
+                for(Object reg:(Iterable<?>)root)if(mapped.isInstance(reg))states.put(reg,fz.getBoolean(reg));
+            } else {
+                // Resolve each scoped registry id directly on the root registry-of-registries (root.getValue(loc)).
+                // Derive the id class (ResourceLocation / Identifier, mapping-dependent) from getValue's own
+                // parameter type — the overload whose parameter exposes a static parse(String) — so no class name
+                // is hardcoded and the class comes from the live registry's own loader.
+                java.lang.reflect.Method getVal=null,parse=null;
+                for(java.lang.reflect.Method m:root.getClass().getMethods()){
+                    if(!m.getName().equals("getValue")||m.getParameterCount()!=1)continue;
+                    Class<?> pt=m.getParameterTypes()[0];
+                    try{ java.lang.reflect.Method pm=pt.getMethod("parse",String.class);
+                        if(java.lang.reflect.Modifier.isStatic(pm.getModifiers())){getVal=m;parse=pm;break;} }
+                    catch(NoSuchMethodException ignore){}
+                }
+                if(getVal==null) throw new IllegalStateException("Registry.getValue(<id>) not found on "+root.getClass().getName());
+                for(String id:scope){ try{ Object reg=getVal.invoke(root,parse.invoke(null,id.trim()));
+                        if(reg!=null&&mapped.isInstance(reg)) states.put(reg,fz.getBoolean(reg));
+                        else InjectionLogger.warn("thawRegistries: '"+id+"' resolved to "+reg+" (not a MappedRegistry) — skipped");
+                    }catch(Throwable t){ InjectionLogger.warn("thawRegistries: failed to resolve '"+id+"' -> "+rootMsg(t)); } }
+            }
             RegistryThawSession session=new RegistryThawSession(fz,states);
+            try{ session.allTagsField=mapped.getDeclaredField("allTags"); session.allTagsField.setAccessible(true);
+                 Class<?> tagSet=session.allTagsField.getType();
+                 session.tagsUnbound=tagSet.getMethod("unbound"); session.tagsUnbound.setAccessible(true);
+                 session.tagsIsBound=tagSet.getMethod("isBound"); session.tagsIsBound.setAccessible(true);
+            }catch(Throwable t){ session.allTagsField=null; InjectionLogger.warn("thaw: allTags swap unavailable ("+rootMsg(t)+") — re-freeze of a thawed registry may fault"); }
             try{
-                for(var e:states.entrySet())if(e.getValue())fz.setBoolean(e.getKey(),false);
-                InjectionLogger.info("thawed "+states.values().stream().filter(Boolean::booleanValue).count()+"/"+states.size()+" registries");
+                int tagsSwapped=0;
+                for(var e:states.entrySet())if(e.getValue()){
+                    Object reg=e.getKey(); fz.setBoolean(reg,false);
+                    if(session.allTagsField!=null) try{ Object cur=session.allTagsField.get(reg);
+                        if(cur!=null&&(Boolean)session.tagsIsBound.invoke(cur)){ session.tagBackup.put(reg,cur);
+                            session.allTagsField.set(reg,session.tagsUnbound.invoke(null)); tagsSwapped++; } }
+                        catch(Throwable t){ InjectionLogger.warn("thaw: allTags unbind failed for a registry -> "+rootMsg(t)); }
+                }
+                InjectionLogger.info("thawed "+states.values().stream().filter(Boolean::booleanValue).count()+"/"+states.size()+" registries"+(all?"":" (scoped: "+scope+")")+(tagsSwapped>0?" (allTags unbound on "+tagsSwapped+" for re-freeze safety)":""));
                 return session;
             }catch(Throwable t){session.close();if(session.restored)try{lbrt.JoinGate.open();}catch(Throwable ignored){}
                 if(t instanceof Exception e)throw e;if(t instanceof Error e)throw e;throw new RuntimeException(t);}
         }
+        /** Re-assert the thaw: a resource reload re-freezes the static registry access mid-init (ClientRegistryLayer
+         *  rebuild), so a one-shot thaw is undone before the payload registers. Called repeatedly while waiting for the
+         *  payload to report ready, this holds the scoped registries writable across those re-freezes. No-op once closed. */
+        void reassertThaw(){ if(closed.get())return;
+            for(var e:original.entrySet()) if(e.getValue()) try{ if(frozen.getBoolean(e.getKey())) frozen.setBoolean(e.getKey(),false); }catch(Throwable ignored){} }
         public void close(){if(!closed.compareAndSet(false,true))return;int count=0,failures=0;
+            // Restore the tag sets we swapped out first — but only where nothing rebound them meanwhile (a rebind is
+            // authoritative and must win). Then restore each registry's original frozen flag.
+            for(var e:tagBackup.entrySet())try{ Object reg=e.getKey(),cur=allTagsField.get(reg);
+                if(cur==null||!(Boolean)tagsIsBound.invoke(cur)) allTagsField.set(reg,e.getValue()); }
+                catch(Throwable t){LateAttachVerifier.error("REGISTRY_RESTORE_FAILURE","registries","bootstrap-tags",rootMsg(t));}
             for(var e:original.entrySet())try{frozen.setBoolean(e.getKey(),e.getValue());count++;}
                 catch(Throwable t){failures++;LateAttachVerifier.error("REGISTRY_RESTORE_FAILURE","registries","bootstrap",rootMsg(t));}
             restored=failures==0;
             InjectionLogger.info("restored original state of "+count+"/"+original.size()+" registries"+(restored?"":"; join gate remains closed"));}
     }
-    static void closeThaw(RegistryThawSession t){ if(t!=null) t.close(); }   // null on the reload-driven path (no thaw)
+    static void closeThaw(RegistryThawSession t){ if(t!=null) t.close(); }   // t may be null (no registries thawed)
     static void restoreAndOpen(RegistryThawSession thaw,boolean initializationSucceeded){
+        if (thaw != null) thaw.close();   // close() computes thaw.restored — must run before we read it below
         boolean restored = thaw == null || thaw.restored;   // null thaw = reload-driven path: registries were never thawed
-        if (thaw != null) thaw.close();
         // The gate must ALWAYS be released here so a failed/partial bootstrap can never leave multiplayer permanently
         // locked. On full success replay the deferred join; otherwise (registries not fully restored, or LB did not
         // initialize) don't replay into a half-set-up client, but still unblock so the user can retry the join.
@@ -492,6 +550,7 @@ public class FullInjectAgent {
             java.lang.reflect.Method initialized = readyCls.getMethod(cfg.readyMethod);
             long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
             while (!(Boolean) initialized.invoke(readyObj)) {
+                if (thaw != null) thaw.reassertThaw();   // hold scoped registries thawed across the reload's re-freeze
                 if (System.nanoTime() >= deadline) {
                     LateAttachVerifier.error("BOOTSTRAP_TIMEOUT","registries","bootstrap","Timed out waiting for "+cfg.id+" initialization");
                     break;
