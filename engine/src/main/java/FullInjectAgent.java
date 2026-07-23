@@ -215,13 +215,23 @@ public class FullInjectAgent {
             Object mc = mcCls.getMethod("getInstance").invoke(null);
             Runnable kick = () -> { RegistryThawSession thaw=null; try {
                 if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("Bootstrap class preflight produced verification errors");
-                thaw = RegistryThawSession.begin();
+                // A resource-reload-driven init runs inside MC's own reload lifecycle, which reloads+refreezes tags —
+                // a RegistryThawSession would leave them unfrozen and the reload throws "Tags already present before
+                // freezing". So skip the thaw for that path; MC owns the registry state during the reload.
+                if (!cfg.reloadResources) thaw = RegistryThawSession.begin();
                 bootstrapPayload(cfg);
                 if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("payload init produced verification errors");
+                if (cfg.reloadResources) {
+                    // The payload registered a resource-reload listener during its start event and defers real init to
+                    // it; the boot-time reload is long gone on late-attach, so drive one now (async; the readiness probe
+                    // below waits for the init the reload triggers).
+                    InjectionLogger.info("(MC main thread) reloadResourcePacks() to drive payload resource-reload init");
+                    mcCls.getMethod("reloadResourcePacks").invoke(mc);
+                }
                 if (cfg.hasReadinessProbe()) {
                     restoreRegistriesAfterInitialization(mcCls, mc, thaw, cfg);   // async: wait for ready, then publish
                 } else {
-                    thaw.close(); thaw=null;                                      // synchronous: init is done, publish now
+                    closeThaw(thaw); thaw=null;                                   // synchronous: init is done, publish now
                     activateLoadedTargets(INST);
                     lbrt.JoinGate.cancelAndOpen();
                     InjectionLogger.info("payload injection complete");
@@ -458,12 +468,14 @@ public class FullInjectAgent {
             restored=failures==0;
             InjectionLogger.info("restored original state of "+count+"/"+original.size()+" registries"+(restored?"":"; join gate remains closed"));}
     }
+    static void closeThaw(RegistryThawSession t){ if(t!=null) t.close(); }   // null on the reload-driven path (no thaw)
     static void restoreAndOpen(RegistryThawSession thaw,boolean initializationSucceeded){
-        thaw.close();
+        boolean restored = thaw == null || thaw.restored;   // null thaw = reload-driven path: registries were never thawed
+        if (thaw != null) thaw.close();
         // The gate must ALWAYS be released here so a failed/partial bootstrap can never leave multiplayer permanently
         // locked. On full success replay the deferred join; otherwise (registries not fully restored, or LB did not
         // initialize) don't replay into a half-set-up client, but still unblock so the user can retry the join.
-        if(thaw.restored && initializationSucceeded){
+        if(restored && initializationSucceeded){
             try{lbrt.JoinGate.open();}
             catch(Throwable t){LateAttachVerifier.error("DEFERRED_JOIN_FAILURE","ConnectScreen","join-gate",rootMsg(t));lbrt.JoinGate.cancelAndOpen();}
         } else {
@@ -501,17 +513,17 @@ public class FullInjectAgent {
             Runnable restore=()->{try{
                 if(ready.get())try{activateLoadedTargets(INST);}
                 catch(Throwable t){ready.set(false);LateAttachVerifier.error("TARGET_ACTIVATION_FAILURE","targets","bootstrap",rootMsg(t));InjectionLogger.error("target activation failed -> "+rootMsg(t));}
-                if(finalized.compareAndSet(false,true))restoreAndOpen(thaw,ready.get());else thaw.close();
+                if(finalized.compareAndSet(false,true))restoreAndOpen(thaw,ready.get());else closeThaw(thaw);
             }finally{done.complete(null);}};
             try {
                 mcCls.getMethod("execute", Runnable.class).invoke(mc, restore);
                 // If the main-thread restore runnable (which releases the gate via restoreAndOpen) never completes,
                 // release the gate here too so a stalled/failed activation cannot leave multiplayer locked out.
                 try{done.get(60,TimeUnit.SECONDS);}
-                catch(TimeoutException t){LateAttachVerifier.warn("REGISTRY_RESTORE_MAIN_THREAD_TIMEOUT","registries","bootstrap","Main thread did not finish activation/restore within 60 seconds; applying state fallback");if(finalized.compareAndSet(false,true)){thaw.close();lbrt.JoinGate.cancelAndOpen();}else thaw.close();}
-                catch(InterruptedException t){Thread.currentThread().interrupt();if(finalized.compareAndSet(false,true)){thaw.close();lbrt.JoinGate.cancelAndOpen();}else thaw.close();}
-                catch(ExecutionException t){LateAttachVerifier.error("REGISTRY_RESTORE_TASK_FAILURE","registries","bootstrap",rootMsg(t));if(finalized.compareAndSet(false,true)){thaw.close();lbrt.JoinGate.cancelAndOpen();}else thaw.close();}
-            } catch(Throwable t){ if(finalized.compareAndSet(false,true)){thaw.close();lbrt.JoinGate.cancelAndOpen();}else thaw.close();LateAttachVerifier.error("REGISTRY_RESTORE_SCHEDULE_FAILURE","registries","bootstrap",rootMsg(t)); }
+                catch(TimeoutException t){LateAttachVerifier.warn("REGISTRY_RESTORE_MAIN_THREAD_TIMEOUT","registries","bootstrap","Main thread did not finish activation/restore within 60 seconds; applying state fallback");if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+                catch(InterruptedException t){Thread.currentThread().interrupt();if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+                catch(ExecutionException t){LateAttachVerifier.error("REGISTRY_RESTORE_TASK_FAILURE","registries","bootstrap",rootMsg(t));if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+            } catch(Throwable t){ if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);LateAttachVerifier.error("REGISTRY_RESTORE_SCHEDULE_FAILURE","registries","bootstrap",rootMsg(t)); }
         } }, "lb-registry-restore");
         waiter.setDaemon(true);
         waiter.start();

@@ -33,6 +33,9 @@ public final class PayloadConfig {
     // optional readiness probe for an ASYNC event-bootstrap (the target retransforms are published only once the mod
     // reports ready); null readyClass -> the bootstrap is treated as synchronous (publish immediately after the kick)
     public final String readyClass, readyInstance, readyMethod;
+    // some mods defer their real init to a resource-reload listener registered during the start event; on late-attach
+    // the boot-time reload has passed, so trigger one to drive that init. (bootstrap.reloadResources=true)
+    public final boolean reloadResources;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
@@ -52,6 +55,7 @@ public final class PayloadConfig {
         readyClass = blankToNull(p.getProperty("bootstrap.ready.class", ""));
         readyInstance = p.getProperty("bootstrap.ready.instance", "INSTANCE").trim();
         readyMethod = p.getProperty("bootstrap.ready.method", "isInitialized").trim();
+        reloadResources = Boolean.parseBoolean(p.getProperty("bootstrap.reloadResources", "false").trim());
     }
 
     /** True when an async readiness probe is configured (publish retransforms only after the mod reports ready). */
