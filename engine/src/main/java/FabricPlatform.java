@@ -197,6 +197,13 @@ final class FabricPlatform implements LoaderPlatform {
     // ---- §1c: baselines (X_others) captured while LB is UNVISITED, then LB activated -------------------------------
     public void prepareBaselines(java.util.List<String> internalTargets) throws Exception {
         if (lbActivated) throw new IllegalStateException("prepareBaselines after LB already activated");
+        // On an IDLE Knot client (bare Fabric: nothing transformed since boot) processor.transformedCount is 0, so the
+        // first baseline transform would trip Mixin's checkSelect (unvisited>0 && transformedCount==0) and PROMOTE our
+        // still-pending payload config mid-baseline — contaminating X_others with the payload and erasing its delta in
+        // phase A. Force the count non-zero so the baseline is captured with the payload unvisited; phase A re-selects
+        // it deliberately via the setInt(0) in transform(). No-op on an active host (count already > 0).
+        int tc0 = fTransformedCount.getInt(processor);
+        if (tc0 == 0) { fTransformedCount.setInt(processor, 1); InjectionLogger.info("baseline: forced transformedCount 0 -> 1 (idle host; keeps payload config unvisited during X_others capture)"); }
         int n = 0;
         for (String internal : internalTargets) {
             byte[] pre = getPreMixinClassBytes(internal); if (pre == null) continue;
