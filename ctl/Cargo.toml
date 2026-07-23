@@ -1,0 +1,18 @@
+[package]
+name = "mcgraft"
+version = "0.1.0"
+edition = "2021"
+description = "Control CLI for mc-graft: discover running Minecraft JVMs and inject the mc-graft agent via the HotSpot attach protocol."
+license = "MIT"
+
+[[bin]]
+name = "mcgraft"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
