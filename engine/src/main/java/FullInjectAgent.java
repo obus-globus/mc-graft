@@ -16,6 +16,7 @@ public class FullInjectAgent {
     static final Map<String,List<String[]>> ifaceMap = new ConcurrentHashMap<>();  // iface -> all [target, sidecar]; read by concurrent CFT threads
     static final Set<String> targetSet = new HashSet<>();                          // internal names of mixin targets
     static Instrumentation INST;
+    static volatile RetransformConverter.Resolver AW_RES;   // AW resolver (for the caller-rewrite diagnostic)
     static volatile boolean everInjected;                                         // true once injected; a second inject in the same JVM is refused — the payload can't be re-staged onto the already-populated loader. volatile: successive attaches may land on different attach-listener threads.
     static boolean tolerateBaselineFailures;                                      // agent arg tolerateBaselineFailures=true: on modded loaders, skip an other-mod target whose baseline transform throws instead of aborting the whole inject. Default OFF (fail-fast). Set once in agentmain before prepareBaselines, read on the same thread.
     static final Set<String> preLoaded = ConcurrentHashMap.newKeySet();            // MC classes loaded at attach (can't be AW-widened)
@@ -126,7 +127,7 @@ public class FullInjectAgent {
 
         // Resolver: the payload access of a non-public member of an ALREADY-LOADED MC class must be reflection-routed (that
         // class could not be AW-widened, since retransform bans modifier changes). Future MC classes get the AW on-load.
-        RetransformConverter.Resolver awRes = new RetransformConverter.Resolver(){
+        RetransformConverter.Resolver awRes = AW_RES = new RetransformConverter.Resolver(){
             public boolean fieldNeedsReflect(String o,String n,String d){ return INACC.contains(o) || (isPreloadedMc(o) && fieldNonPublic(o,n)); }
             public boolean methodNeedsReflect(String o,String n,String d){ return INACC.contains(o) || (isPreloadedMc(o) && methodNonPublic(o,n,d)); }
             public boolean typeInaccessible(String in){ return INACC.contains(in); }
@@ -313,6 +314,23 @@ public class FullInjectAgent {
     /** Retransform the whole set in ONE VM op (one safepoint, not N). retransformClasses is all-or-nothing, so if a
      *  class legitimately cannot be retransformed live it fails the batch -> we then fall back to per-class ONLY for
      *  that set to isolate the offender while still applying the rest. Common case (all succeed) is a single fast call. */
+    /** Diagnostic: reproduce the caller-rewrite for a class whose retransform failed and log which methods the rewrite
+     *  adds/drops vs the original (a schema change is what retransformClasses rejects). */
+    static void diagCallerSchema(String internal) {
+        try {
+            byte[] o; try (InputStream in = SYS.getResourceAsStream(internal+".class")) { if(in==null){InjectionLogger.warn("  diag: no original bytes for "+internal);return;} o=in.readAllBytes(); }
+            byte[] rw = AccessorBridgeRewriter.rewrite(internal, o);
+            if(!ifaceMap.isEmpty()) rw = RetransformConverter.rewriteCaller(rw, ifaceMap);
+            rw = RetransformConverter.rewriteLbAw(rw, AW_RES);
+            java.util.Set<String> om = methodSet(o), rm = methodSet(rw);
+            java.util.Set<String> dropped = new java.util.TreeSet<>(om); dropped.removeAll(rm);
+            java.util.Set<String> added = new java.util.TreeSet<>(rm); added.removeAll(om);
+            InjectionLogger.warn("  diag "+internal+": rewrite dropped methods "+dropped+" ; added "+added);
+        } catch (Throwable t) { InjectionLogger.warn("  diag "+internal+" failed: "+rootMsg(t)); }
+    }
+    static java.util.Set<String> methodSet(byte[] b){ org.objectweb.asm.tree.ClassNode c=new org.objectweb.asm.tree.ClassNode(); new ClassReader(b).accept(c,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
+        java.util.Set<String> s=new java.util.HashSet<>(); if(c.methods!=null)for(org.objectweb.asm.tree.MethodNode m:c.methods)s.add(m.name+m.desc); return s; }
+
     static int batchRetransform(Instrumentation inst, List<Class<?>> cs, String kind) {
         if (cs.isEmpty()) return 0;
         try { inst.retransformClasses(cs.toArray(new Class<?>[0])); return cs.size(); }
@@ -322,7 +340,8 @@ public class FullInjectAgent {
             for (Class<?> c : cs) { String in=c.getName().replace('.','/');
                 try { inst.retransformClasses(c); ok++; }
                 catch (Throwable e) { LateAttachVerifier.error(kind.toUpperCase()+"_RETRANSFORM_FAILURE",in,kind,rootMsg(e));
-                    InjectionLogger.warn("retransform fail "+in+" -> "+rootMsg(e)); } }
+                    InjectionLogger.warn("retransform fail "+in+" -> "+rootMsg(e));
+                    if("caller".equals(kind)) diagCallerSchema(in); } }
             return ok;
         }
     }
