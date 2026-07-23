@@ -26,9 +26,11 @@ public class AccessWidener {
                 int c = line.indexOf('#'); if (c>=0) line = line.substring(0,c).trim();
                 if (line.isEmpty()) continue;
                 String[] t = line.split("\\s+");
-                if (!header) {   // first real line MUST be "accessWidener v1|v2 <namespace>"
-                    if (t.length < 2 || !t[0].equals("accessWidener") || !(t[1].equals("v1") || t[1].equals("v2")))
-                        throw new IOException("Invalid AccessWidener header: '" + line + "' (expected 'accessWidener v1|v2 <namespace>')");
+                if (!header) {   // first real line MUST be "accessWidener v1|v2 <ns>" or "classTweaker v1 <ns>"
+                    boolean aw = t.length >= 2 && t[0].equals("accessWidener") && (t[1].equals("v1") || t[1].equals("v2"));
+                    boolean ct = t.length >= 2 && t[0].equals("classTweaker") && t[1].equals("v1");   // ClassTweaker: AW superset; the accessible/extendable/mutable entries below are identical
+                    if (!aw && !ct)
+                        throw new IOException("Invalid AccessWidener/ClassTweaker header: '" + line + "' (expected 'accessWidener v1|v2 <namespace>' or 'classTweaker v1 <namespace>')");
                     header = true; continue;
                 }
                 if (t.length < 3) continue;

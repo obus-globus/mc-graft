@@ -158,7 +158,9 @@ final class FabricPlatform implements LoaderPlatform {
                 line = line.strip();
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 String[] tok = line.split("\\s+");
-                if (tok.length >= 3 && tok[0].equals("accessWidener")) return tok[2];
+                // both the legacy AccessWidener ("accessWidener v2 <ns>") and the newer ClassTweaker
+                // ("classTweaker v1 <ns>") headers put the namespace in the third whitespace/tab-separated token.
+                if (tok.length >= 3 && (tok[0].equals("accessWidener") || tok[0].equals("classTweaker"))) return tok[2];
                 break;   // first non-comment line must be the header
             }
         } catch (Throwable ignored) {}
