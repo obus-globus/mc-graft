@@ -43,7 +43,7 @@ public final class PayloadConfig {
     // from the payload jar. Used to scope the caller-rewrite preflight + the already-loaded-payload snapshot so the
     // engine makes no assumption about any one mod's package. Empty -> the engine falls back to the payload class set.
     public final List<String> payloadPackages;
-    // a system property the payload reads to locate its data/game directory (e.g. LiquidBounce reads "vspike.gameDir").
+    // a system property the payload reads to locate its data/game directory (e.g. a mod that reads "vspike.gameDir").
     // null -> the injector does not set any such property. (bootstrap.gameDirProperty=...)
     public final String gameDirProperty;
     // MC screen internal name whose join path is gated until the payload reports ready, so a multiplayer connect issued

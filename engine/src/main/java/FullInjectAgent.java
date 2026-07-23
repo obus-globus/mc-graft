@@ -21,8 +21,8 @@ public class FullInjectAgent {
     static final Set<String> preLoaded = ConcurrentHashMap.newKeySet();            // MC classes loaded at attach (can't be AW-widened)
     static final Map<String,Boolean> npField = new ConcurrentHashMap<>();          // owner#name -> non-public?
     static final Map<String,Boolean> npMethod = new ConcurrentHashMap<>();         // owner#name desc -> non-public?
-    static final Set<String> INACC = ConcurrentHashMap.newKeySet();                // already-loaded package-private MC classes LB references by type
-    static final Set<String> preBootstrapLb = ConcurrentHashMap.newKeySet();       // LB classes present before normal on-load caller rewriting
+    static final Set<String> INACC = ConcurrentHashMap.newKeySet();                // already-loaded package-private MC classes the payload references by type
+    static final Set<String> preBootstrapLb = ConcurrentHashMap.newKeySet();       // payload classes present before normal on-load caller rewriting
     /** per-target conversion: target' bytes + sidecar/state (defined LAZILY in the CFT with the target's real PD). */
     static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; volatile boolean defined;
         boolean define(ProtectionDomain pd){ synchronized(this){ if(defined) return true;
@@ -70,7 +70,7 @@ public class FullInjectAgent {
         List<String> targets = new ArrayList<>();
         try (var r = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(PLATFORM.bundleResource("mixin-targets.txt"))))) { String l; while ((l=r.readLine())!=null) if(!l.isBlank()) targets.add(l.trim().replace('.','/')); }
         targetSet.addAll(targets);
-        PLATFORM.prepareBaselines(targets);   // Fabric: capture the non-LB mod baseline before LB's config is selected
+        PLATFORM.prepareBaselines(targets);   // Fabric: capture the non-payload baseline before the payload's config is selected
 
         // Convert transactionally. Nothing is published/defined until every transformed target verifies, because the
         // global relocation tables permit cross-target sidecar calls and therefore cannot be safely partially accepted.

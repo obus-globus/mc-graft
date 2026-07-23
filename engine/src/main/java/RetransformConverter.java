@@ -854,7 +854,7 @@ public class RetransformConverter {
     }
     static final String AWR = "mcgraft/rt/AwReflect";
     /** Type-inaccessibility predicate used when erasing CHECKCASTs to types the rewritten class cannot name. It is
-     *  threaded as a parameter through the AW-inline helpers (NOT a shared static) so the caller path (LB→MC, uses the
+     *  threaded as a parameter through the AW-inline helpers (NOT a shared static) so the caller path (payload→MC, uses the
      *  Resolver) and the sidecar path (relocated body, uses {@link #typeInaccessibleFromSidecar}) never clobber each
      *  other and both are thread-safe. NEVER_INACC is the no-op used where no erasure applies. */
     static final Predicate<String> NEVER_INACC = t -> false;

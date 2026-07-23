@@ -53,7 +53,7 @@ public final class PayloadLoader extends URLClassLoader {
         if (owned(name.replace('.', '/'))) {
             synchronized (getClassLoadingLock(name)) {
                 Class<?> c = findLoadedClass(name);
-                if (c == null) c = findClass(name);   // define locally from LB URLs (or already define()d sidecar)
+                if (c == null) c = findClass(name);   // define locally from payload URLs (or already define()d sidecar)
                 if (resolve) resolveClass(c);
                 return c;
             }

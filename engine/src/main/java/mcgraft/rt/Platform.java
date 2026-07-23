@@ -5,6 +5,6 @@ package mcgraft.rt;
  *  instead of hardcoding getSystemClassLoader(). Vanilla: LOADER == system loader, so behavior is unchanged. */
 public final class Platform {
     private Platform() {}
-    /** The loader against which the runtime helpers resolve MC/LB classes. Defaults to the system loader. */
+    /** The loader against which the runtime helpers resolve MC/payload classes. Defaults to the system loader. */
     public static volatile ClassLoader LOADER = ClassLoader.getSystemClassLoader();
 }

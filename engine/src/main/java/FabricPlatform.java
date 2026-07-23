@@ -33,7 +33,7 @@ final class FabricPlatform implements LoaderPlatform {
     private Object aw;                      // vspike.AccessWidener (parsed as DATA for INACC/Resolver)
     private File agentJar;
     private final Map<String,byte[]> baseline = new HashMap<>();   // internal -> X_others (all mods except LB) = loaded schema
-    private boolean lbActivated;                                   // has the transformedCount reset selected LB's config yet
+    private boolean lbActivated;                                   // has the transformedCount reset selected the payload's configig yet
 
     // ---- §1a: KnotClassLoader ---------------------------------------------------------------------------------------
     public ClassLoader targetLoader(){ try {
@@ -226,7 +226,7 @@ final class FabricPlatform implements LoaderPlatform {
         for (String internal : internalTargets) {
             byte[] pre = getPreMixinClassBytes(internal); if (pre == null) continue;
             byte[] xOthers;
-            try { xOthers = (byte[]) mTransformClassBytes.invoke(transformer, internal.replace('/','.'), internal.replace('/','.'), pre); } // LB unvisited -> other mods only
+            try { xOthers = (byte[]) mTransformClassBytes.invoke(transformer, internal.replace('/','.'), internal.replace('/','.'), pre); } // the payload unvisited -> other mods only
             catch (Throwable t) {
                 // Another mod's mixin whose injection point diverges on this already-loaded target throws here. Either
                 // way it is logged. Default is FAIL-FAST: log an error naming the target + abort. With
@@ -251,13 +251,13 @@ final class FabricPlatform implements LoaderPlatform {
         String internal = dotted.replace('.','/');
         byte[] in = getPreMixinClassBytes(internal);
         if (in == null) in = originalO;                                            // fall back to the raw baseline
-        fTransformedCount.setInt(processor, 0);                                    // probe workaround #2: promote LB's pending config
+        fTransformedCount.setInt(processor, 0);                                    // probe workaround #2: promote the payload's pending config
         lbActivated = true;
         byte[] X = (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in);
         if (X == null) return null;
         byte[] base = originalO != null ? originalO : baseline.get(internal);      // X_others baseline
         if (base != null) X = alignSynthetics(base, X);                            // renumber other mods' counter-suffixed synthetics back to the baseline's names
-        return (base != null && Arrays.equals(X, base)) ? null : X;               // isolate LB's delta
+        return (base != null && Arrays.equals(X, base)) ? null : X;               // isolate the payload's delta
     }
 
     /** MixinExtras (and other injectors) name their synthetic bridges `...$<methods.size()>`; that counter is a global

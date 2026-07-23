@@ -30,7 +30,7 @@ final class NeoForgePlatform implements LoaderPlatform {
     private final Instrumentation inst;
     private ClassLoader tcl;                         // TransformingClassLoader (owns net.minecraft.* in module `minecraft`)
     private ClassLoader agentLoader;                 // system/App loader (owns the agent + mcgraft.rt.* single identity + FML's Mixin)
-    private PayloadLoader lb;                             // child-first LB loader (parent = TCL), holds LB + relocated sidecars
+    private PayloadLoader lb;                             // child-first payload loader (parent = TCL), holds payload + relocated sidecars
     private Object transformer;                      // org.spongepowered.asm.mixin.transformer.MixinTransformer (Object handle)
     private Object processor; private Field fTransformedCount, fErrorState;
     private Method mTransformClassBytes, mGenerateClass; private Object env;
@@ -76,7 +76,7 @@ final class NeoForgePlatform implements LoaderPlatform {
         } }
         if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         ownedPkgs.add(SIDECAR_PKG);                                              // relocated sidecars are defined + resolved here
-        // Install PayloadLoader as the TCL's child-first fallback (chained to FML's original fallback) and register LB
+        // Install PayloadLoader as the TCL's child-first fallback (chained to FML's original fallback) and register payload
         // packages in parentLoaders so FML's mixin byte reader locates the payload mixin classes during transformation.
         ClassLoader original = readLoaderField(tcl, "fallbackClassLoader");
         lb = new PayloadLoader(urls.toArray(new URL[0]), tcl, original, agentLoader, ownedPkgs);
@@ -188,7 +188,7 @@ final class NeoForgePlatform implements LoaderPlatform {
     public byte[] transform(String dotted, byte[] originalO) throws Exception {
         String internal = dotted.replace('.','/');
         byte[] in = rawBytes(internal); if (in == null) in = originalO; if (in == null) return null;
-        fTransformedCount.setInt(processor, 0);                                  // probe workaround: promote LB's pending config
+        fTransformedCount.setInt(processor, 0);                                  // probe workaround: promote the payload's pending config
         lbActivated = true;
         byte[] X;
         try { X = (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in); }

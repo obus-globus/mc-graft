@@ -93,7 +93,7 @@ public final class InjectorUi extends JFrame {
         browseButton.addActionListener(event -> browseForAgent());
         agentPanel.add(browseButton, BorderLayout.EAST);
 
-        // Where LiquidBounce/ is created: the client's game directory (default), its working directory, or a custom folder.
+        // Where the payload data dir is created: the client's game directory (default), its working directory, or a custom folder.
         JPanel dataDirPanel = new JPanel(new BorderLayout(8, 0));
         JLabel dataLabel = new JLabel("Data folder:");
         dataDirPanel.add(dataLabel, BorderLayout.WEST);
