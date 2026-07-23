@@ -2,7 +2,7 @@
 //! payload, and inject it into a running Minecraft — with a live log. Long operations run on background threads and
 //! stream lines back through a channel so the window never blocks.
 
-use crate::{attach, build, procs};
+use crate::{attach, build, modinfo, procs};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -41,6 +41,8 @@ struct App {
     // build inputs
     repo: Option<PathBuf>,
     payload: String,
+    payload_info: Option<Result<modinfo::ModInfo, String>>,
+    info_for: String,
     config: String,
     agent_name: String,
     deps: String,
@@ -67,6 +69,8 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(10),
             repo,
             payload: String::new(),
+            payload_info: None,
+            info_for: String::new(),
             config: String::new(),
             agent_name: "mc-graft-agent.jar".into(),
             deps: String::new(),
@@ -90,6 +94,36 @@ impl App {
         if self.selected.is_none() {
             self.selected = self.jvms.iter().find(|j| j.is_minecraft).map(|j| j.pid);
         }
+    }
+
+    /// Point the build at a payload jar: read its mod info, auto-name the agent, and (for a known entrypoint-less mod
+    /// with a bundled example config) pre-fill the bootstrap config.
+    fn set_payload(&mut self, path: PathBuf) {
+        self.payload = path.display().to_string();
+        let info = modinfo::read_jar(&path);
+        match &info {
+            Ok(m) => {
+                self.status = format!("Loaded {}", m.summary());
+                if !m.id.is_empty() {
+                    self.agent_name = format!("{}-agent.jar", m.id);
+                }
+                // A mod with no entrypoints needs a bootstrap override; use a bundled example if one matches its id.
+                if m.needs_bootstrap_config() && self.config.trim().is_empty() {
+                    if let Some(repo) = &self.repo {
+                        let ex = repo.join(format!("examples/{}/bootstrap.properties", m.id));
+                        if ex.is_file() {
+                            self.config = ex.display().to_string();
+                            self.log_line(format!("[info] {} has no entrypoint — using bundled config {}", m.id, ex.display()));
+                        } else {
+                            self.log_line(format!("[warn] {} has no fabric entrypoint; it likely needs a bootstrap config (none bundled for this id)", m.id));
+                        }
+                    }
+                }
+            }
+            Err(e) => self.status = format!("Not a Fabric mod: {e}"),
+        }
+        self.payload_info = Some(info);
+        self.info_for = self.payload.clone();
     }
 
     fn log_line(&mut self, s: impl Into<String>) {
@@ -230,6 +264,22 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(400));
 
+        // Drag & drop: a dropped .jar becomes the payload (its fabric.mod.json is read for version info).
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if let Some(jar) = dropped.into_iter().find(|p| p.extension().map(|e| e.eq_ignore_ascii_case("jar")).unwrap_or(false)) {
+            self.set_payload(jar);
+        }
+        // While something is hovering over the window, show a "drop to load" hint.
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            let screen = ctx.screen_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd")));
+            p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+            p.text(screen.center(), egui::Align2::CENTER_CENTER, "Drop a mod jar to load it", egui::FontId::proportional(28.0), egui::Color32::WHITE);
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("mc-graft");
@@ -273,7 +323,40 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::CollapsingHeader::new("① Build agent").default_open(true).show(ui, |ui| {
+                ui.weak("Drag a mod jar anywhere on this window, or:");
                 path_row(ui, "Payload mod jar", &mut self.payload, &["jar"]);
+                if let Some(info) = &self.payload_info {
+                    match info {
+                        Ok(m) => {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong(&m.name);
+                                    ui.weak(format!("v{}", m.version));
+                                    ui.separator();
+                                    ui.label(format!("id: {}", m.id));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(mc) = &m.mc { ui.label(format!("MC: {mc}")); }
+                                    if let Some(l) = &m.loader { ui.label(format!("· loader: {l}")); }
+                                    ui.label(format!("· {} mixin config(s)", m.mixins.len()));
+                                    if let Some(aw) = &m.access_widener { ui.label(format!("· AW: {aw}")); }
+                                });
+                                let ep = m.entry_client.len() + m.entry_main.len();
+                                if m.needs_bootstrap_config() {
+                                    ui.colored_label(egui::Color32::from_rgb(220, 170, 60), "no entrypoint — needs a bootstrap config");
+                                } else {
+                                    ui.weak(format!("{ep} entrypoint(s)"));
+                                }
+                                if !m.other_deps.is_empty() {
+                                    ui.weak(format!("depends: {}", m.other_deps.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(", ")));
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, format!("Not a Fabric mod jar: {e}"));
+                        }
+                    }
+                }
                 path_row(ui, "Bootstrap config (optional)", &mut self.config, &["properties"]);
                 ui.horizontal(|ui| {
                     ui.label("Agent name");
@@ -327,6 +410,17 @@ impl eframe::App for App {
                 }
             });
         });
+
+        // If the payload path changed via Browse/typing (not a drop, which already re-parsed), refresh the mod info.
+        if self.payload.trim() != self.info_for.trim() {
+            let p = self.payload.trim().to_string();
+            if std::path::Path::new(&p).is_file() {
+                self.set_payload(PathBuf::from(p));
+            } else {
+                self.info_for = self.payload.clone();
+                self.payload_info = None;
+            }
+        }
     }
 }
 

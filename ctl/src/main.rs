@@ -6,6 +6,7 @@
 mod attach;
 mod build;
 mod gui;
+mod modinfo;
 mod procs;
 
 use clap::{Parser, Subcommand};
