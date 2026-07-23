@@ -2,30 +2,30 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.util.*;
 
-/** Child-first loader for LiquidBounce's own packages + relocated sidecars, installed as the fallback of NeoForge's
- *  TransformingClassLoader (its parent). Adapted from docs/neoforge-agent-selfcontained nfagent.LbLoader, with two
+/** Child-first loader for the payload's own packages + relocated sidecars, installed as the fallback of NeoForge's
+ *  TransformingClassLoader (its parent). Adapted from docs/neoforge-agent-selfcontained nfagent.PayloadLoader, with two
  *  late-attach additions:
- *   - {@code define(name,bytes)} — the host defines relocated sidecars/state into an LB-owned package here (JPMS
+ *   - {@code define(name,bytes)} — the host defines relocated sidecars/state into a payload-owned package here (JPMS
  *     forbids defining them into module `minecraft`); a TCL-loaded target' resolves them via the TCL fallback -> this.
- *   - {@code shared} routing — lbrt.* runtime helpers (AwReflect/DuckDispatch/JoinGate/Platform) must be ONE identity
- *     shared by the agent (system loader), LB, and the sidecars; this loader delegates lbrt.* to the agent loader so
+ *   - {@code shared} routing — mcgraft.rt.* runtime helpers (AwReflect/DuckDispatch/JoinGate/Platform) must be ONE identity
+ *     shared by the agent (system loader), the payload, and the sidecars; this loader delegates mcgraft.rt.* to the agent loader so
  *     Platform.LOADER / DuckDispatch's tables are the same objects the host populated. */
-public final class LbLoader extends URLClassLoader {
-    private final Set<String> ownedPkgs;          // e.g. "net/ccbluex/liquidbounce/features/", "net/ccbluex/lbrt/sc/"
+public final class PayloadLoader extends URLClassLoader {
+    private final Set<String> ownedPkgs;          // e.g. "com/example/mod/features/", "mcgraft/sc/"
     private final ClassLoader original;           // FML's pre-existing TCL fallback (may be null)
-    private final ClassLoader shared;             // the agent (system) loader that owns the single lbrt.* identity
+    private final ClassLoader shared;             // the agent (system) loader that owns the single mcgraft.rt.* identity
     private final ThreadLocal<Set<String>> loadingNames = ThreadLocal.withInitial(HashSet::new);
     private final ThreadLocal<Set<String>> resolvingNames = ThreadLocal.withInitial(HashSet::new);
     private final ThreadLocal<Set<String>> resolvingMulti = ThreadLocal.withInitial(HashSet::new);
 
-    public LbLoader(URL[] urls, ClassLoader parentTcl, ClassLoader original, ClassLoader shared, Set<String> ownedPkgs) {
-        super("lb-agent-loader", urls, parentTcl);
+    public PayloadLoader(URL[] urls, ClassLoader parentTcl, ClassLoader original, ClassLoader shared, Set<String> ownedPkgs) {
+        super("mcgraft-agent-loader", urls, parentTcl);
         this.original = original;
         this.shared = shared;
         this.ownedPkgs = ownedPkgs;
     }
 
-    /** Define a host-generated class (relocated sidecar / state) into this loader's LB-owned package. */
+    /** Define a host-generated class (relocated sidecar / state) into this loader's payload-owned package. */
     public synchronized Class<?> define(String dotted, byte[] b) {
         Class<?> existing = findLoadedClass(dotted);
         if (existing != null) return existing;
@@ -37,11 +37,11 @@ public final class LbLoader extends URLClassLoader {
         if (i <= 0) return false;
         return ownedPkgs.contains(internal.substring(0, i + 1));
     }
-    private static boolean isLbrt(String name) { return name.startsWith("lbrt."); }
+    private static boolean isLbrt(String name) { return name.startsWith("mcgraft.rt."); }
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-        // lbrt.* -> the agent loader's single copy (Platform.LOADER / DuckDispatch tables set by the host live there).
+        // mcgraft.rt.* -> the agent loader's single copy (Platform.LOADER / DuckDispatch tables set by the host live there).
         if (isLbrt(name) && shared != null) {
             Class<?> c = shared.loadClass(name);
             if (resolve) resolveClass(c);

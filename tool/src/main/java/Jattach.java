@@ -104,7 +104,7 @@ final class Jattach {
         // Prefer java.io.tmpdir; if it is mounted noexec (or an ACL blocks exec), the exec PROBE below fails even though
         // the exec bit was set, so fall back to a private dir under user.home. File.canExecute() only reads the bit and
         // misses a noexec mount, so we actually run the binary once (no args -> prints usage, exits) to be sure.
-        Path out = stage(Files.createTempDirectory("lb-jattach-"), resource, outName);
+        Path out = stage(Files.createTempDirectory("mcgraft-jattach-"), resource, outName);
         if (!execWorks(out)) {
             Path home = Path.of(System.getProperty("user.home", "."));
             Path alt = stage(Files.createTempDirectory(home, ".lb-jattach-"), resource, outName);

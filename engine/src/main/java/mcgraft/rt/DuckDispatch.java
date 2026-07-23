@@ -1,4 +1,4 @@
-package lbrt;
+package mcgraft.rt;
 
 import java.lang.invoke.MethodType;
 import java.lang.reflect.*;
@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Runtime dispatcher for duck interfaces which cannot be added to already-loaded targets. */
 public final class DuckDispatch {
-    private static final ClassLoader SYS = lbrt.Platform.LOADER;
+    private static final ClassLoader SYS = mcgraft.rt.Platform.LOADER;
     private static final Map<String,List<Impl>> IMPLEMENTATIONS = new ConcurrentHashMap<>();
     private static final Map<String,Class<?>> TARGETS = new ConcurrentHashMap<>();
     private static final Map<Key,Method> METHODS = new ConcurrentHashMap<>();

@@ -1,18 +1,18 @@
 import org.objectweb.asm.*;
 import org.objectweb.asm.tree.*;
 import java.util.*;
-import lbrt.InjectionLogger;
+import mcgraft.rt.InjectionLogger;
 
 /**
  * Rewrites loadable static Mixin {@code @Accessor}/{@code @Invoker} stubs into schema-neutral
- * calls through lbrt.AwReflect. Normal Mixin fabricates target members for these declarations,
+ * calls through mcgraft.rt.AwReflect. Normal Mixin fabricates target members for these declarations,
  * but a late attach cannot add those members to an already-defined target class.
  */
 public final class AccessorBridgeRewriter {
     private static final String MIXIN = "Lorg/spongepowered/asm/mixin/Mixin;";
     private static final String ACCESSOR = "Lorg/spongepowered/asm/mixin/gen/Accessor;";
     private static final String INVOKER = "Lorg/spongepowered/asm/mixin/gen/Invoker;";
-    private static final String AWR = "lbrt/AwReflect";
+    private static final String AWR = "mcgraft/rt/AwReflect";
 
     private AccessorBridgeRewriter() {}
 

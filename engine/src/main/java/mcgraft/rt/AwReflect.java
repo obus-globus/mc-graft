@@ -1,15 +1,15 @@
-package lbrt;
+package mcgraft.rt;
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Runtime reflection helper for LB's direct access to non-public members / inaccessible TYPES of ALREADY-LOADED MC
+/** Runtime reflection helper for the payload's direct access to non-public members / inaccessible TYPES of ALREADY-LOADED MC
  *  classes (which the AccessWidener could not widen — retransform forbids modifier changes). Owner + parameter types
  *  are passed as class-name STRINGS and resolved via Class.forName (which performs no access check), so no inaccessible
- *  type ever appears as a constant/CHECKCAST in LB's verified bytecode. Handles cached, setAccessible. Static access
+ *  type ever appears as a constant/CHECKCAST in the payload's verified bytecode. Handles cached, setAccessible. Static access
  *  passes target=null. */
 public final class AwReflect {
-    private static final ClassLoader SYS = lbrt.Platform.LOADER;
+    private static final ClassLoader SYS = mcgraft.rt.Platform.LOADER;
     private static final Map<String,Class<?>> KC = new ConcurrentHashMap<>();
     private static final Map<String,Field> FC = new ConcurrentHashMap<>();
     private static final Map<String,Method> MC = new ConcurrentHashMap<>();

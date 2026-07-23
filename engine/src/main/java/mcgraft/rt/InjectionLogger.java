@@ -1,4 +1,4 @@
-package lbrt;
+package mcgraft.rt;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -10,7 +10,7 @@ import java.nio.file.StandardOpenOption;
 
 /** Dedicated logger for late-injection diagnostics consumed by the injector UI. */
 public final class InjectionLogger {
-    public static final String PREFIX = "[LB-INJECT]";
+    public static final String PREFIX = "[mc-graft]";
     /** Separator between key=value agent-arg tokens; a control char that cannot appear in a filesystem path. */
     public static final char ARG_SEP = (char) 1;
 

@@ -9,10 +9,10 @@ import org.spongepowered.asm.service.MixinService;
 import java.io.*; import java.lang.instrument.Instrumentation; import java.lang.reflect.Method;
 import java.nio.file.*; import java.security.ProtectionDomain; import java.util.jar.*;
 import vspike.VSpikeService;
-import lbrt.InjectionLogger;
+import mcgraft.rt.InjectionLogger;
 
-/** Vanilla late-attach platform: MC + staged LB live on the SYSTEM classloader, and the agent stands up its OWN
- *  standalone Sponge Mixin service (VSpikeService) and applies LB's AccessWidener itself. */
+/** Vanilla late-attach platform: MC + staged the payload live on the SYSTEM classloader, and the agent stands up its OWN
+ *  standalone Sponge Mixin service (VSpikeService) and applies the payload's AccessWidener itself. */
 final class VanillaPlatform implements LoaderPlatform {
     private final ClassLoader sys = ClassLoader.getSystemClassLoader();
     private final Method defineClass5;                                        // reflective 5-arg ClassLoader.defineClass
@@ -32,10 +32,10 @@ final class VanillaPlatform implements LoaderPlatform {
     public byte[] bundleResource(String path){ try (InputStream in = sys.getResourceAsStream(path)) { return in==null?null:in.readAllBytes(); } catch(Throwable t){ return null; } }
 
     public Path stageBundle(Instrumentation inst, File agentJar) throws Exception {
-        Path tmp = Files.createTempDirectory("lb-full-"); tmp.toFile().deleteOnExit();
+        Path tmp = Files.createTempDirectory("mcgraft-vanilla-"); tmp.toFile().deleteOnExit();
         Path lbBundle = null;
         try (JarFile jf = new JarFile(agentJar)) { for (var en = jf.entries(); en.hasMoreElements();) { JarEntry e = en.nextElement(); String n = e.getName();
-            if (n.equals("lbrt/AwReflect.class") || n.equals("lbrt/Platform.class") || ((n.startsWith("lbrt/DuckDispatch") || n.startsWith("lbrt/JoinGate")) && n.endsWith(".class"))) {
+            if (n.equals("mcgraft/rt/AwReflect.class") || n.equals("mcgraft/rt/Platform.class") || ((n.startsWith("mcgraft/rt/DuckDispatch") || n.startsWith("mcgraft/rt/JoinGate")) && n.endsWith(".class"))) {
                 byte[] b; try (InputStream in=jf.getInputStream(e)){ b=in.readAllBytes(); }
                 if(!defineClass(n.substring(0, n.length()-6).replace('/','.'), b, null))
                     throw new IllegalStateException("Cannot stage runtime class "+n);

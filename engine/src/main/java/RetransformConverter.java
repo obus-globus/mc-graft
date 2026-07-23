@@ -17,7 +17,7 @@ import java.util.function.Predicate;
  *   added static field    -> a static field on the sidecar.
  *   added method          -> a static method on the sidecar with the target as param0 (instance slot0=this
  *                            maps 1:1 to static slot0=param0, so bodies need no local reindexing).
- *   added interface       -> dropped from target' (external LB call-sites are rewritten at build time).
+ *   added interface       -> dropped from target' (external the payload call-sites are rewritten at build time).
  */
 public class RetransformConverter {
     public static final class Result {
@@ -28,15 +28,15 @@ public class RetransformConverter {
     }
 
     /** NeoForge (JPMS): sidecars cannot enter module `minecraft` (it owns net/minecraft/*), so they are RELOCATED into
-     *  an LB-owned package. Null (vanilla/Fabric) keeps the sidecar in the target's own package. When set, the sidecar
+     *  a payload-owned package. Null (vanilla/Fabric) keeps the sidecar in the target's own package. When set, the sidecar
      *  becomes cross-package for EVERY target, so the pkg(caller)!=pkg(owner) checks in illegalSidecarMethod /
      *  rewriteRefs automatically route ALL non-public MC access (package-private included) through AwReflect — no other
-     *  logic change is needed. Must be an LB-owned package dir ending in '/', e.g. "net/ccbluex/lbrt/sc/". */
+     *  logic change is needed. Must be a payload-owned package dir ending in '/', e.g. "mcgraft/sc/". */
     public static volatile String SIDECAR_PKG = null;
-    /** Injective-enough mangle: net/a/B$C -> <pkg>net_a_B_C$$LBSidecar. Target internal names are a fixed, unique set. */
+    /** Injective-enough mangle: net/a/B$C -> <pkg>net_a_B_C$$Sidecar. Target internal names are a fixed, unique set. */
     static String sidecarInternal(String internal) {
-        return SIDECAR_PKG == null ? internal + "$$LBSidecar"
-                                   : SIDECAR_PKG + internal.replace('/', '_').replace('$', '_') + "$$LBSidecar";
+        return SIDECAR_PKG == null ? internal + "$$Sidecar"
+                                   : SIDECAR_PKG + internal.replace('/', '_').replace('$', '_') + "$$Sidecar";
     }
 
     final String targetInternal, targetDesc, sidecar, stateName;
@@ -241,15 +241,15 @@ public class RetransformConverter {
     void addSidecarClinit(ClassNode S) {
         MethodNode c = new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
         InsnList in = c.instructions;
-        // WEAK-IDENTITY per-instance store (lbrt.WeakIdentityHashMap): keys weakly by object identity, so relocated
+        // WEAK-IDENTITY per-instance store (mcgraft.rt.WeakIdentityHashMap): keys weakly by object identity, so relocated
         // @Unique state is collected with its target instead of leaking for the whole session — a real @Unique field
         // dies with its object, and this must match (targets like per-frame EntityRenderState / per-line GuiMessage /
         // PlayerInfo churn hard). It must NOT call target.hashCode()/equals(): a mixin-modified hashCode() reading a
         // relocated field would recurse into getState() -> map.get(self) -> hashCode(). WeakHashMap can't be used
         // (it keys on equals/hashCode); IdentityHashMap can't (strong keys -> unbounded leak). Thread-safe internally.
-        in.add(new TypeInsnNode(Opcodes.NEW, "lbrt/WeakIdentityHashMap"));
+        in.add(new TypeInsnNode(Opcodes.NEW, "mcgraft/rt/WeakIdentityHashMap"));
         in.add(new InsnNode(Opcodes.DUP));
-        in.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "lbrt/WeakIdentityHashMap", "<init>", "()V", false));
+        in.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "mcgraft/rt/WeakIdentityHashMap", "<init>", "()V", false));
         in.add(new FieldInsnNode(Opcodes.PUTSTATIC, sidecar, "STATE", "Ljava/util/Map;"));
         in.add(new InsnNode(Opcodes.RETURN));
         c.maxStack = 2; c.maxLocals = 0; S.methods.add(c);
@@ -500,12 +500,12 @@ public class RetransformConverter {
                     gti.desc = impls.get(0)[0];
                 } else if (gti.getOpcode() == Opcodes.CHECKCAST) {
                     InsnList suffix = new InsnList(); suffix.add(new LdcInsnNode(gti.desc));
-                    suffix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "lbrt/DuckDispatch", "cast",
+                    suffix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "cast",
                         "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;", false));
                     m.instructions.insertBefore(gti, suffix); m.instructions.remove(gti);
                 } else {
                     InsnList suffix = new InsnList(); suffix.add(new LdcInsnNode(gti.desc));
-                    suffix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "lbrt/DuckDispatch", "isInstance", "(Ljava/lang/Object;Ljava/lang/String;)Z", false));
+                    suffix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "isInstance", "(Ljava/lang/Object;Ljava/lang/String;)Z", false));
                     m.instructions.insertBefore(gti, suffix); m.instructions.remove(gti);
                 }
             } else if (GIFACE != null && p instanceof MethodInsnNode gmi && gmi.getOpcode() == Opcodes.INVOKEINTERFACE && GIFACE.containsKey(gmi.owner)) {
@@ -753,14 +753,14 @@ public class RetransformConverter {
             in.add(new VarInsnNode(at[i].getOpcode(Opcodes.ILOAD), slot)); box(in, at[i]);
             in.add(new InsnNode(Opcodes.AASTORE)); slot += at[i].getSize();
         }
-        in.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "lbrt/DuckDispatch", "invoke",
+        in.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "invoke",
             "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;", false));
         emitReturn(in, rt);
         m.maxStack = 8 + at.length; m.maxLocals = slot;
         return m;
     }
 
-    /** Schema-neutral LB-caller rewrite for interfaces dropped from already-loaded targets. */
+    /** Schema-neutral payload-caller rewrite for interfaces dropped from already-loaded targets. */
     public static byte[] rewriteCaller(byte[] callerBytes, Map<String,List<String[]>> ifaceMap) {
         ClassNode c = read(callerBytes); int n = 0;
         for (MethodNode m : c.methods) {
@@ -773,13 +773,13 @@ public class RetransformConverter {
                     if (impls.size() == 1) ti.desc = impls.get(0)[0];
                     else if (ti.getOpcode() == Opcodes.CHECKCAST) {
                         InsnList call = new InsnList(); call.add(new LdcInsnNode(iface));
-                        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "lbrt/DuckDispatch", "cast",
+                        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "cast",
                             "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;", false));
                         m.instructions.insertBefore(ti, call); m.instructions.remove(ti);
                     }
                     else {
                         InsnList call = new InsnList(); call.add(new LdcInsnNode(iface));
-                        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "lbrt/DuckDispatch", "isInstance", "(Ljava/lang/Object;Ljava/lang/String;)Z", false));
+                        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "isInstance", "(Ljava/lang/Object;Ljava/lang/String;)Z", false));
                         m.instructions.insertBefore(ti, call); m.instructions.remove(ti);
                     }
                     n++;
@@ -795,7 +795,7 @@ public class RetransformConverter {
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() != Opcodes.INVOKEINTERFACE
                         && addedCallStatic(mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC) != null) {
                     // Call to a mixin-ADDED method (relocated to a sidecar) reached via a CONCRETE-class
-                    // INVOKEVIRTUAL/INVOKESPECIAL/INVOKESTATIC rather than through a duck interface. LB routes added
+                    // INVOKEVIRTUAL/INVOKESPECIAL/INVOKESTATIC rather than through a duck interface. the payload routes added
                     // methods through duck interfaces (handled above); clients that OVERRIDE an inherited vanilla
                     // method call the concrete class directly, so redirect those sites to the sidecar static exactly
                     // as rewriteRefs does — preserving the mixin override behavior instead of silently dispatching to
@@ -839,28 +839,28 @@ public class RetransformConverter {
         in.add(intConst(at.length)); in.add(new TypeInsnNode(Opcodes.ANEWARRAY,"java/lang/Object"));
         for(int i=0;i<at.length;i++){in.add(new InsnNode(Opcodes.DUP));in.add(intConst(i));
             in.add(new VarInsnNode(at[i].getOpcode(Opcodes.ILOAD),slots[i]));box(in,at[i]);in.add(new InsnNode(Opcodes.AASTORE));}
-        in.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"lbrt/DuckDispatch","invoke",
+        in.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"mcgraft/rt/DuckDispatch","invoke",
             "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",false));
         adaptInlineResult(in,rt,false,NEVER_INACC);
         m.instructions.insertBefore(mi,in);m.instructions.remove(mi);m.maxLocals=Math.max(m.maxLocals,next);
     }
 
-    /** Decides whether an LB access of an MC member must be reflection-routed, and which MC types are inaccessible
-     *  (already-loaded + package-private: can be neither AW-widened nor referenced from LB bytecode). */
+    /** Decides whether an the payload access of an MC member must be reflection-routed, and which MC types are inaccessible
+     *  (already-loaded + package-private: can be neither AW-widened nor referenced from the payload bytecode). */
     public interface Resolver {
         boolean fieldNeedsReflect(String owner, String name, String desc);
         boolean methodNeedsReflect(String owner, String name, String desc);
         boolean typeInaccessible(String internalName);
     }
-    static final String AWR = "lbrt/AwReflect";
+    static final String AWR = "mcgraft/rt/AwReflect";
     /** Type-inaccessibility predicate used when erasing CHECKCASTs to types the rewritten class cannot name. It is
      *  threaded as a parameter through the AW-inline helpers (NOT a shared static) so the caller path (LB→MC, uses the
      *  Resolver) and the sidecar path (relocated body, uses {@link #typeInaccessibleFromSidecar}) never clobber each
      *  other and both are thread-safe. NEVER_INACC is the no-op used where no erasure applies. */
     static final Predicate<String> NEVER_INACC = t -> false;
 
-    /** Rewrite LB's own direct access to non-public members / inaccessible TYPES of already-loaded MC classes into
-     *  reflective calls (fields/methods/ctors -> lbrt/AwReflect via string-named owner+param types, so no inaccessible
+    /** Rewrite the payload's own direct access to non-public members / inaccessible TYPES of already-loaded MC classes into
+     *  reflective calls (fields/methods/ctors -> mcgraft/rt/AwReflect via string-named owner+param types, so no inaccessible
      *  type appears as a constant), and erase CHECKCASTs to inaccessible types. Classes loaded AFTER attach get the
      *  AccessWidener on-load, so their members stay direct (Resolver returns false for them). */
     public static synchronized byte[] rewriteLbAw(byte[] lbBytes, Resolver r) {
@@ -979,12 +979,12 @@ public class RetransformConverter {
     /** reads class metadata (superName / interfaces / isInterface) WITHOUT loading the class; set by the agent. */
     public static java.util.function.Function<String,byte[]> CLASS_BYTES;
     /** [BUG22 FIX] When emitting a class that will be REDEFINED over an already-loaded original (target',
-     *  rewritten LB callers), seed the ClassWriter with the ORIGINAL bytes' ClassReader so the emitted constant
+     *  rewritten the payload callers), seed the ClassWriter with the ORIGINAL bytes' ClassReader so the emitted constant
      *  pool is an index-preserving EXTENSION of the loaded class's pool (original entries keep their indices, new
      *  entries appended). A freely reordered pool triggers a JVM redefinition bug on records with annotated record
      *  components (GuiMessage: @Nullable on the `signature` component): RetransformClasses succeeds but the class's
      *  field metadata is corrupted -> intermittent `NoSuchFieldError: addedTime` at GuiMessage.<init>, and
-     *  EXCEPTION_ACCESS_VIOLATION in Class.getDeclaredFields0 (JDK-8315575 family; reproduced LB-free with a pure
+     *  EXCEPTION_ACCESS_VIOLATION in Class.getDeclaredFields0 (JDK-8315575 family; reproduced payload-free with a pure
      *  ASM round-trip, and clean with an identity clone and with this CP-preserving mode). NOTE: the basis MUST be
      *  the loaded original O, not the mixin output X
      *  (Mixin's own ClassWriter already reordered X's pool). */

@@ -64,7 +64,23 @@ payload.entrypoints.main   ModInitializer classes (fabric "main")
 payload.entrypoints.client ClientModInitializer classes (fabric "client")
 payload.mixins.neoforge    optional NeoForge-specific mixin config set
 payload.dependencies       external dependency mods to stage, as Maven coordinates (see below)
+payload.packages           optional: internal-name prefixes the payload's own classes live under (scopes the caller
+                           preflight); empty falls back to the exact payload class set — needed only for fat jars
 ```
+
+Optional bootstrap keys (all default to off, so a plain entrypoint mod needs none):
+
+```
+bootstrap.reloadResources    trigger a resource reload on attach to drive a mod that defers init to a reload listener
+bootstrap.thawRegistries     built-in registries the mod writes into during init (e.g. minecraft:sound_event); held
+                             writable across the reload and restored after — comma-separated ids
+bootstrap.gameDirProperty    system property the mod reads for its data dir (e.g. LiquidBounce reads vspike.gameDir)
+bootstrap.joinGate.screen    MC screen internal name whose multiplayer-connect is deferred until the mod reports ready
+                             (e.g. net/minecraft/client/gui/screens/ConnectScreen); omit to disable the join gate
+```
+
+The AccessWidener namespace is read from the AW file's own header, and the sidecar relocation package (NeoForge only)
+defaults to `mcgraft/sc/` (`-Dmcgraft.sidecarPackage=` to override) — neither is hardcoded to any mod.
 
 **Dependencies.** Late-attach bypasses the Fabric loader, which is what normally unpacks a mod's bundled
 (jar-in-jar) dependencies and its declared dependency mods. mc-graft handles both:
@@ -98,7 +114,7 @@ probe before publishing the retransforms. See `examples/liquidbounce/bootstrap.p
 ## Layout
 
 ```
-engine/        converter, verifier, loader platforms, agent, lbrt runtime
+engine/        converter, verifier, loader platforms, agent, mcgraft.rt runtime helpers
 mixinservice/  standalone Sponge-Mixin service (used on bare vanilla)
 tool/          attach launcher / UI (standalone gradle build)
 examples/      per-mod config (LB, Wurst)

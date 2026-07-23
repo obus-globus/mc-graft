@@ -34,7 +34,7 @@ final class McefNative {
             if (selfJar == null || !selfJar.isFile()) return;
             try (JarFile jf = new JarFile(selfJar)) {
                 if (jf.getEntry("mcef-native/libcef.so") == null) return; // native not bundled -> download-on-load
-                Path dir = Paths.get(System.getProperty("java.io.tmpdir"), "lb-mcef-native");
+                Path dir = Paths.get(System.getProperty("java.io.tmpdir"), "mcgraft-mcef-native");
                 Path marker = dir.resolve(".extract-complete");
                 Files.createDirectories(dir);
                 // Cross-process exclusive lock: the staging dir is fixed and SHARED, so two clients attaching on the same

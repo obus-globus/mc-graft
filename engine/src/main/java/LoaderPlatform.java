@@ -5,23 +5,23 @@ import java.io.File; import java.lang.instrument.Instrumentation; import java.ni
  *  loader. The transactional convert/verify/publish
  *  algorithm, the CFT, the kick, and RetransformConverter stay in FullInjectAgent and drive these primitives. */
 interface LoaderPlatform {
-    /** Coupling #1: loader that holds net.minecraft.* and the staged LB bundle (vanilla: system; Fabric: Knot;
+    /** Coupling #1: loader that holds net.minecraft.* and the staged the payload bundle (vanilla: system; Fabric: Knot;
      *  NeoForge: TransformingClassLoader). All Class.forName / kick resolution routes through this. */
     ClassLoader targetLoader();
 
-    /** Coupling #2/#7: stage the bundled LB+deps onto the target loader and define the lbrt runtime helpers; returns
-     *  the extracted liquidbounce.jar (for caller preflight). agentJar is the agent's own jar. */
+    /** Coupling #2/#7: stage the bundled payload+deps onto the target loader and define the mcgraft.rt runtime helpers; returns
+     *  the extracted payload jar (for caller preflight). agentJar is the agent's own jar. */
     Path stageBundle(Instrumentation inst, File agentJar) throws Exception;
 
-    /** Coupling #3: stand up (vanilla) or acquire (modded) the Mixin service and register LB configs. Call once,
+    /** Coupling #3: stand up (vanilla) or acquire (modded) the Mixin service and register the payload configs. Call once,
      *  after stageBundle. The transformer itself stays loader-internal (Fabric's lives on Knot / behind reflection). */
     void initMixin() throws Exception;
 
-    /** Coupling #3: (Fabric-only) pre-compute the schema baseline for each target while LB's late-added config is still
-     *  unvisited, so `originalBytes(target)` returns the "all OTHER mods applied, LB not yet" plane. On Fabric the live
+    /** Coupling #3: (Fabric-only) pre-compute the schema baseline for each target while the payload's late-added config is still
+     *  unvisited, so `originalBytes(target)` returns the "all OTHER mods applied, the payload not yet" plane. On Fabric the live
      *  Knot transformer re-applies the whole mod mixin stack (fabric-api/iris/sodium/...) on every call, so the diff
-     *  baseline must be that stack MINUS LB — otherwise every other mod's additions are misattributed to LB. No-op on
-     *  loaders whose transformer only carries LB's mixins (vanilla). Call once, right before phase A. */
+     *  baseline must be that stack MINUS the payload — otherwise every other mod's additions are misattributed to the payload. No-op on
+     *  loaders whose transformer only carries the payload's mixins (vanilla). Call once, right before phase A. */
     default void prepareBaselines(java.util.List<String> internalTargets) throws Exception {}
 
     /** Coupling #3: mixin-transform a target and return X (the mixin output), or null if the mixin did not change the

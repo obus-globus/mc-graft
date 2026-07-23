@@ -37,7 +37,7 @@ import com.sun.jna.ptr.PointerByReference;
 public final class InjectorUi extends JFrame {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final Pattern TASKLIST_CSV = Pattern.compile("^\"([^\"]+)\",\"([0-9]+)\"");
-    private static final char AGENT_ARG_SEP = (char) 1;   // must match lbrt.InjectionLogger.ARG_SEP
+    private static final char AGENT_ARG_SEP = (char) 1;   // must match mcgraft.rt.InjectionLogger.ARG_SEP
 
     private final ProcessTableModel processModel = new ProcessTableModel();
     private final JTable processTable = new JTable(processModel);
@@ -47,13 +47,13 @@ public final class InjectorUi extends JFrame {
     private final JCheckBox tolerateFailuresCheck = new JCheckBox("Tolerate other-mod mixin failures (skip instead of aborting)");
     private final JTextArea logArea = new JTextArea();
     private final JButton refreshButton = new JButton("Refresh");
-    private final JButton injectButton = new JButton("Inject LiquidBounce");
+    private final JButton injectButton = new JButton("Inject payload");
     private final JProgressBar progressBar = new JProgressBar(0, 100);
     private SwingWorker<Void, String> logTailWorker;
     private volatile boolean tailingInjectionLog;
 
     private InjectorUi(String initialAgent) {
-        super("LiquidBounce Injector");
+        super("mc-graft injector");
         setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(690, 500));
         setSize(760, 560);
@@ -82,7 +82,7 @@ public final class InjectorUi extends JFrame {
         JLabel agentLabel = new JLabel("Agent JAR:");
         agentPanel.add(agentLabel, BorderLayout.WEST);
         agentField.setText(initialAgent);
-        agentField.setToolTipText("LiquidBounce agent JAR to load into the selected Minecraft JVM");
+        agentField.setToolTipText("payload agent JAR to load into the selected Minecraft JVM");
         agentField.getDocument().addDocumentListener(new DocumentListener() {
             @Override public void insertUpdate(DocumentEvent event) { updateInjectEnabled(); }
             @Override public void removeUpdate(DocumentEvent event) { updateInjectEnabled(); }
@@ -99,8 +99,8 @@ public final class InjectorUi extends JFrame {
         dataDirPanel.add(dataLabel, BorderLayout.WEST);
         JButton dataBrowse = new JButton("Browse...");
         dataBrowse.addActionListener(event -> browseForDataDir());
-        dataDirField.setToolTipText("Folder that will contain LiquidBounce/ (config, accounts, CEF cache).");
-        dataModeCombo.setToolTipText("Where to create the LiquidBounce/ folder in the injected client.");
+        dataDirField.setToolTipText("Folder that will hold the payload\u0027s data directory.");
+        dataModeCombo.setToolTipText("Where the payload\u0027s data directory is created in the injected client.");
         dataModeCombo.addActionListener(event -> {
             boolean custom = dataModeCombo.getSelectedIndex() == 2;
             dataDirField.setEnabled(custom);
@@ -119,7 +119,7 @@ public final class InjectorUi extends JFrame {
 
         tolerateFailuresCheck.setToolTipText("<html>Modded loaders only. When another mod's mixin fails to apply to an already-loaded class during injection,<br>"
                 + "the default (off) aborts the whole injection. Enable this to skip just that class and continue &mdash; useful in<br>"
-                + "heavy modpacks where one incompatible mod would otherwise block LiquidBounce entirely.</html>");
+                + "heavy modpacks where one incompatible mod would otherwise block the payload entirely.</html>");
         JPanel form = new JPanel(new GridLayout(3, 1, 0, 6));
         form.add(agentPanel);
         form.add(dataDirPanel);
@@ -164,7 +164,7 @@ public final class InjectorUi extends JFrame {
 
     private void browseForAgent() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Select LiquidBounce agent JAR");
+        chooser.setDialogTitle("Select payload agent JAR");
         chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Java archives (*.jar)", "jar"));
         File current = new File(agentField.getText().trim());
         if (current.exists()) chooser.setSelectedFile(current);
@@ -176,7 +176,7 @@ public final class InjectorUi extends JFrame {
 
     private void browseForDataDir() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Select the folder to hold LiquidBounce/");
+        chooser.setDialogTitle("Select the payload data directory");
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         String current = dataDirField.getText().trim();
         if (!current.isEmpty()) chooser.setSelectedFile(new File(current));
@@ -244,7 +244,7 @@ public final class InjectorUi extends JFrame {
             // Random-named (createTempFile: O_EXCL + owner-only), not a fixed /tmp/liquidbounce-<verb>-<pid>.log an
             // attacker on a shared host could pre-plant a symlink at and clobber via the truncating open. The tool holds
             // the path and passes it to the agent, so predictability buys nothing.
-            injectionLog = Files.createTempFile("liquidbounce-" + verb + "-" + process.pid + "-", ".log").toFile();
+            injectionLog = Files.createTempFile("mcgraft-" + verb + "-" + process.pid + "-", ".log").toFile();
             injectionLog.deleteOnExit();
             startInjectionLogTail(injectionLog);
             appendLog("Dedicated " + verb + " log: " + injectionLog.getAbsolutePath());
@@ -295,8 +295,8 @@ public final class InjectorUi extends JFrame {
                 try {
                     get();
                     if (tailingInjectionLog) {
-                        appendLog("Agent delivered; waiting for LiquidBounce initialization to finish.");
-                        setProgressIfHigher(70, "Initializing LiquidBounce ...");
+                        appendLog("Agent delivered; waiting for payload initialization to finish.");
+                        setProgressIfHigher(70, "Initializing payload ...");
                     } else {
                         appendLog(Verb + " completed successfully (target log unavailable). ");
                         progressBar.setValue(100);
@@ -314,7 +314,7 @@ public final class InjectorUi extends JFrame {
                     tailingInjectionLog = false;
                     JOptionPane.showMessageDialog(InjectorUi.this,
                             Verb + " failed:\n" + message + "\n\nSee the log for details.",
-                            "LiquidBounce Injector", JOptionPane.ERROR_MESSAGE);
+                            "mc-graft injector", JOptionPane.ERROR_MESSAGE);
                 } finally {
                     if (!tailingInjectionLog)
                         setBusy(false, progressBar.getString(), progressBar.getValue());
@@ -327,7 +327,7 @@ public final class InjectorUi extends JFrame {
         if (logTailWorker != null && !logTailWorker.isDone()) logTailWorker.cancel(true);
         tailingInjectionLog = true;
         long startOffset = logFile.length();
-        String successMarker = "LiquidBounce initialization completed";
+        String successMarker = "initialization completed";
         logTailWorker = new SwingWorker<>() {
             private boolean sawSuccess;
 
@@ -348,7 +348,7 @@ public final class InjectorUi extends JFrame {
                             sawSuccess = true;
                             deadline = Math.min(deadline, System.currentTimeMillis() + 15_000L);
                         }
-                        if (line.contains("[LB-INJECT]")
+                        if (line.contains("[mc-graft]")
                                 && (line.contains("restored original state") || line.contains("initialization failed"))
                                 || line.contains("Game crashed")) {
                             break;
@@ -368,8 +368,8 @@ public final class InjectorUi extends JFrame {
             @Override protected void done() {
                 if (!isCancelled() && sawSuccess) {
                     progressBar.setValue(100);
-                    progressBar.setString("LiquidBounce injection complete");
-                    appendLog("LiquidBounce injection completed successfully.");
+                    progressBar.setString("payload injection complete");
+                    appendLog("payload injection completed successfully.");
                 } else if (!isCancelled() && progressBar.getValue() < 100) {
                     appendLog("Stopped waiting for the injection completion marker.");
                     progressBar.setString("Injection log monitoring ended");
@@ -382,13 +382,13 @@ public final class InjectorUi extends JFrame {
     }
 
     private static boolean isInjectionLogLine(String line) {
-        return line.contains("[LB-INJECT]")
-                || line.contains("LiquidBounce initialization completed");
+        return line.contains("[mc-graft]")
+                || line.contains("initialization completed");
     }
 
     private void applyInjectionProgress(String line) {
-        if (line.contains("staging LB bundle"))
-            setProgressIfHigher(48, "Staging LiquidBounce bundle ...");
+        if (line.contains("staging payload bundle"))
+            setProgressIfHigher(48, "Staging payload bundle ...");
         else if (line.contains("inaccessible already-loaded AW classes"))
             setProgressIfHigher(52, "Checking loaded classes ...");
         else if (line.contains("phase A:"))
@@ -397,22 +397,20 @@ public final class InjectorUi extends JFrame {
             setProgressIfHigher(63, "Converting targets ...");
         else if (line.contains("retransformed "))
             setProgressIfHigher(70, "Retransforming loaded classes ...");
-        else if (line.contains("scheduled LB bootstrap"))
+        else if (line.contains("bootstrap on MC main thread"))
             setProgressIfHigher(75, "Bootstrap scheduled ...");
         else if (line.contains("unfroze ") || line.contains("thawed "))
             setProgressIfHigher(80, "Preparing registries ...");
-        else if (line.contains("callEvent(ClientStartEvent)"))
-            setProgressIfHigher(85, "Starting LiquidBounce ...");
-        else if (line.contains("ClientStartEvent dispatched"))
-            setProgressIfHigher(88, "Loading LiquidBounce ...");
-        else if (line.contains("LiquidBounce initialization completed"))
-            setProgressIfHigher(95, "LiquidBounce initialized; restoring registries ...");
+        else if (line.contains("reloadResourcePacks") || line.contains("bootstrapping"))
+            setProgressIfHigher(88, "Starting payload ...");
+        else if (line.contains("initialization completed"))
+            setProgressIfHigher(95, "payload initialized; restoring registries ...");
         else if (line.contains("restored original state")) {
             progressBar.setValue(100);
-            progressBar.setString("LiquidBounce injection complete");
-            appendLog("LiquidBounce injection completed successfully.");
+            progressBar.setString("payload injection complete");
+            appendLog("payload injection completed successfully.");
         } else if (line.contains("FAILED") || line.contains("initialization failed")) {
-            progressBar.setString("LiquidBounce injection reported a failure");
+            progressBar.setString("payload injection reported a failure");
         }
     }
 
@@ -614,7 +612,7 @@ public final class InjectorUi extends JFrame {
         return root.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message);
     }
 
-    private static final String AGENT_JAR_NAME = "liquidbounce-injector-agent.jar";
+    private static final String AGENT_JAR_NAME = "mc-graft-agent.jar";
 
     /** Default to the agent jar sitting next to the user (cwd first, then beside this tool jar); the usual layout is
      *  the two jars in the same folder. Falls back to the bare relative name if neither exists. */

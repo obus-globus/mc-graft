@@ -2,18 +2,18 @@ import org.spongepowered.asm.mixin.Mixins;                                  // i
 import org.objectweb.asm.*; import org.objectweb.asm.tree.*;
 import java.io.*; import java.lang.instrument.Instrumentation; import java.lang.reflect.*;
 import java.nio.file.*; import java.security.*; import java.util.*; import java.util.jar.*;
-import lbrt.InjectionLogger;
+import mcgraft.rt.InjectionLogger;
 
 /** Fabric (Knot) late-attach platform.
  *
  *  Cross-loader identity (Option B): the converter classes run on the SYSTEM loader (agent mechanism), but Sponge Mixin
  *  and ASM are on the process classpath and Knot delegates those packages to its parent, so they share one identity
  *  with the agent. Every Knot/Fabric/Mixin seam is therefore driven through REFLECTION on Object handles (the live
- *  transformer object is a Knot-visible MixinTransformer that we never cast to a system-loader type), and LB + its
- *  runtime helpers (lbrt.*) resolve on Knot via parent delegation — a single lbrt.Platform identity for agent + LB.
+ *  transformer object is a Knot-visible MixinTransformer that we never cast to a system-loader type), and the payload + its
+ *  runtime helpers (mcgraft.rt.*) resolve on Knot via parent delegation — a single mcgraft.rt.Platform identity for agent + the payload.
  *
  *  X-acquisition workaround (proven by the probe): a post-boot Mixins.addConfiguration is only applied by a direct
- *  transformClassBytes when (1) the LB configs are downgraded to required:false (else MixinTargetAlreadyLoadedException
+ *  transformClassBytes when (1) the the payload configs are downgraded to required:false (else MixinTargetAlreadyLoadedException
  *  on already-loaded targets) and (2) MixinProcessor.transformedCount is reset to 0 before the transform (forces
  *  checkSelect -> select -> prepareConfigs to promote the pending config). Both are asserted; a Mixin version drift
  *  fails loud. */
@@ -54,14 +54,14 @@ final class FabricPlatform implements LoaderPlatform {
         return knot;
     } catch (Throwable t){ throw rt("targetLoader (Knot acquisition)", t); } }
 
-    // ---- §3.2: stage LB onto Knot (deps already on the stock classpath are skipped; ASM/Mixin never pushed) ----------
+    // ---- §3.2: stage the payload onto Knot (deps already on the stock classpath are skipped; ASM/Mixin never pushed) ----------
     public Path stageBundle(Instrumentation inst, File agentJar) throws Exception {
         this.agentJar = agentJar;
-        exposeRuntimeToParent(agentJar);   // let Knot delegate lbrt.*/agent classes to the system loader (single identity)
+        exposeRuntimeToParent(agentJar);   // let Knot delegate mcgraft.rt.*/agent classes to the system loader (single identity)
         // basenames already on the process classpath -> pushing a second copy onto Knot would split class identity.
         Set<String> onCp = new HashSet<>();
         for (String p : System.getProperty("java.class.path","").split(File.pathSeparator)) { String b = new File(p).getName().toLowerCase(); if(!b.isEmpty()) onCp.add(b); }
-        Path tmp = Files.createTempDirectory("lb-fabric-"); tmp.toFile().deleteOnExit();
+        Path tmp = Files.createTempDirectory("mcgraft-fabric-"); tmp.toFile().deleteOnExit();
         Path lbBundle = null; int pushed = 0, skipped = 0;
         try (JarFile jf = new JarFile(agentJar)) { for (var en = jf.entries(); en.hasMoreElements();) { JarEntry e = en.nextElement(); String n = e.getName();
             if (!n.startsWith("agent-libs/") || !n.endsWith(".jar")) continue;
@@ -101,13 +101,13 @@ final class FabricPlatform implements LoaderPlatform {
     }
 
     // ---- expose the injector runtime to Knot via PARENT delegation (NOT a second Knot-owned copy) --------------------
-    // Sidecars run on Knot but reference lbrt.* helpers (AwReflect/DuckDispatch/JoinGate), which the agent loaded on the
+    // Sidecars run on Knot but reference mcgraft.rt.* helpers (AwReflect/DuckDispatch/JoinGate), which the agent loaded on the
     // SYSTEM loader. Knot's dev-mode isolation refuses to resolve them for game classes ("hasn't been exposed to the
     // game") -> NoClassDefFoundError the first time a late-loaded Knot class (e.g. DisconnectedScreen) links one.
     // Whitelisting the agent jar as a valid PARENT code source makes Knot's tryLoadClass/loadClass delegate those
     // classes to its parent (system) loader via parentClassLoader.loadClass instead of throwing -> a SINGLE identity
     // shared with the agent. This DELEGATES, never defineClass's a Knot-owned copy (that is what addToClassPath would
-    // do, forking the stateful helpers into two identities). lbrt.* is confirmed absent from every jar pushed onto
+    // do, forking the stateful helpers into two identities). mcgraft.rt.* is confirmed absent from every jar pushed onto
     // Knot, so Knot can never own a copy -> the single-identity property is structural, not incidental.
     //
     // Blast radius: the whitelist is code-source-granular, so in principle ANY agent-jar-root class Knot fails to find
@@ -149,7 +149,24 @@ final class FabricPlatform implements LoaderPlatform {
         catch (Throwable t) { try { return p.toRealPath(); } catch (Exception e) { return p.toAbsolutePath().normalize(); } }
     }
 
-    // ---- §1c/§3.3: register LB configs into the LIVE Knot Mixin (required:false), apply AW to Knot, grab transformer -
+    /** The namespace an AccessWidener declares in its header line ("accessWidener v2 &lt;namespace&gt;"). The live
+     *  ClassTweaker reader remaps entries from this namespace to the running client's — so it must be read from the
+     *  file, not hardcoded (an official-mapped build declares "named"/"official"; an intermediary one "intermediary"). */
+    static String accessWidenerNamespace(byte[] awBytes) {
+        try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(new ByteArrayInputStream(awBytes), java.nio.charset.StandardCharsets.UTF_8))) {
+            for (String line; (line = br.readLine()) != null; ) {
+                line = line.strip();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] tok = line.split("\\s+");
+                if (tok.length >= 3 && tok[0].equals("accessWidener")) return tok[2];
+                break;   // first non-comment line must be the header
+            }
+        } catch (Throwable ignored) {}
+        InjectionLogger.warn("could not read AccessWidener namespace from header; defaulting to 'named'");
+        return "named";
+    }
+
+    // ---- §1c/§3.3: register the payload configs into the LIVE Knot Mixin (required:false), apply AW to Knot, grab transformer -
     public void initMixin() throws Exception {
         // 1) AccessWidener onto the live Knot ClassTweaker (widens FUTURE classes; already-loaded go via AwReflect).
         PayloadConfig pc = PayloadConfig.get();
@@ -161,8 +178,9 @@ final class FabricPlatform implements LoaderPlatform {
             Class<?> ctrCls = fc("net.fabricmc.loader.impl.lib.classtweaker.api.ClassTweakerReader");
             Method create = null; for (Method m : ctrCls.getMethods()) if (m.getName().equals("create") && m.getParameterCount()==1) { create=m; break; }
             Object reader = create.invoke(null, classTweaker);
-            reader.getClass().getMethod("read", byte[].class, String.class).invoke(reader, awBytes, "official");
-            InjectionLogger.info("applied "+pc.accessWidener+" to live Knot ClassTweaker ("+awBytes.length+" bytes)");
+            String ns = accessWidenerNamespace(awBytes);   // read the namespace the payload's AW declares in its header
+            reader.getClass().getMethod("read", byte[].class, String.class).invoke(reader, awBytes, ns);
+            InjectionLogger.info("applied "+pc.accessWidener+" (namespace "+ns+") to live Knot ClassTweaker ("+awBytes.length+" bytes)");
         }
 
         // 2) register the payload's mixin configs into the live service, then downgrade them to required:false (probe workaround #1).
@@ -194,9 +212,9 @@ final class FabricPlatform implements LoaderPlatform {
         InjectionLogger.info("acquired live Knot transformer "+transformer.getClass().getName()+" (env="+env+")");
     }
 
-    // ---- §1c: baselines (X_others) captured while LB is UNVISITED, then LB activated -------------------------------
+    // ---- §1c: baselines (X_others) captured while the payload is UNVISITED, then the payload activated -------------------------------
     public void prepareBaselines(java.util.List<String> internalTargets) throws Exception {
-        if (lbActivated) throw new IllegalStateException("prepareBaselines after LB already activated");
+        if (lbActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
         // On an IDLE Knot client (bare Fabric: nothing transformed since boot) processor.transformedCount is 0, so the
         // first baseline transform would trip Mixin's checkSelect (unvisited>0 && transformedCount==0) and PROMOTE our
         // still-pending payload config mid-baseline — contaminating X_others with the payload and erasing its delta in
@@ -228,7 +246,7 @@ final class FabricPlatform implements LoaderPlatform {
         InjectionLogger.info("captured "+n+" non-LB mod baselines (X_others)");
     }
 
-    // ---- §1c: X for an already-loaded target = X_all (X_others + LB) after forcing LB's config to select --------------
+    // ---- §1c: X for an already-loaded target = X_all (X_others + LB) after forcing the payload's config to select --------------
     public byte[] transform(String dotted, byte[] originalO) throws Exception {
         String internal = dotted.replace('.','/');
         byte[] in = getPreMixinClassBytes(internal);
@@ -243,10 +261,10 @@ final class FabricPlatform implements LoaderPlatform {
     }
 
     /** MixinExtras (and other injectors) name their synthetic bridges `...$<methods.size()>`; that counter is a global
-     *  post-pass over the fully-assembled class, so LB's added methods shift EVERY other mod's bridge suffix between the
+     *  post-pass over the fully-assembled class, so the payload's added methods shift EVERY other mod's bridge suffix between the
      *  no-LB baseline (X_others) and the with-LB output (X_all). Re-map X_all's non-LB counter-suffixed synthetics back
      *  to the baseline's names (matched by name-without-trailing-$digits + descriptor) so the converter's O-vs-X diff
-     *  isolates only LB's real additions. LB's own synthetics keep their (unmatched) names and go to the sidecar. */
+     *  isolates only the payload's real additions. the payload's own synthetics keep their (unmatched) names and go to the sidecar. */
     static byte[] alignSynthetics(byte[] xOthers, byte[] xAll) {
         ClassNode co = read(xOthers), ca = read(xAll);
         Set<String> keysO = new HashSet<>(), keysA = new HashSet<>();
@@ -273,7 +291,7 @@ final class FabricPlatform implements LoaderPlatform {
     }
     private static ClassNode read(byte[] b){ ClassNode cn=new ClassNode(); new ClassReader(b).accept(cn,0); return cn; }
     private static final String[] SYN_MARKERS = {"mixinextras","wrapOperation","$bridge$","$wrapped$","handler$","redirect$","modify$","inject$"};
-    /** An injector synthetic whose name carries one or more size()-based counter segments (which shift when LB adds
+    /** An injector synthetic whose name carries one or more size()-based counter segments (which shift when the payload adds
      *  methods). Restricted to names bearing a known injector marker so ordinary lambdas ($N) are never re-mapped. */
     private static boolean isCounterSynthetic(String name){ boolean marked=false; for (String s:SYN_MARKERS) if (name.contains(s)){ marked=true; break; }
         return marked && !norm(name).equals(name); }
@@ -305,11 +323,11 @@ final class FabricPlatform implements LoaderPlatform {
         return false; } }
 
     // ---- §1b: schema baseline O. For a mixin target = X_others (loaded schema: all non-LB mods). For everything else
-    //           (hierarchy metadata over arbitrary classes) = raw Knot bytes (no LB mixin targets them, so X_others==raw). -
+    //           (hierarchy metadata over arbitrary classes) = raw Knot bytes (no the payload mixin targets them, so X_others==raw). -
     public byte[] originalBytes(String internalName){ byte[] b = baseline.get(internalName); return b != null ? b : getRawClassBytes(internalName); }
 
     public byte[] bundleResource(String path){
-        // agent-jar-root resources (lb-mixin-targets.txt) resolve on the system loader; LB-jar resources resolve on Knot.
+        // agent-jar-root resources (lb-mixin-targets.txt) resolve on the system loader; payload-jar resources resolve on Knot.
         try (InputStream in = FabricPlatform.class.getClassLoader().getResourceAsStream(path)) { if (in != null) return in.readAllBytes(); } catch(Throwable t){}
         try (InputStream in = knot.getResourceAsStream(path)) { return in==null?null:in.readAllBytes(); } catch(Throwable t){ return null; }
     }

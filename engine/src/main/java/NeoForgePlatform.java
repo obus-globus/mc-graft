@@ -3,7 +3,7 @@ import org.spongepowered.asm.mixin.MixinEnvironment;
 import org.spongepowered.asm.service.MixinService;
 import java.io.*; import java.lang.instrument.Instrumentation; import java.lang.reflect.*;
 import java.net.URL; import java.nio.file.*; import java.security.*; import java.util.*; import java.util.jar.*;
-import lbrt.InjectionLogger;
+import mcgraft.rt.InjectionLogger;
 
 /** NeoForge (FML 11 / TransformingClassLoader) late-attach platform.
  *
@@ -14,20 +14,23 @@ import lbrt.InjectionLogger;
  *  reflectively only where the concrete FML type isn't on the compile classpath.
  *
  *  Module system (the crux): MC is in named module `minecraft` on the TCL; sidecars CANNOT enter it (a package is owned
- *  by one module per loader). So LB is staged onto an LbLoader (child of the TCL, unnamed module) and sidecars are
- *  RELOCATED (RetransformConverter.SIDECAR_PKG) into an LB-owned package defined on the LbLoader; a target' running on
- *  the TCL resolves its sidecar across the loader boundary via the TCL's fallbackClassLoader (= LbLoader). The relocated
+ *  by one module per loader). So the payload is staged onto an PayloadLoader (child of the TCL, unnamed module) and sidecars are
+ *  RELOCATED (RetransformConverter.SIDECAR_PKG) into a payload-owned package defined on the PayloadLoader; a target' running on
+ *  the TCL resolves its sidecar across the loader boundary via the TCL's fallbackClassLoader (= PayloadLoader). The relocated
  *  sidecar is cross-package from every MC target, so the converter's pkg(caller)!=pkg(owner) checks route ALL non-public
  *  MC access through AwReflect. The transformer input / diff baseline stay RAW (non-AW-widened) so oFieldAcc reflects
  *  the true (non-public) access of already-loaded targets. TCL.parentLoaders/fallback are in the unnamed module -> no
  *  module opens needed. */
 final class NeoForgePlatform implements LoaderPlatform {
     static final String TCL_NAME = "net.neoforged.fml.classloading.transformation.TransformingClassLoader";
-    static final String SIDECAR_PKG = "net/ccbluex/lbrt/sc/";
+    // Package the relocated sidecars live in (must NOT be net/minecraft/* — that module is owned by the Transforming
+    // ClassLoader). Neutral default; overridable early (before staging) via -Dmcgraft.sidecarPackage=some/pkg/ .
+    static final String SIDECAR_PKG = normalizePkg(System.getProperty("mcgraft.sidecarPackage", "mcgraft/sc/"));
+    static String normalizePkg(String p){ p=p.replace('.','/'); return p.endsWith("/")?p:p+"/"; }
     private final Instrumentation inst;
     private ClassLoader tcl;                         // TransformingClassLoader (owns net.minecraft.* in module `minecraft`)
-    private ClassLoader agentLoader;                 // system/App loader (owns the agent + lbrt.* single identity + FML's Mixin)
-    private LbLoader lb;                             // child-first LB loader (parent = TCL), holds LB + relocated sidecars
+    private ClassLoader agentLoader;                 // system/App loader (owns the agent + mcgraft.rt.* single identity + FML's Mixin)
+    private PayloadLoader lb;                             // child-first LB loader (parent = TCL), holds LB + relocated sidecars
     private Object transformer;                      // org.spongepowered.asm.mixin.transformer.MixinTransformer (Object handle)
     private Object processor; private Field fTransformedCount, fErrorState;
     private Method mTransformClassBytes, mGenerateClass; private Object env;
@@ -50,11 +53,11 @@ final class NeoForgePlatform implements LoaderPlatform {
         return tcl;
     } catch (Throwable t){ throw rt("targetLoader (TCL acquisition)", t); } }
 
-    // ---- §1a/§1d/§3.3: stage LB onto an LbLoader; install it as the TCL fallback + register parentLoaders -----------
+    // ---- §1a/§1d/§3.3: stage the payload onto an PayloadLoader; install it as the TCL fallback + register parentLoaders -----------
     public Path stageBundle(Instrumentation inst, File agentJar) throws Exception {
         this.agentJar = agentJar;
         RetransformConverter.SIDECAR_PKG = SIDECAR_PKG;                          // relocate sidecars out of module `minecraft`
-        Path tmp = Files.createTempDirectory("lb-nf-"); tmp.toFile().deleteOnExit();
+        Path tmp = Files.createTempDirectory("mcgraft-nf-"); tmp.toFile().deleteOnExit();
         List<URL> urls = new ArrayList<>(); Path lbBundle = null; int pushed = 0, skipped = 0;
         try (JarFile jf = new JarFile(agentJar)) { for (var en = jf.entries(); en.hasMoreElements();) { JarEntry e = en.nextElement(); String n = e.getName();
             if (!n.startsWith("agent-libs/") || !n.endsWith(".jar")) continue;
@@ -65,7 +68,7 @@ final class NeoForgePlatform implements LoaderPlatform {
             try (InputStream in = jf.getInputStream(e)) { Files.copy(in, o, StandardCopyOption.REPLACE_EXISTING); } o.toFile().deleteOnExit();
             if (isLb) { lbBundle = o; scanPackages(o, ownedPkgs); }
             urls.add(o.toUri().toURL()); pushed++;
-            // Stage this jar's bundled (jar-in-jar) dependencies too, onto the same LbLoader.
+            // Stage this jar's bundled (jar-in-jar) dependencies too, onto the same PayloadLoader.
             for (java.nio.file.Path nested : FullInjectAgent.extractNestedJars(o, tmp)) {
                 if (isLoaderProvided(nested.getFileName().toString())) { skipped++; continue; }
                 scanPackages(nested, ownedPkgs); urls.add(nested.toUri().toURL()); pushed++;
@@ -73,18 +76,18 @@ final class NeoForgePlatform implements LoaderPlatform {
         } }
         if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         ownedPkgs.add(SIDECAR_PKG);                                              // relocated sidecars are defined + resolved here
-        // Install LbLoader as the TCL's child-first fallback (chained to FML's original fallback) and register LB
-        // packages in parentLoaders so FML's mixin byte reader locates LB mixin classes during transformation.
+        // Install PayloadLoader as the TCL's child-first fallback (chained to FML's original fallback) and register LB
+        // packages in parentLoaders so FML's mixin byte reader locates the payload mixin classes during transformation.
         ClassLoader original = readLoaderField(tcl, "fallbackClassLoader");
-        lb = new LbLoader(urls.toArray(new URL[0]), tcl, original, agentLoader, ownedPkgs);
+        lb = new PayloadLoader(urls.toArray(new URL[0]), tcl, original, agentLoader, ownedPkgs);
         tcl.getClass().getMethod("setFallbackClassLoader", ClassLoader.class).invoke(tcl, lb);
         registerParentLoaders(tcl, lb);
-        InjectionLogger.info("staged LB onto LbLoader: "+pushed+" jar(s), "+skipped+" loader-provided skipped; ownedPkgs="+ownedPkgs.size()+"; TCL="+tcl);
+        InjectionLogger.info("staged payload onto loader: "+pushed+" jar(s), "+skipped+" loader-provided skipped; ownedPkgs="+ownedPkgs.size()+"; TCL="+tcl);
         return lbBundle;
     }
-    /** Hard identity-split hazards NeoForge provides itself — resolved parent-first via the TCL, never on the LbLoader.
+    /** Hard identity-split hazards NeoForge provides itself — resolved parent-first via the TCL, never on the PayloadLoader.
      *  mcef is excluded too: the bundled Fabric-flavoured mcef jar's MCEF.<clinit> transitively references Sodium
-     *  classes absent from sodium-neoforge, crashing the (stretch) browser stage; without it LB skips the browser. */
+     *  classes absent from sodium-neoforge, crashing the (stretch) browser stage; without it the payload skips the browser. */
     private static boolean isLoaderProvided(String base){ String b=base.toLowerCase();
         return b.startsWith("asm-")||b.startsWith("asm.")||b.contains("sponge-mixin")||b.contains("mixinextras")||b.contains("mcef"); }
 
@@ -105,12 +108,12 @@ final class NeoForgePlatform implements LoaderPlatform {
         for (String pkg : ownedPkgs) { String dotted = (pkg.endsWith("/") ? pkg.substring(0, pkg.length()-1) : pkg).replace('/', '.');
             if (map.putIfAbsent(dotted, lb) == null) n++; }
         if (replace) f.set(t, map);
-        InjectionLogger.info("registered "+n+" LB packages into TCL.parentLoaders");
+        InjectionLogger.info("registered "+n+" payload packages into TCL.parentLoaders");
     }
     private static ClassLoader readLoaderField(Object o, String name){ try { Field f = declaredUp(o.getClass(), name); f.setAccessible(true); return (ClassLoader) f.get(o); } catch(Throwable t){ return null; } }
     private static Field declaredUp(Class<?> k, String name) throws NoSuchFieldException { for (; k != null; k = k.getSuperclass()) { try { return k.getDeclaredField(name); } catch(NoSuchFieldException e){} } throw new NoSuchFieldException(name); }
 
-    // ---- §1c/§3.2: register LB configs into the LIVE FMLMixinService (required:false), acquire the live transformer -
+    // ---- §1c/§3.2: register the payload configs into the LIVE FMLMixinService (required:false), acquire the live transformer -
     public void initMixin() throws Exception {
         PayloadConfig pc = PayloadConfig.get();
         if (pc.accessWidener != null) {
@@ -138,8 +141,8 @@ final class NeoForgePlatform implements LoaderPlatform {
             if (mixinConfig == null) continue;
             try { Field req = mixinConfig.getClass().getDeclaredField("required"); req.setAccessible(true); req.setBoolean(mixinConfig, false); downgraded++; } catch(Throwable t){}
         }
-        if (downgraded == 0) throw new IllegalStateException("required:false workaround failed: no LB Config via Mixins.getConfigs()");
-        InjectionLogger.info("registered LB mixin configs, downgraded "+downgraded+" to required:false");
+        if (downgraded == 0) throw new IllegalStateException("required:false workaround failed: no payload config via Mixins.getConfigs()");
+        InjectionLogger.info("registered payload mixin configs, downgraded "+downgraded+" to required:false");
 
         transformer = findMethod(svc.getClass(), "getMixinTransformer").invoke(svc);
         if (transformer == null) throw new IllegalStateException("FMLMixinService.getMixinTransformer() == null");
@@ -154,9 +157,9 @@ final class NeoForgePlatform implements LoaderPlatform {
         InjectionLogger.info("acquired live FML transformer "+transformer.getClass().getName()+" (transformedCount="+fTransformedCount.getInt(processor)+")");
     }
 
-    // ---- §1c: baselines (X_others) captured while LB's late-added config is UNVISITED -------------------------------
+    // ---- §1c: baselines (X_others) captured while the payload's late-added config is UNVISITED -------------------------------
     public void prepareBaselines(java.util.List<String> internalTargets) throws Exception {
-        if (lbActivated) throw new IllegalStateException("prepareBaselines after LB already activated");
+        if (lbActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
         int n = 0;
         for (String internal : internalTargets) {
             byte[] pre = rawBytes(internal); if (pre == null) continue;
@@ -181,7 +184,7 @@ final class NeoForgePlatform implements LoaderPlatform {
         InjectionLogger.info("captured "+n+" non-LB mod baselines (X_others)");
     }
 
-    // ---- §1c: X for a target = X_all after forcing LB's config to select; delta isolated against X_others ----------
+    // ---- §1c: X for a target = X_all after forcing the payload's config to select; delta isolated against X_others ----------
     public byte[] transform(String dotted, byte[] originalO) throws Exception {
         String internal = dotted.replace('.','/');
         byte[] in = rawBytes(internal); if (in == null) in = originalO; if (in == null) return null;
@@ -214,7 +217,7 @@ final class NeoForgePlatform implements LoaderPlatform {
     public boolean cftAppliesAw(){ return true; }                               // our CFT widens FUTURE MC classes (like vanilla)
     public byte[] applyAw(String internalName, byte[] bytes){ try { return (byte[]) awApply.invoke(aw, internalName, bytes); } catch(Throwable t){ return null; } }
 
-    // ---- §1d: define relocated sidecar/state into the LB-owned package on the LbLoader; target' resolves via fallback
+    // ---- §1d: define relocated sidecar/state into the payload-owned package on the PayloadLoader; target' resolves via fallback
     public boolean defineClass(String dotted, byte[] bytes, ProtectionDomain pd){ try {
         lb.define(dotted, bytes); return true;
     } catch(Throwable t){ Throwable c = t.getCause()!=null?t.getCause():t; String m = String.valueOf(c.getMessage());

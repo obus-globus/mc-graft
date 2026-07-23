@@ -1,14 +1,17 @@
 import org.objectweb.asm.*;
 import org.objectweb.asm.tree.*;
 
-/** Schema-neutral prologue injection for Minecraft's static ConnectScreen.startConnecting entry point. */
+/** Schema-neutral prologue injection for a client's static multiplayer-connect entry point (e.g. Minecraft's
+ *  ConnectScreen.startConnecting). Optional: armed only when the payload configures bootstrap.joinGate.screen. */
 public final class JoinGateRewriter {
-    public static final String CONNECT_SCREEN = "net/minecraft/client/gui/screens/ConnectScreen";
-    private static final String GATE = "lbrt/JoinGate";
+    /** MC screen internal name whose startConnecting is gated. null -> the join-gate feature is disabled. */
+    public static volatile String CONNECT_SCREEN = null;
+    private static final String GATE = "mcgraft/rt/JoinGate";
 
     private JoinGateRewriter() {}
 
     public static byte[] rewrite(String owner, byte[] bytes) {
+        if (CONNECT_SCREEN == null) return bytes;
         ClassNode c = new ClassNode();
         new ClassReader(bytes).accept(c, 0);
         boolean found = false, changed = false;

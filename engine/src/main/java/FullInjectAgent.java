@@ -1,11 +1,11 @@
 import org.objectweb.asm.ClassReader;
 import java.io.*; import java.lang.instrument.*; import java.lang.reflect.Method;
 import java.nio.file.*; import java.security.ProtectionDomain; import java.util.*; import java.util.concurrent.*; import java.util.jar.*;
-import lbrt.InjectionLogger;
+import mcgraft.rt.InjectionLogger;
 
-/** Attach to a fully-running client and inject full LiquidBounce. Uniform-convert every mixin target
- *  (already-loaded -> retransform; future -> on-load CFT returns target'); rewrite LB callers to sidecars;
- *  then manually kick LB's ClientStartEvent so it initializes on the already-running game. */
+/** Attach to a fully-running client and inject the full payload mod. Uniform-convert every mixin target
+ *  (already-loaded -> retransform; future -> on-load CFT returns target'); rewrite payload callers to sidecars;
+ *  then manually kick the payload's start event so it initializes on the already-running game. */
 public class FullInjectAgent {
     static LoaderPlatform PLATFORM;                                               // loader-specific seams (vanilla/Fabric/NeoForge)
     static ClassLoader SYS;                                                       // == PLATFORM.targetLoader(); holds net.minecraft.* + staged LB
@@ -40,18 +40,19 @@ public class FullInjectAgent {
         INST = inst;
         PLATFORM = detectPlatform(inst);
         SYS = PLATFORM.targetLoader();
-        lbrt.Platform.LOADER = SYS;
-        applyDataDir(a);
+        mcgraft.rt.Platform.LOADER = SYS;
         tolerateBaselineFailures = "true".equalsIgnoreCase(InjectionLogger.argValue(a, "tolerateBaselineFailures"));
         verifyAsmRuntime();
         for (Class<?> c : inst.getAllLoadedClasses()) preLoaded.add(c.getName().replace('.','/'));   // snapshot BEFORE we load anything
         inst.redefineModule(Object.class.getModule(), Set.of(), Map.of(), Map.of("java.lang", Set.of(FullInjectAgent.class.getModule())), Set.of(), Map.of());
         RetransformConverter.CLASS_BYTES = PLATFORM::originalBytes;
-        InjectionLogger.info("staging LB bundle ("+preLoaded.size()+" classes already loaded)");
+        InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
         File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         Path lbBundle = PLATFORM.stageBundle(inst, self);
         RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle);
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
+        applyGameDirProperty(cfg, resolveGameDir(a));
+        if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
             +(cfg.hasEventBootstrap()?" eventBootstrap="+cfg.evtStart+(cfg.hasReadinessProbe()?" (async)":" (sync)"):""));
@@ -59,7 +60,7 @@ public class FullInjectAgent {
         PLATFORM.initMixin();
         Object aw = PLATFORM.accessWidener();
         // Inaccessible types: AW-widened classes that are ALREADY loaded (so can't be widened) and still non-public.
-        // LB references these by type; the CFT erases those references to Object + reflection.
+        // the payload references these by type; the CFT erases those references to Object + reflection.
         try { var caF = aw.getClass().getDeclaredField("classAccessible"); caF.setAccessible(true);
             @SuppressWarnings("unchecked") Set<String> ca = (Set<String>) caF.get(aw);
             for (String cn : ca) { if (!preLoaded.contains(cn)) continue; try { Class<?> k = Class.forName(cn.replace('/','.'), false, SYS); if (!java.lang.reflect.Modifier.isPublic(k.getModifiers())) INACC.add(cn); } catch(Throwable t){} }
@@ -120,9 +121,9 @@ public class FullInjectAgent {
         InjectionLogger.info("converted "+conv+" targets ("+eager+" sidecars eager-defined); ifaceMap="+ifaceMap.size()+" interfaces; skipped="+skipped.size()+(skipped.isEmpty()?"":" "+skipped));
         InjectionLogger.info("ifaceMap keys: " + ifaceMap.keySet());
         for (var ie : ifaceMap.entrySet()) for (String[] impl : ie.getValue())
-            lbrt.DuckDispatch.register(ie.getKey(), impl[0], impl[1]);
+            mcgraft.rt.DuckDispatch.register(ie.getKey(), impl[0], impl[1]);
 
-        // Resolver: LB access of a non-public member of an ALREADY-LOADED MC class must be reflection-routed (that
+        // Resolver: the payload access of a non-public member of an ALREADY-LOADED MC class must be reflection-routed (that
         // class could not be AW-widened, since retransform bans modifier changes). Future MC classes get the AW on-load.
         RetransformConverter.Resolver awRes = new RetransformConverter.Resolver(){
             public boolean fieldNeedsReflect(String o,String n,String d){ return INACC.contains(o) || (isPreloadedMc(o) && fieldNonPublic(o,n)); }
@@ -130,7 +131,7 @@ public class FullInjectAgent {
             public boolean typeInaccessible(String in){ return INACC.contains(in); }
         };
         // CFT: mixin target loads/retransforms -> lazily define sidecar+state (class PD), return target' (AW-widened if
-        // future-loaded). Future non-target MC class -> apply AW on-load. LB class -> caller-rewrite to sidecars + reflect
+        // future-loaded). Future non-target MC class -> apply AW on-load. the payload class -> caller-rewrite to sidecars + reflect
         // its direct accesses to already-loaded MC members.
         ClassFileTransformer cft = new ClassFileTransformer(){ public byte[] transform(ClassLoader l,String n,Class<?> c,ProtectionDomain p,byte[] b){
             if (n==null) return null;
@@ -145,9 +146,9 @@ public class FullInjectAgent {
                     if (c!=null) { long s=System.nanoTime(); boolean ok=LateAttachVerifier.verifyRetransform(n, b, t); tVerify += System.nanoTime()-s; if(!ok) return null; }
                     if(!cv.define(p)){
                         // Future-loaded target (c==null) can hit this AFTER the join gate opened; the JVM then defines the
-                        // pristine original with NO LB hooks, so the feature backing this target is silently inert for the
+                        // pristine original with NO the payload hooks, so the feature backing this target is silently inert for the
                         // session. Surface it to the live injection log (not just the verifier report) so it is observable.
-                        InjectionLogger.error("sidecar/state define failed for "+n+" — it will load WITHOUT LiquidBounce hooks (that feature is inert this session; restart the client to retry)");
+                        InjectionLogger.error("sidecar/state define failed for "+n+" — it will load WITHOUT payload hooks (that feature is inert this session; restart the client to retry)");
                         return null;
                     }
                     if (c==null) { byte[] w=awApply(n,t); if(w!=null) t=w; }
@@ -183,9 +184,9 @@ public class FullInjectAgent {
             if (!lp.isEmpty()) { inst.retransformClasses(lp.toArray(new Class[0])); InjectionLogger.info("retransformed "+lp.size()+" already-loaded payload classes for caller rewriting: "+lp); }
         } catch(Throwable t){ InjectionLogger.warn("payload caller retransform failed: "+rootMsg(t)); }
 
-        // Force the join entry point through the installed CFT now. A later first-click load is too late to prove that
-        // the gate exists before registries are thawed.
-        try{
+        // Force the join entry point through the installed CFT now (only when the join-gate feature is armed). A later
+        // first-click load is too late to prove that the gate exists before registries are thawed.
+        if(cfg.joinGateScreen!=null) try{
             boolean connectWasLoaded=preLoaded.contains(JoinGateRewriter.CONNECT_SCREEN);
             Class<?> connectClass=Class.forName(JoinGateRewriter.CONNECT_SCREEN.replace('/','.'),false,SYS);
             if(connectWasLoaded){
@@ -199,8 +200,8 @@ public class FullInjectAgent {
             throw new IllegalStateException("Late-attach preflight failed before target retransformation; see report");
         }
 
-        for(Class<?> c:inst.getAllLoadedClasses())if(c.getName().startsWith("net.ccbluex."))preBootstrapLb.add(c.getName());
-        lbrt.JoinGate.block();
+        for(Class<?> c:inst.getAllLoadedClasses())if(RetransformConverter.PAYLOAD_CLASSES.contains(c.getName().replace('.','/')))preBootstrapLb.add(c.getName());
+        if(cfg.joinGateScreen!=null) mcgraft.rt.JoinGate.block();
 
         // Bootstrap the payload on the Minecraft thread while target hooks are still INACTIVE. A payload whose init is
         // asynchronous (e.g. it launches a coroutine from an event) can have later render/entity hooks run before its
@@ -231,7 +232,7 @@ public class FullInjectAgent {
                 } else {
                     closeThaw(thaw); thaw=null;                                   // synchronous: init is done, publish now
                     activateLoadedTargets(INST);
-                    lbrt.JoinGate.cancelAndOpen();
+                    mcgraft.rt.JoinGate.cancelAndOpen();
                     InjectionLogger.info("payload injection complete");
                 }
             } catch (Throwable t) {
@@ -239,12 +240,12 @@ public class FullInjectAgent {
                 // (payload clinit, reflection, or the fatal-error check) where thaw is still null — otherwise the gate
                 // blocked above stays closed for the session and multiplayer is permanently locked out.
                 if(thaw!=null)thaw.close();
-                lbrt.JoinGate.cancelAndOpen();
+                mcgraft.rt.JoinGate.cancelAndOpen();
                 LateAttachVerifier.error("BOOTSTRAP_KICK_FAILURE",cfg.id,"bootstrap",rootMsg(t));
                 InjectionLogger.error("kick error", t); } };
             mcCls.getMethod("execute", Runnable.class).invoke(mc, kick);
             InjectionLogger.info("scheduled "+cfg.id+" bootstrap on MC main thread");
-        } catch (Throwable e) { LateAttachVerifier.error("BOOTSTRAP_SCHEDULE_FAILURE",cfg.id,"bootstrap",rootMsg(e)); lbrt.JoinGate.cancelAndOpen(); InjectionLogger.error("bootstrap kick failed", e); }
+        } catch (Throwable e) { LateAttachVerifier.error("BOOTSTRAP_SCHEDULE_FAILURE",cfg.id,"bootstrap",rootMsg(e)); mcgraft.rt.JoinGate.cancelAndOpen(); InjectionLogger.error("bootstrap kick failed", e); }
     }
 
     /** Initialize the payload on the MC thread: dispatch its configured client-start event, or (default) call the
@@ -418,7 +419,7 @@ public class FullInjectAgent {
                 }
                 InjectionLogger.info("thawed "+states.values().stream().filter(Boolean::booleanValue).count()+"/"+states.size()+" registries"+(all?"":" (scoped: "+scope+")")+(tagsSwapped>0?" (allTags unbound on "+tagsSwapped+" for re-freeze safety)":""));
                 return session;
-            }catch(Throwable t){session.close();if(session.restored)try{lbrt.JoinGate.open();}catch(Throwable ignored){}
+            }catch(Throwable t){session.close();if(session.restored)try{mcgraft.rt.JoinGate.open();}catch(Throwable ignored){}
                 if(t instanceof Exception e)throw e;if(t instanceof Error e)throw e;throw new RuntimeException(t);}
         }
         /** Re-assert the thaw: a resource reload re-freezes the static registry access mid-init (ClientRegistryLayer
@@ -442,14 +443,14 @@ public class FullInjectAgent {
         if (thaw != null) thaw.close();   // close() computes thaw.restored — must run before we read it below
         boolean restored = thaw == null || thaw.restored;   // null thaw = reload-driven path: registries were never thawed
         // The gate must ALWAYS be released here so a failed/partial bootstrap can never leave multiplayer permanently
-        // locked. On full success replay the deferred join; otherwise (registries not fully restored, or LB did not
+        // locked. On full success replay the deferred join; otherwise (registries not fully restored, or the payload did not
         // initialize) don't replay into a half-set-up client, but still unblock so the user can retry the join.
         if(restored && initializationSucceeded){
-            try{lbrt.JoinGate.open();}
-            catch(Throwable t){LateAttachVerifier.error("DEFERRED_JOIN_FAILURE","ConnectScreen","join-gate",rootMsg(t));lbrt.JoinGate.cancelAndOpen();}
+            try{mcgraft.rt.JoinGate.open();}
+            catch(Throwable t){LateAttachVerifier.error("DEFERRED_JOIN_FAILURE","ConnectScreen","join-gate",rootMsg(t));mcgraft.rt.JoinGate.cancelAndOpen();}
         } else {
             InjectionLogger.error("initialization incomplete; dropping deferred join and unblocking gate");
-            lbrt.JoinGate.cancelAndOpen();
+            mcgraft.rt.JoinGate.cancelAndOpen();
         }
     }
     /** An async-bootstrap payload initializes after its start event. Poll the configured readiness probe, then publish
@@ -490,37 +491,39 @@ public class FullInjectAgent {
                 // If the main-thread restore runnable (which releases the gate via restoreAndOpen) never completes,
                 // release the gate here too so a stalled/failed activation cannot leave multiplayer locked out.
                 try{done.get(60,TimeUnit.SECONDS);}
-                catch(TimeoutException t){LateAttachVerifier.warn("REGISTRY_RESTORE_MAIN_THREAD_TIMEOUT","registries","bootstrap","Main thread did not finish activation/restore within 60 seconds; applying state fallback");if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
-                catch(InterruptedException t){Thread.currentThread().interrupt();if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
-                catch(ExecutionException t){LateAttachVerifier.error("REGISTRY_RESTORE_TASK_FAILURE","registries","bootstrap",rootMsg(t));if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
-            } catch(Throwable t){ if(finalized.compareAndSet(false,true)){closeThaw(thaw);lbrt.JoinGate.cancelAndOpen();}else closeThaw(thaw);LateAttachVerifier.error("REGISTRY_RESTORE_SCHEDULE_FAILURE","registries","bootstrap",rootMsg(t)); }
-        } }, "lb-registry-restore");
+                catch(TimeoutException t){LateAttachVerifier.warn("REGISTRY_RESTORE_MAIN_THREAD_TIMEOUT","registries","bootstrap","Main thread did not finish activation/restore within 60 seconds; applying state fallback");if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+                catch(InterruptedException t){Thread.currentThread().interrupt();if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+                catch(ExecutionException t){LateAttachVerifier.error("REGISTRY_RESTORE_TASK_FAILURE","registries","bootstrap",rootMsg(t));if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
+            } catch(Throwable t){ if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);LateAttachVerifier.error("REGISTRY_RESTORE_SCHEDULE_FAILURE","registries","bootstrap",rootMsg(t)); }
+        } }, "mcgraft-registry-restore");
         waiter.setDaemon(true);
         waiter.start();
     }
     static byte[] awApply(String n, byte[] b){ return PLATFORM.applyAw(n, b); }
-    /** Point LiquidBounce's data dir (&lt;gameDir&gt;/LiquidBounce) at the injector-supplied path, else the client's REAL
-     *  game directory — so it matches a normal install instead of landing in whatever working directory the client was
-     *  launched from. Runs before LB's VanillaPlatform reads the vspike.gameDir system property. */
-    static void applyDataDir(String a) {
-        String dir = null;
+    /** Resolve the game/data directory to hand the payload: the injector-supplied path (agentArg gameDir), else the
+     *  client's REAL game directory — so the payload's data lands next to a normal install instead of in whatever
+     *  working directory the client was launched from. Returns null if it can't be resolved. */
+    static String resolveGameDir(String a) {
         try {
             String override = InjectionLogger.argValue(a, "gameDir");
             if (override == null || override.isBlank()) {
-                // default: the client's REAL game directory (matches a normal install)
                 Class<?> mcCls = Class.forName("net.minecraft.client.Minecraft", false, SYS);
                 Object gd = mcCls.getField("gameDirectory").get(mcCls.getMethod("getInstance").invoke(null));
-                if (gd instanceof File file) dir = file.getAbsolutePath();
+                if (gd instanceof File file) return file.getAbsolutePath();
             } else if (override.equals(".")) {
-                dir = System.getProperty("user.dir");      // the client's working directory (CWD)
+                return System.getProperty("user.dir");      // the client's working directory (CWD)
             } else {
-                dir = new File(override).getAbsoluteFile().toPath().normalize().toString();
+                return new File(override).getAbsoluteFile().toPath().normalize().toString();
             }
         } catch (Throwable t) { InjectionLogger.warn("could not resolve game directory ("+rootMsg(t)+"); the payload falls back to the process working directory"); }
-        if (dir != null) {
-            System.setProperty("vspike.gameDir", dir);
-            InjectionLogger.info("payload game directory: " + dir);
-        }
+        return null;
+    }
+    /** If the payload declares a system property for its data dir (bootstrap.gameDirProperty), set it to the resolved
+     *  game directory. No property declared -> nothing to do (the injector makes no assumption about the payload). */
+    static void applyGameDirProperty(PayloadConfig cfg, String dir) {
+        if (cfg.gameDirProperty == null || dir == null) return;
+        System.setProperty(cfg.gameDirProperty, dir);
+        InjectionLogger.info("payload game directory: " + dir + " (via " + cfg.gameDirProperty + ")");
     }
     /** Pick the platform by probing which loader owns the live client. Default vanilla; modded selects a stub host. */
     static LoaderPlatform detectPlatform(Instrumentation inst) throws Exception {
@@ -536,12 +539,16 @@ public class FullInjectAgent {
         Class<?> asmInfo=Class.forName("org.spongepowered.asm.util.asm.ASM",true,SYS);
         boolean supported=(Boolean)asmInfo.getMethod("isAtLeastVersion",int.class,int.class).invoke(null,9,8);
         InjectionLogger.info("ASM runtime="+version+" source="+source+" Java25Compatible="+supported);
-        if(!supported)throw new IllegalStateException("LiquidBounce Java 25 requires ASM >= 9.8, but active ASM is "+version+" from "+source+". Restart with a correctly packaged agent or remove the preloaded ASM collision.");
+        if(!supported)throw new IllegalStateException("the payload requires ASM >= 9.8, but active ASM is "+version+" from "+source+". Restart with a correctly packaged agent or remove the preloaded ASM collision.");
     }
     static void preflightLbClasses(Path lbJar,RetransformConverter.Resolver resolver,Map<String,String[]> gadded,
             Map<String,String[]> gfield,Map<String,List<String[]>> ifaces){int total=0,changed=0,failed=0;
+        PayloadConfig cfg=PayloadConfig.get();
         try(JarFile jf=new JarFile(lbJar.toFile())){for(var en=jf.entries();en.hasMoreElements();){JarEntry e=en.nextElement();String n=e.getName();
-            if(!n.startsWith("net/ccbluex/")||!n.endsWith(".class"))continue;total++;
+            if(!n.endsWith(".class"))continue;
+            // Scope to the payload's own packages when the build derived them; else accept every class in the jar
+            // (the payload jar holds the mod's classes; nested dependency jars live under META-INF/jars, not here).
+            if(!cfg.payloadPackages.isEmpty()&&!cfg.ownsClass(n.substring(0,n.length()-6)))continue; total++;
             try{byte[] b;try(InputStream in=jf.getInputStream(e)){b=in.readAllBytes();}
                 byte[] rw=AccessorBridgeRewriter.rewrite(n.substring(0,n.length()-6),b);
                 if(!ifaces.isEmpty())rw=RetransformConverter.rewriteCaller(rw,ifaces);

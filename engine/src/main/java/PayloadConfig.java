@@ -39,6 +39,17 @@ public final class PayloadConfig {
     // some mods defer their real init to a resource-reload listener registered during the start event; on late-attach
     // the boot-time reload has passed, so trigger one to drive that init. (bootstrap.reloadResources=true)
     public final boolean reloadResources;
+    // internal-name prefixes (e.g. "com/example/mod/") that the payload's OWN classes live under — derived by the build
+    // from the payload jar. Used to scope the caller-rewrite preflight + the already-loaded-payload snapshot so the
+    // engine makes no assumption about any one mod's package. Empty -> the engine falls back to the payload class set.
+    public final List<String> payloadPackages;
+    // a system property the payload reads to locate its data/game directory (e.g. LiquidBounce reads "vspike.gameDir").
+    // null -> the injector does not set any such property. (bootstrap.gameDirProperty=...)
+    public final String gameDirProperty;
+    // MC screen internal name whose join path is gated until the payload reports ready, so a multiplayer connect issued
+    // mid-attach is deferred rather than racing a half-initialized client. null -> the join-gate feature is disabled.
+    // (bootstrap.joinGate.screen=net/minecraft/client/gui/screens/ConnectScreen)
+    public final String joinGateScreen;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
@@ -60,6 +71,16 @@ public final class PayloadConfig {
         readyMethod = p.getProperty("bootstrap.ready.method", "isInitialized").trim();
         reloadResources = Boolean.parseBoolean(p.getProperty("bootstrap.reloadResources", "false").trim());
         thawRegistries = csv(p.getProperty("bootstrap.thawRegistries", ""));
+        payloadPackages = csv(p.getProperty("payload.packages", ""));
+        gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));
+        joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
+    }
+
+    /** True when the payload owns a class under one of its declared package roots. Empty roots -> false (callers then
+     *  fall back to the exact payload class set). Internal names ("com/example/mod/Foo"). */
+    public boolean ownsClass(String internalName) {
+        for (String pkg : payloadPackages) if (internalName.startsWith(pkg)) return true;
+        return false;
     }
 
     /** True when an async readiness probe is configured (publish retransforms only after the mod reports ready). */
