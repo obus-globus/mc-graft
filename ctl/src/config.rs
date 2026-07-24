@@ -16,6 +16,7 @@ pub struct AgentConfig {
     pub reload_resources: bool,     // bootstrap.reloadResources
     pub thaw_registries: String,    // bootstrap.thawRegistries
     pub register_mod_container: bool, // bootstrap.registerModContainer
+    pub reopen_key_bindings: bool,  // bootstrap.reopenKeyBindings
     pub game_dir_property: String,  // bootstrap.gameDirProperty
     pub join_gate_screen: String,   // bootstrap.joinGate.screen
     // event bootstrap (for mods with no entrypoint)
@@ -53,6 +54,7 @@ impl AgentConfig {
                 "bootstrap.reloadResources" => c.reload_resources = v.eq_ignore_ascii_case("true"),
                 "bootstrap.thawRegistries" => c.thaw_registries = v,
                 "bootstrap.registerModContainer" => c.register_mod_container = v.eq_ignore_ascii_case("true"),
+                "bootstrap.reopenKeyBindings" => c.reopen_key_bindings = v.eq_ignore_ascii_case("true"),
                 "bootstrap.gameDirProperty" => c.game_dir_property = v,
                 "bootstrap.joinGate.screen" => c.join_gate_screen = v,
                 "bootstrap.event.manager" => c.evt_manager = v,
@@ -89,6 +91,9 @@ impl AgentConfig {
         kv(&mut o, "bootstrap.thawRegistries", &self.thaw_registries);
         if self.register_mod_container {
             o.push_str("bootstrap.registerModContainer=true\n");
+        }
+        if self.reopen_key_bindings {
+            o.push_str("bootstrap.reopenKeyBindings=true\n");
         }
         kv(&mut o, "bootstrap.gameDirProperty", &self.game_dir_property);
         kv(&mut o, "bootstrap.joinGate.screen", &self.join_gate_screen);

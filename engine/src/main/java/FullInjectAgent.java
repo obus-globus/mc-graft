@@ -54,6 +54,7 @@ public class FullInjectAgent {
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
+        if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
         if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, lbBundle);   // so the mod's self-metadata lookups resolve
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
@@ -170,6 +171,11 @@ public class FullInjectAgent {
                     if(c==null){byte[] w=awApply(n,rw);if(w!=null)rw=w;}
                     return rw==b?null:rw;
                 }
+                if (n.equals(KeyBindingReopen.TARGET)) {   // strip fabric-api's post-GameOptions keybinding-registration guard
+                    byte[] rw=KeyBindingReopen.rewrite(n,b);
+                    if(c!=null&&!LateAttachVerifier.verifyRetransform(n,b,rw))return null;
+                    return rw==b?null:rw;
+                }
                 if (n.startsWith("net/minecraft/")||n.startsWith("com/mojang/")) return PLATFORM.cftAppliesAw()? awApply(n,b) : null;  // widen future MC classes (on-load) + AW-class retransforms (modded loaders widen future classes themselves)
             } catch(Throwable x){ LateAttachVerifier.error("TRANSFORM_FAILURE",n,"cft",rootMsg(x)); InjectionLogger.error("CFT fail "+n, x); }
             return null; } };
@@ -197,6 +203,16 @@ public class FullInjectAgent {
                 inst.retransformClasses(connectClass);
             }
         }catch(Throwable e){LateAttachVerifier.error("JOIN_GATE_PREFLIGHT_FAILURE",JoinGateRewriter.CONNECT_SCREEN,"join-gate",rootMsg(e));}
+
+        // Strip fabric-api's keybinding-registration guard now (before the payload's client init registers keybinds,
+        // which for some mods happens on a later tick). The impl class was loaded at startup (its process() runs from
+        // Options' constructor), so it is already loadable + retransformable.
+        if(cfg.reopenKeyBindings) try{
+            Class<?> kri=Class.forName(KeyBindingReopen.TARGET.replace('/','.'),false,SYS);
+            if(inst.isModifiableClass(kri)){ inst.retransformClasses(kri); InjectionLogger.info("reopened fabric-api keybinding registry (late registration enabled)"); }
+            else InjectionLogger.warn("keybinding registry class not modifiable; late keybinds may fail");
+        }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
+
         preflightLbClasses(lbBundle,awRes,gadded,gfield,ifaceMap);
         if(LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();

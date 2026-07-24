@@ -53,6 +53,11 @@ public final class PayloadConfig {
     // (Fabric) register the payload as a synthetic ModContainer so a mod that reads its own metadata at init (e.g.
     // FabricLoader.getModContainer(id).orElseThrow()) works on late-attach. (bootstrap.registerModContainer=true)
     public final boolean registerModContainer;
+    // (Fabric) reopen fabric-api's keybinding registry for late registration. fabric-api's KeyMappingRegistryImpl
+    // refuses registerKeyMapping once GameOptions is initialised; a mod that registers keybinds in its (deferred)
+    // client init would throw. With this set, mc-graft strips that guard and splices late-registered keybinds into the
+    // live options so they function and appear in Controls. (bootstrap.reopenKeyBindings=true)
+    public final boolean reopenKeyBindings;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
@@ -78,6 +83,7 @@ public final class PayloadConfig {
         gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
         registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());
+        reopenKeyBindings = Boolean.parseBoolean(p.getProperty("bootstrap.reopenKeyBindings", "false").trim());
     }
 
     /** True when the payload owns a class under one of its declared package roots. Empty roots -> false (callers then

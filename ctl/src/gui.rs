@@ -679,6 +679,7 @@ fn advanced_config(ui: &mut egui::Ui, c: &mut config::AgentConfig) {
     ui.checkbox(&mut c.reload_resources, "bootstrap.reloadResources (drive a resource reload on attach)");
     field(ui, "bootstrap.thawRegistries", "e.g. minecraft:sound_event", &mut c.thaw_registries);
     ui.checkbox(&mut c.register_mod_container, "bootstrap.registerModContainer (Fabric self-metadata)");
+    ui.checkbox(&mut c.reopen_key_bindings, "bootstrap.reopenKeyBindings (allow late fabric-api keybind registration)");
     field(ui, "bootstrap.gameDirProperty", "e.g. vspike.gameDir", &mut c.game_dir_property);
     field(ui, "bootstrap.joinGate.screen", "e.g. net/minecraft/.../ConnectScreen", &mut c.join_gate_screen);
 
