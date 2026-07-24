@@ -77,9 +77,30 @@ jobs:
           path: ctl/dist/${{ matrix.artifact }}
           if-no-files-found: error
 
-  # The control app on Windows (MSVC), with embedded krak2.exe (patch assembly) and jattach.exe (inject).
+  # Build jattach.exe with MSVC (cl) in an ISOLATED job — msvc-dev-cmd reorders PATH so Git's link.exe shadows the MSVC
+  # linker, which breaks Rust builds; keeping it out of the Rust job avoids that. (JATTACH_VERSION is optional — #ifdef.)
+  jattach-windows:
+    name: Build jattach.exe
+    runs-on: windows-latest
+    steps:
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build jattach v2.2
+        shell: cmd
+        run: |
+          git clone --branch v2.2 --depth 1 https://github.com/jattach/jattach jattach
+          cd jattach
+          cl /O2 /D_CRT_SECURE_NO_WARNINGS /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jattach-windows
+          path: jattach/jattach.exe
+          if-no-files-found: error
+
+  # The control app on Windows (MSVC), embedding krak2.exe (patch assembly) + jattach.exe (inject). No msvc-dev-cmd here,
+  # so the Rust builds use their normal MSVC linker resolution.
   binary-windows:
     name: Build mcgraft (windows-x86_64)
+    needs: jattach-windows
     runs-on: windows-latest
     defaults:
       run:
@@ -92,8 +113,11 @@ jobs:
         with:
           workspaces: ctl
           key: windows-release
-      - name: Set up MSVC (to build jattach)
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Download jattach.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: jattach-windows
+          path: ${{ runner.temp }}/jattach
       - name: Build krak2.exe (Krakatau) to embed
         working-directory: .
         env:
@@ -102,13 +126,6 @@ jobs:
           git clone https://github.com/Storyyeller/Krakatau "$RUNNER_TEMP/krakatau"
           git -C "$RUNNER_TEMP/krakatau" checkout "$KRAK2_COMMIT"
           cargo build --release --manifest-path "$RUNNER_TEMP/krakatau/Cargo.toml"
-      - name: Build jattach.exe to embed
-        working-directory: .
-        shell: cmd
-        run: |
-          git clone --branch v2.2 --depth 1 https://github.com/jattach/jattach "%RUNNER_TEMP%\jattach"
-          cd /d "%RUNNER_TEMP%\jattach"
-          cl /O2 /D_CRT_SECURE_NO_WARNINGS /DJATTACH_VERSION=\"2.2\" /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
       - name: Build mcgraft (embedding krak2.exe + jattach.exe)
         env:
           # build.rs needs Windows paths; cygpath -w converts the bash paths.
