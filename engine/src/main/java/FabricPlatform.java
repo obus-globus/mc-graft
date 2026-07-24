@@ -228,7 +228,7 @@ final class FabricPlatform implements LoaderPlatform {
         for (String internal : internalTargets) {
             byte[] pre = getPreMixinClassBytes(internal); if (pre == null) continue;
             byte[] xOthers;
-            try { xOthers = (byte[]) mTransformClassBytes.invoke(transformer, internal.replace('/','.'), internal.replace('/','.'), pre); } // the payload unvisited -> other mods only
+            try { xOthers = driveTransform(internal.replace('/','.'), pre); } // the payload unvisited -> other mods only
             catch (Throwable t) {
                 // Another mod's mixin whose injection point diverges on this already-loaded target throws here. Either
                 // way it is logged. Default is FAIL-FAST: log an error naming the target + abort. With
@@ -255,11 +255,25 @@ final class FabricPlatform implements LoaderPlatform {
         if (in == null) in = originalO;                                            // fall back to the raw baseline
         fTransformedCount.setInt(processor, 0);                                    // probe workaround #2: promote the payload's pending config
         lbActivated = true;
-        byte[] X = (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in);
+        byte[] X = driveTransform(dotted, in);
         if (X == null) return null;
         byte[] base = originalO != null ? originalO : baseline.get(internal);      // X_others baseline
         if (base != null) X = alignSynthetics(base, X);                            // renumber other mods' counter-suffixed synthetics back to the baseline's names
         return (base != null && Arrays.equals(X, base)) ? null : X;               // isolate the payload's delta
+    }
+
+    /** Invoke the live Knot Mixin transformer with the Knot loader installed as the thread context classloader — as a
+     *  normal Fabric mixin application would run. Under late-attach we drive the transformer from the attach thread,
+     *  whose TCCL is the system loader; a mod whose mixin-config plugin resolves platform services via the single-arg
+     *  ServiceLoader.load(Class) (context-CL based, e.g. xaerolib's IPlatformMixinHelper) would then find nothing and
+     *  throw mid-transform — leaving Mixin's re-entrance lock stuck and cascading a failure across every later target.
+     *  Making the TCCL faithful to apply-time lets those ServiceLoader lookups resolve against Knot's staged classpath. */
+    private byte[] driveTransform(String dotted, byte[] in) throws Exception {
+        Thread th = Thread.currentThread();
+        ClassLoader prev = th.getContextClassLoader();
+        th.setContextClassLoader(knot);
+        try { return (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in); }
+        finally { th.setContextClassLoader(prev); }
     }
 
     /** MixinExtras (and other injectors) name their synthetic bridges `...$<methods.size()>`; that counter is a global

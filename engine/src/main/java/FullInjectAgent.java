@@ -60,10 +60,11 @@ public class FullInjectAgent {
             +(cfg.hasEventBootstrap()?" eventBootstrap="+cfg.evtStart+(cfg.hasReadinessProbe()?" (async)":" (sync)"):""));
 
         PLATFORM.initMixin();
-        Object aw = PLATFORM.accessWidener();
+        Object aw = PLATFORM.accessWidener();   // null when the payload declares no access widener (a common, valid case)
         // Inaccessible types: AW-widened classes that are ALREADY loaded (so can't be widened) and still non-public.
         // the payload references these by type; the CFT erases those references to Object + reflection.
-        try { var caF = aw.getClass().getDeclaredField("classAccessible"); caF.setAccessible(true);
+        if (aw == null) { InjectionLogger.info("no access widener declared — skipping inaccessible-type computation"); }
+        else try { var caF = aw.getClass().getDeclaredField("classAccessible"); caF.setAccessible(true);
             @SuppressWarnings("unchecked") Set<String> ca = (Set<String>) caF.get(aw);
             for (String cn : ca) { if (!preLoaded.contains(cn)) continue; try { Class<?> k = Class.forName(cn.replace('/','.'), false, SYS); if (!java.lang.reflect.Modifier.isPublic(k.getModifiers())) INACC.add(cn); } catch(Throwable t){} }
             InjectionLogger.info("inaccessible already-loaded AW classes: "+INACC.size()+" "+INACC);
@@ -583,8 +584,10 @@ public class FullInjectAgent {
         InjectionLogger.info("LB caller preflight: "+total+" classes, "+changed+" rewritten, "+failed+" failed");
     }
     static void refreshLoadedAccessState(Instrumentation inst,Object aw){try{
-        java.lang.reflect.Field caF=aw.getClass().getDeclaredField("classAccessible");caF.setAccessible(true);
-        @SuppressWarnings("unchecked") Set<String> ca=(Set<String>)caF.get(aw);
+        // No access widener (aw==null) -> no widened classes to reconcile, but still refresh the attach-window class set.
+        Set<String> ca=java.util.Collections.emptySet();
+        if(aw!=null){ java.lang.reflect.Field caF=aw.getClass().getDeclaredField("classAccessible");caF.setAccessible(true);
+            @SuppressWarnings("unchecked") Set<String> c2=(Set<String>)caF.get(aw); ca=c2; }
         int added=0;for(Class<?> c:inst.getAllLoadedClasses()){String n=c.getName().replace('.','/');
             if(!(n.startsWith("net/minecraft/")||n.startsWith("com/mojang/")))continue;
             if(preLoaded.add(n))added++;
