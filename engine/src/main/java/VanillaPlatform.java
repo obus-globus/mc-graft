@@ -73,14 +73,14 @@ final class VanillaPlatform implements LoaderPlatform {
         tr = ((VSpikeService) MixinService.getService()).createTransformer();
         try { com.llamalad7.mixinextras.MixinExtrasBootstrap.init(); } catch (Throwable t) {}
         env = MixinEnvironment.getCurrentEnvironment();
-        awApply = aw.getClass().getMethod("apply", String.class, byte[].class);
+        if (aw != null) awApply = aw.getClass().getMethod("apply", String.class, byte[].class);   // AW is optional
     }
 
     public byte[] transform(String dotted, byte[] originalO){ byte[] X = tr.transformClassBytes(dotted, dotted, originalO); return (X==null||java.util.Arrays.equals(X,originalO))?null:X; }
     public byte[] generateClass(String dotted){ return tr.generateClass(env, dotted); }
     public Object accessWidener(){ return aw; }
     public boolean cftAppliesAw(){ return true; }
-    public byte[] applyAw(String n, byte[] b){ try { return (byte[]) awApply.invoke(aw, n, b); } catch(Throwable t){ return null; } }
+    public byte[] applyAw(String n, byte[] b){ if (awApply == null) return null; try { return (byte[]) awApply.invoke(aw, n, b); } catch(Throwable t){ return null; } }
 
     public boolean defineClass(String dotted, byte[] b, ProtectionDomain pd){ try { dc().invoke(sys, dotted, b, 0, b.length, pd); return true; }
         catch(Throwable t){ Throwable c=t.getCause()!=null?t.getCause():t;

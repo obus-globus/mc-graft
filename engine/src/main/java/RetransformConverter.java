@@ -255,7 +255,8 @@ public class RetransformConverter {
         c.maxStack = 2; c.maxLocals = 0; S.methods.add(c);
     }
     void addGetState(ClassNode S) {
-        // static State getState(Target self){ return (State) STATE.computeIfAbsent(self, k -> new State()); }
+        // static synchronized State getState(Target self){ State s=(State)STATE.get(self); if(s==null){ s=new State(); STATE.put(self,s);} return s; }
+        // (explicit get/init/put rather than computeIfAbsent, so a throwing State <init> never publishes a half-built instance)
         MethodNode g = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNCHRONIZED,
             "getState", "(" + targetDesc + ")L" + stateName + ";", null, null);
         InsnList in = g.instructions;
@@ -420,7 +421,7 @@ public class RetransformConverter {
         return s;
     }
 
-    /** GLOBAL table of mixin-ADDED methods across ALL targets, keyed by "owner name desc" -> [owner, sidecar,
+    /** GLOBAL table of mixin-ADDED methods across ALL targets, keyed by "owner name desc" -> [owner, sidecar,
      *  isStatic]. Keyed by OWNER (not just name+desc) because the same handler name+desc can be added to multiple
      *  targets; a call is resolved by walking the receiver's class hierarchy to the declaring target. */
     // volatile: assigned once by the agent AFTER Phase A completes, then read from many concurrent CFT threads. The
@@ -455,7 +456,7 @@ public class RetransformConverter {
         for (String c = owner; c != null && !c.equals("java/lang/Object"); c = superOf(c)) { String[] g = GFIELD.get(gkey(c, name, desc)); if (g != null) return g; }
         return null;
     }
-    static String gkey(String owner, String name, String desc) { return owner + " " + name + " " + desc; }
+    static String gkey(String owner, String name, String desc) { return owner + " " + name + " " + desc; }
     public static void collectAdded(String internal, byte[] O, byte[] X, Map<String,String[]> gMethods, Map<String,String[]> gFields, Map<String,List<String[]>> gIfaces) {
         ClassNode o = read(O), x = read(X); Set<String> om = keysM(o), of = keysF(o);
         String sc = sidecarInternal(internal);
@@ -474,7 +475,8 @@ public class RetransformConverter {
     /** resolve a call to a mixin-added method: walk the receiver type's hierarchy to the target that declared it. */
     String[] addedCall(String owner, String name, String desc, boolean callStatic) {
         if (GADDED == null) return null;
-        for (String c = owner; c != null && !c.equals("java/lang/Object"); c = superOf(c)) {
+        String c = owner;
+        for (int guard = 0; c != null && !c.equals("java/lang/Object") && guard++ < 256; c = superOf(c)) {
             String[] g = GADDED.get(gkey(c, name, desc));
             if (g != null) return callStatic == "1".equals(g[2]) ? g : null;
         }
@@ -722,7 +724,7 @@ public class RetransformConverter {
         in.add(new LdcInsnNode(targetInternal+"."+name+desc));
         in.add(new MethodInsnNode(Opcodes.INVOKESTATIC, AWR, "invokeResolved", "(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;", false));
         if (rt.getSort() == Type.VOID) { in.add(new InsnNode(Opcodes.POP)); in.add(new InsnNode(Opcodes.RETURN)); }
-        else if (rt.getSort() <= Type.DOUBLE) { unbox(in, rt); in.add(new InsnNode(rt.getOpcode(Opcodes.IRETURN))); }
+        else if (rt.getSort() <= Type.DOUBLE) { in.add(new MethodInsnNode(Opcodes.INVOKESTATIC, AWR, "nn", "(Ljava/lang/Object;)Ljava/lang/Object;", false)); unbox(in, rt); in.add(new InsnNode(rt.getOpcode(Opcodes.IRETURN))); }
         else { in.add(new TypeInsnNode(Opcodes.CHECKCAST, rt.getInternalName())); in.add(new InsnNode(Opcodes.ARETURN)); }
         m.maxStack = 9 + at.length; m.maxLocals = slot; S.methods.add(m);
     }

@@ -68,5 +68,13 @@ public final class AwReflect {
      *  descriptor mismatch — a correct invoke of a primitive-returning member never returns null). */
     public static Object nn(Object v){ if(v==null) throw new IllegalStateException("reflective primitive accessor/invoker returned null — descriptor mismatch"); return v; }
     public static Object newInst(String o, String[] pt, String key, Object[] a){ try { return ct(o,pt,key).newInstance(a); } catch(InvocationTargetException e){ throw re(e.getCause()==null?e:e.getCause()); } catch(Throwable e){ throw re(e); } }
+    /** Invoke a pre-resolved Method (a sidecar {@code rmi$} bridge's {@code RM$} field): {@code m.invoke(receiver,args)}
+     *  with InvocationTargetException unwrapping. {@code label} is {@code target."name"+desc} for diagnostics. Static
+     *  targets pass a null receiver; instance targets pass the receiver explicitly (args is already receiver-free). */
+    public static Object invokeResolved(Method m, Object receiver, Object[] args, String label){
+        try { return m.invoke(receiver, args); }
+        catch(InvocationTargetException e){ throw re(e.getCause()==null?e:e.getCause()); }
+        catch(Throwable e){ throw re(new RuntimeException("reflective invoke of "+label+" failed", e)); }
+    }
     private static RuntimeException re(Throwable e){ return e instanceof RuntimeException r ? r : new RuntimeException(e); }
 }
