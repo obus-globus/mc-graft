@@ -36,3 +36,6 @@ sha2 = "0.10"
 ristretto_classfile = "0.30.0"
 tempfile = "3.27.0"
 json-patch = "4.2.0"
+
+[target."cfg(windows)".dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }

@@ -77,10 +77,50 @@ jobs:
           path: ctl/dist/${{ matrix.artifact }}
           if-no-files-found: error
 
-  # Attach both artifacts to the GitHub release for the pushed tag.
+  # The control app on Windows (MSVC), with an embedded krak2.exe. inject is Unix-only for now; build/pack/patch work.
+  binary-windows:
+    name: Build mcgraft (windows-x86_64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ctl
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ctl
+          key: windows-release
+      - name: Build krak2.exe (Krakatau) to embed
+        working-directory: .
+        env:
+          KRAK2_COMMIT: ae49743af92bbab1684b19bb1bee22b0a64d8ce5   # pinned Krakatau v2
+        run: |
+          git clone https://github.com/Storyyeller/Krakatau "$RUNNER_TEMP/krakatau"
+          git -C "$RUNNER_TEMP/krakatau" checkout "$KRAK2_COMMIT"
+          cargo build --release --manifest-path "$RUNNER_TEMP/krakatau/Cargo.toml"
+      - name: Build mcgraft (embedding krak2.exe)
+        env:
+          # build.rs needs a Windows path; cygpath -w converts the bash path.
+          MCGRAFT_BUNDLE_KRAK2_RAW: ${{ runner.temp }}/krakatau/target/release/krak2.exe
+        run: |
+          export MCGRAFT_BUNDLE_KRAK2="$(cygpath -w "$MCGRAFT_BUNDLE_KRAK2_RAW")"
+          cargo build --release
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp target/release/mcgraft.exe dist/mcgraft-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcgraft-windows-x86_64
+          path: ctl/dist/mcgraft-windows-x86_64.exe
+          if-no-files-found: error
+
+  # Attach all artifacts to the GitHub release for the pushed tag.
   release:
     name: Publish release
-    needs: [base, binary]
+    needs: [base, binary, binary-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -94,4 +134,5 @@ jobs:
             artifacts/mc-graft-base/mc-graft-base.jar
             artifacts/mcgraft-linux-x86_64/mcgraft-linux-x86_64
             artifacts/mcgraft-linux-aarch64/mcgraft-linux-aarch64
+            artifacts/mcgraft-windows-x86_64/mcgraft-windows-x86_64.exe
           generate_release_notes: true

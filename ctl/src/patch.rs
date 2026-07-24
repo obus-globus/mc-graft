@@ -645,9 +645,10 @@ fn krak2_bin() -> Result<PathBuf, String> {
     if let Ok(p) = embedded_krak2() {
         return Ok(p);
     }
+    let exe = if cfg!(windows) { "krak2.exe" } else { "krak2" };
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let c = dir.join("krak2");
+            let c = dir.join(exe);
             if c.is_file() {
                 return Ok(c);
             }
@@ -671,6 +672,7 @@ fn embedded_krak2() -> Result<PathBuf, String> {
         static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_KRAK2_EMBEDDED"));
         let mut tmp = tempfile::Builder::new()
             .prefix("mcgraft-krak2-")
+            .suffix(if cfg!(windows) { ".exe" } else { "" }) // Windows execs by extension
             .tempfile()
             .map_err(|e| format!("extract embedded krak2: {e}"))?;
         tmp.write_all(BYTES).map_err(|e| format!("extract embedded krak2: {e}"))?;

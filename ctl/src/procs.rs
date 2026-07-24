@@ -1,13 +1,10 @@
-//! Discover running, attachable HotSpot JVMs on this host (and flag which are Minecraft) by reading `/proc` and the
-//! `hsperfdata` markers HotSpot drops for each attachable VM. No external `jps`/JDK needed.
-
-use std::fs;
-use std::path::PathBuf;
+//! Discover running, attachable HotSpot JVMs on this host (and flag which are Minecraft). On Unix this reads `/proc`
+//! and the `hsperfdata` markers HotSpot drops; on Windows it enumerates processes via `sysinfo`. No external `jps`/JDK.
 
 #[derive(Clone)]
 pub struct Jvm {
     pub pid: i32,
-    /// Full command line, space-joined (args were NUL-separated in /proc).
+    /// Full command line, space-joined.
     pub cmdline: String,
     /// Best-effort "what is this" label: the launched main class or `-jar` name.
     pub main: String,
@@ -18,14 +15,7 @@ pub struct Jvm {
 
 /// All attachable JVMs, Minecraft ones first, then by pid.
 pub fn list_jvms() -> Vec<Jvm> {
-    let mut pids: Vec<i32> = hsperf_pids();
-    // Also include any /proc entry whose comm is exactly "java" (covers VMs started with -XX:-UsePerfData).
-    for pid in proc_pids() {
-        if !pids.contains(&pid) && comm(pid).as_deref() == Some("java") {
-            pids.push(pid);
-        }
-    }
-    let mut out: Vec<Jvm> = pids.into_iter().filter_map(describe).collect();
+    let mut out = platform_list();
     out.sort_by(|a, b| b.is_minecraft.cmp(&a.is_minecraft).then(a.pid.cmp(&b.pid)));
     out
 }
@@ -47,64 +37,10 @@ pub fn resolve_target(selector: Option<&str>) -> Result<i32, String> {
     }
 }
 
-fn hsperf_pids() -> Vec<i32> {
-    let mut v = Vec::new();
-    if let Ok(tmp) = fs::read_dir("/tmp") {
-        for e in tmp.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("hsperfdata_") {
-                continue;
-            }
-            if let Ok(inner) = fs::read_dir(e.path()) {
-                for f in inner.flatten() {
-                    if let Ok(pid) = f.file_name().to_string_lossy().parse::<i32>() {
-                        v.push(pid);
-                    }
-                }
-            }
-        }
-    }
-    v
-}
-
-fn proc_pids() -> Vec<i32> {
-    fs::read_dir("/proc")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
-        .collect()
-}
-
-fn comm(pid: i32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-fn cmdline_args(pid: i32) -> Option<Vec<String>> {
-    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    if raw.is_empty() {
-        return None;
-    }
-    Some(
-        raw.split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect(),
-    )
-}
-
-fn describe(pid: i32) -> Option<Jvm> {
-    // Must still be alive and have a cmdline.
-    let args = cmdline_args(pid)?;
-    if !PathBuf::from(format!("/proc/{pid}")).exists() {
-        return None;
-    }
+/// Classify a JVM from its pid + argv (platform-independent).
+fn classify(pid: i32, args: &[String]) -> Jvm {
     let cmdline = args.join(" ");
     let joined = cmdline.as_str();
-
     let is_minecraft = joined.contains("knot.KnotClient")
         || joined.contains("net.minecraft.client.main.Main")
         || joined.contains("net.fabricmc.loader")
@@ -112,12 +48,9 @@ fn describe(pid: i32) -> Option<Jvm> {
         || joined.contains("net.neoforged")
         || joined.contains("io.github.zekerzhayard") // ForgeWrapper
         || (joined.contains("minecraft") && joined.contains("-cp"));
-
-    // Best-effort "main" label: the last non-flag arg that looks like a class, or the -jar target.
-    let main = mainish(&args);
-    let mc_version = flag_value(&args, "--version");
-
-    Some(Jvm { pid, cmdline, main, mc_version, is_minecraft })
+    let main = mainish(args);
+    let mc_version = flag_value(args, "--version");
+    Jvm { pid, cmdline, main, mc_version, is_minecraft }
 }
 
 /// The launched entry point: `-jar X` target, else the main class (first non-`-flag`, non-`java` arg after options).
@@ -127,7 +60,6 @@ fn mainish(args: &[String]) -> String {
             return j.clone();
         }
     }
-    // Known launcher main classes are the most informative label when present.
     for known in [
         "net.fabricmc.loader.impl.launch.knot.KnotClient",
         "net.minecraft.client.main.Main",
@@ -137,7 +69,6 @@ fn mainish(args: &[String]) -> String {
             return known.to_string();
         }
     }
-    // Fallback: first arg after the JVM binary that isn't an option and isn't a value of -cp/-p.
     let mut skip_next = false;
     for (i, a) in args.iter().enumerate().skip(1) {
         if skip_next {
@@ -161,4 +92,92 @@ fn mainish(args: &[String]) -> String {
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+}
+
+// ----------------------------------------------------------------------------------------------- platform discovery
+
+#[cfg(unix)]
+fn platform_list() -> Vec<Jvm> {
+    use std::fs;
+
+    fn hsperf_pids() -> Vec<i32> {
+        let mut v = Vec::new();
+        if let Ok(tmp) = fs::read_dir("/tmp") {
+            for e in tmp.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("hsperfdata_") {
+                    continue;
+                }
+                if let Ok(inner) = fs::read_dir(e.path()) {
+                    for f in inner.flatten() {
+                        if let Ok(pid) = f.file_name().to_string_lossy().parse::<i32>() {
+                            v.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+    fn proc_pids() -> Vec<i32> {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+            .collect()
+    }
+    fn comm(pid: i32) -> Option<String> {
+        fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string())
+    }
+    fn cmdline_args(pid: i32) -> Option<Vec<String>> {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect(),
+        )
+    }
+
+    let mut pids: Vec<i32> = hsperf_pids();
+    // Also include any /proc entry whose comm is exactly "java" (covers VMs started with -XX:-UsePerfData).
+    for pid in proc_pids() {
+        if !pids.contains(&pid) && comm(pid).as_deref() == Some("java") {
+            pids.push(pid);
+        }
+    }
+    pids.into_iter()
+        .filter_map(|pid| {
+            let args = cmdline_args(pid)?;
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return None;
+            }
+            Some(classify(pid, &args))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn platform_list() -> Vec<Jvm> {
+    use sysinfo::System;
+    let sys = System::new_all();
+    sys.processes()
+        .values()
+        .filter_map(|p| {
+            let name = p.name().to_string_lossy().to_ascii_lowercase();
+            if name != "java.exe" && name != "javaw.exe" {
+                return None;
+            }
+            let args: Vec<String> = p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+            if args.is_empty() {
+                return None;
+            }
+            Some(classify(i32::try_from(p.pid().as_u32()).unwrap_or(-1), &args))
+        })
+        .collect()
 }
