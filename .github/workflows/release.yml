@@ -46,7 +46,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ctl
-      - run: cargo build --release
+      - name: Build krak2 (Krakatau) to embed
+        working-directory: .
+        run: |
+          git clone --depth 1 --branch v2 https://github.com/Storyyeller/Krakatau /tmp/krakatau
+          cargo build --release --manifest-path /tmp/krakatau/Cargo.toml
+      - name: Build mcgraft (embedding krak2 so .j patches are self-contained)
+        env:
+          MCGRAFT_BUNDLE_KRAK2: /tmp/krakatau/target/release/krak2
+        run: cargo build --release
       - name: Stage binary
         run: |
           mkdir -p dist

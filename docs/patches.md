@@ -201,8 +201,10 @@ phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *prim
 3. ✅ GUI "Patches" list (Quick-pack mode).
 4. ✅ `krak2` (PATH / `MCGRAFT_KRAK2`) wrapper; whole-class assembly — bare `.j` + bundle `new/`.
 5. ✅ In-place bytecode `[[patch]] format = "ops"` on `ristretto_classfile` — `replace_const`, `redirect_invoke`.
-6. ⏳ More `ops` (`insert_before`/`remove_call`/`set_return` — need frame-index adjustment); `ristretto` post-verify;
-      RFC-6902 `jsonpatch`; ship `krak2` self-contained (embed via `include_bytes!` behind a feature).
+6. ✅ Ship `krak2` self-contained — `build.rs` embeds it via `include_bytes!` when built with
+      `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2` (else runtime falls back to `MCGRAFT_KRAK2` / `PATH`). Release CI bundles it.
+7. ⏳ More `ops` (`insert_before`/`remove_call`/`set_return` — need frame-index adjustment); `ristretto` post-verify of
+      patched classes; RFC-6902 `jsonpatch`; the `krakatau-diff` `[[patch]]` format.
 
 ## Open questions (phase 2)
 

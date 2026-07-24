@@ -77,8 +77,9 @@ bare Krakatau `.j` file. Supported (all JDK-free):
 - **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** (RFC-7396 JSON merge, e.g.
   editing `fabric.mod.json`) — no external tools.
 - **Whole-class Krakatau assembly** — a bare `.j` file, or a bundle `new/` directory of `.j` files, assembled and
-  added/replaced by declared class name. Needs the `krak2` binary on `PATH` or via `MCGRAFT_KRAK2` (only when a patch
-  actually contains `.j`).
+  added/replaced by declared class name. Uses `krak2`: released binaries **embed it** (built with
+  `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2`); otherwise it's found via `MCGRAFT_KRAK2` or `PATH`. Only needed when a patch
+  actually contains `.j`.
 - **In-place bytecode `[[patch]] format = "ops"`** — structured edits to an existing class via `ristretto_classfile`:
   `replace_const` (swap an int/String constant) and `redirect_invoke` (retarget a call). Base-robust (1→1 instruction
   replacement; offsets + stack-map frames recomputed on write), no `krak2` needed.

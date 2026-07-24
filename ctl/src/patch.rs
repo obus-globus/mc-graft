@@ -601,12 +601,16 @@ fn json_merge(target: &mut Value, patch: &Value) {
 
 static KRAK_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Locate the `krak2` binary: `MCGRAFT_KRAK2` env override, else `krak2` on `PATH`. Only called when a patch actually
-/// contains Krakatau assembly, so overlay/JSON-only patches never need it.
+/// Locate the `krak2` binary: `MCGRAFT_KRAK2` override, else the embedded copy (if this build bundled one), else `krak2`
+/// on `PATH`. Only called when a patch actually contains Krakatau assembly, so overlay/JSON/ops patches never need it.
 fn krak2_bin() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("MCGRAFT_KRAK2") {
         let p = PathBuf::from(p);
         return if p.is_file() { Ok(p) } else { Err(format!("MCGRAFT_KRAK2 is not a file: {}", p.display())) };
+    }
+    #[cfg(embed_krak2)]
+    if let Ok(p) = embedded_krak2() {
+        return Ok(p);
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -616,7 +620,30 @@ fn krak2_bin() -> Result<PathBuf, String> {
             }
         }
     }
-    Err("krak2 not found — put it on PATH or set MCGRAFT_KRAK2 (required to assemble Krakatau .j patches)".into())
+    Err("krak2 not found — put it on PATH, set MCGRAFT_KRAK2, or build with MCGRAFT_BUNDLE_KRAK2 to embed it \
+         (required to assemble Krakatau .j patches; overlay/JSON/ops patches don't need it)"
+        .into())
+}
+
+/// Extract the build-time-embedded `krak2` to a temp file once and return its path.
+#[cfg(embed_krak2)]
+fn embedded_krak2() -> Result<PathBuf, String> {
+    use std::sync::OnceLock;
+    static EXTRACTED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    EXTRACTED
+        .get_or_init(|| {
+            static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_KRAK2_EMBEDDED"));
+            let path = std::env::temp_dir().join(format!("mcgraft-krak2-{}", std::process::id()));
+            std::fs::write(&path, BYTES).map_err(|e| format!("extract embedded krak2: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("chmod embedded krak2: {e}"))?;
+            }
+            Ok(path)
+        })
+        .clone()
 }
 
 /// Assemble one Krakatau `.j` source into its class(es); returns `(internal-name, class-bytes)` per class. A `.j` may
