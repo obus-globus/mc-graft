@@ -56,6 +56,11 @@ public class FullInjectAgent {
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
         RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle, cfg.callerRewritePackages);
         GENUINE_IFACES = scanGenuineImplementors(lbBundle, cfg.callerRewritePackages);
+        // Also caller-rewrite the applied dependency (fabric-api) runtime: its own classes cast MC objects to duck
+        // interfaces its mixins add. Match by prefix (they are not in the payload jar). Only when dep-mixins are applied.
+        Set<String> crPrefixes = new HashSet<>(cfg.callerRewritePackages);
+        if (!cfg.depMixinConfigs.isEmpty()) crPrefixes.add("net/fabricmc/fabric");
+        RetransformConverter.CALLER_REWRITE_PREFIXES = crPrefixes;
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
@@ -211,9 +216,10 @@ public class FullInjectAgent {
                     }
                     if (c==null) { byte[] w=awApply(n,t); if(w!=null) t=w; }
                     return t; }
-                if (RetransformConverter.PAYLOAD_CLASSES.contains(n)) {
+                if (RetransformConverter.isCallerRewrite(n)) {
                     byte[] rw = AccessorBridgeRewriter.rewrite(n, b);
                     rw = ifaceMap.isEmpty()? rw : RetransformConverter.rewriteCaller(rw, ifaceMap);
+                    if (n.equals(KeyBindingReopen.TARGET)) rw = KeyBindingReopen.rewrite(n, rw);   // dep classes: also strip the keybind guard (this branch pre-empts the standalone KeyBindingReopen branch below)
                     if (DEBUG) InjectionLogger.info("CFT caller "+n+" changed="+(rw!=b));
                     rw = RetransformConverter.rewriteLbAw(rw, awRes);
                     if (!LateAttachVerifier.verifyCaller(n, b, rw, gadded, gfield, ifaceMap)) return null;
@@ -243,7 +249,7 @@ public class FullInjectAgent {
         // DuckDispatch/the concrete class before the mod bootstraps.
         try { List<Class<?>> lp = new ArrayList<>();
             for (Class<?> c : inst.getAllLoadedClasses()) { String cn = c.getName().replace('.','/');
-                if (RetransformConverter.PAYLOAD_CLASSES.contains(cn) && !convMap.containsKey(cn) && inst.isModifiableClass(c)) lp.add(c); }
+                if (RetransformConverter.isCallerRewrite(cn) && !convMap.containsKey(cn) && inst.isModifiableClass(c)) lp.add(c); }
             if (!lp.isEmpty()) { inst.retransformClasses(lp.toArray(new Class[0])); InjectionLogger.info("retransformed "+lp.size()+" already-loaded payload classes for caller rewriting: "+lp); }
         } catch(Throwable t){ InjectionLogger.warn("payload caller retransform failed: "+rootMsg(t)); }
 

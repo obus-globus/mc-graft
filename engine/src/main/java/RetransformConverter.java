@@ -434,6 +434,15 @@ public class RetransformConverter {
     public static volatile Set<String> PAYLOAD_CLASSES = java.util.Collections.emptySet();
     /** True if the mixin-added interface is one the payload itself defines (vs a pre-existing runtime interface). */
     public static boolean isPayloadIface(String internal) { return PAYLOAD_CLASSES.contains(internal); }
+    /** Internal-name prefixes of DEPENDENCY runtime whose classes must be caller-rewritten too (their own code casts
+     *  MC objects to duck interfaces the applied dependency mixins add, e.g. fabric-api's ClientLifecycleEventsImpl ->
+     *  (LoadedChunksCache) clientLevel). Matched by prefix since the classes are not in the payload jar. */
+    public static volatile Set<String> CALLER_REWRITE_PREFIXES = java.util.Collections.emptySet();
+    public static boolean isCallerRewrite(String internal) {
+        if (PAYLOAD_CLASSES.contains(internal)) return true;
+        for (String p : CALLER_REWRITE_PREFIXES) if (internal.startsWith(p)) return true;
+        return false;
+    }
     /** Payload duck interfaces that are ALSO genuinely implemented by a real (non-mixin) bundle class — i.e. at runtime
      *  a value of this interface type may be a genuine implementor OR a de-implemented (duck) target. Such interfaces
      *  are NOT erased from descriptors ("phantom": the interface type is legal per JVMS since it verifies like Object);
