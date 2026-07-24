@@ -27,10 +27,18 @@ jobs:
           path: build/agent/mc-graft-base.jar
           if-no-files-found: error
 
-  # The control app (CLI + GUI), statically-ish linked Linux x86_64 binary.
+  # The control app (CLI + GUI). Built per Linux arch on a NATIVE runner (so both mcgraft and its embedded krak2 are the
+  # target's architecture — no cross-compilation). Linux-only: inject discovers JVMs via /proc and attaches over the
+  # Unix-socket HotSpot protocol, so macOS/Windows are out of scope.
   binary:
-    name: Build mcgraft (Linux x86_64)
-    runs-on: ubuntu-latest
+    name: Build mcgraft (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    name: linux-x86_64,  artifact: mcgraft-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, name: linux-aarch64, artifact: mcgraft-linux-aarch64 }
     defaults:
       run:
         working-directory: ctl
@@ -46,6 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ctl
+          key: ${{ matrix.name }}
       - name: Build krak2 (Krakatau) to embed
         working-directory: .
         env:
@@ -61,11 +70,11 @@ jobs:
       - name: Stage binary
         run: |
           mkdir -p dist
-          cp target/release/mcgraft dist/mcgraft-linux-x86_64
+          cp target/release/mcgraft "dist/${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: mcgraft-linux-x86_64
-          path: ctl/dist/mcgraft-linux-x86_64
+          name: ${{ matrix.artifact }}
+          path: ctl/dist/${{ matrix.artifact }}
           if-no-files-found: error
 
   # Attach both artifacts to the GitHub release for the pushed tag.
@@ -84,4 +93,5 @@ jobs:
           files: |
             artifacts/mc-graft-base/mc-graft-base.jar
             artifacts/mcgraft-linux-x86_64/mcgraft-linux-x86_64
+            artifacts/mcgraft-linux-aarch64/mcgraft-linux-aarch64
           generate_release_notes: true
