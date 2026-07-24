@@ -77,7 +77,7 @@ jobs:
           path: ctl/dist/${{ matrix.artifact }}
           if-no-files-found: error
 
-  # The control app on Windows (MSVC), with an embedded krak2.exe. inject is Unix-only for now; build/pack/patch work.
+  # The control app on Windows (MSVC), with embedded krak2.exe (patch assembly) and jattach.exe (inject).
   binary-windows:
     name: Build mcgraft (windows-x86_64)
     runs-on: windows-latest
@@ -92,6 +92,8 @@ jobs:
         with:
           workspaces: ctl
           key: windows-release
+      - name: Set up MSVC (to build jattach)
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Build krak2.exe (Krakatau) to embed
         working-directory: .
         env:
@@ -100,12 +102,21 @@ jobs:
           git clone https://github.com/Storyyeller/Krakatau "$RUNNER_TEMP/krakatau"
           git -C "$RUNNER_TEMP/krakatau" checkout "$KRAK2_COMMIT"
           cargo build --release --manifest-path "$RUNNER_TEMP/krakatau/Cargo.toml"
-      - name: Build mcgraft (embedding krak2.exe)
-        env:
-          # build.rs needs a Windows path; cygpath -w converts the bash path.
-          MCGRAFT_BUNDLE_KRAK2_RAW: ${{ runner.temp }}/krakatau/target/release/krak2.exe
+      - name: Build jattach.exe to embed
+        working-directory: .
+        shell: cmd
         run: |
-          export MCGRAFT_BUNDLE_KRAK2="$(cygpath -w "$MCGRAFT_BUNDLE_KRAK2_RAW")"
+          git clone --branch v2.2 --depth 1 https://github.com/jattach/jattach "%RUNNER_TEMP%\jattach"
+          cd /d "%RUNNER_TEMP%\jattach"
+          cl /O2 /D_CRT_SECURE_NO_WARNINGS /DJATTACH_VERSION=\"2.2\" /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
+      - name: Build mcgraft (embedding krak2.exe + jattach.exe)
+        env:
+          # build.rs needs Windows paths; cygpath -w converts the bash paths.
+          KRAK2_RAW: ${{ runner.temp }}/krakatau/target/release/krak2.exe
+          JATTACH_RAW: ${{ runner.temp }}/jattach/jattach.exe
+        run: |
+          export MCGRAFT_BUNDLE_KRAK2="$(cygpath -w "$KRAK2_RAW")"
+          export MCGRAFT_BUNDLE_JATTACH="$(cygpath -w "$JATTACH_RAW")"
           cargo build --release
       - name: Stage binary
         run: |

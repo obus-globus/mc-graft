@@ -183,11 +183,17 @@ pub fn load_agent(pid: i32, agent_jar: &std::path::Path, agent_args: &str) -> Re
     Ok(AttachResult { jvm_status, agent_rc, output: combined })
 }
 
+/// Locate jattach: `MCGRAFT_JATTACH` override, else the embedded copy (if this build bundled one), else `jattach.exe`
+/// on `PATH`.
 #[cfg(windows)]
 fn jattach_bin() -> Result<std::path::PathBuf, String> {
     if let Some(p) = std::env::var_os("MCGRAFT_JATTACH") {
         let p = std::path::PathBuf::from(p);
         return if p.is_file() { Ok(p) } else { Err(format!("MCGRAFT_JATTACH is not a file: {}", p.display())) };
+    }
+    #[cfg(embed_jattach)]
+    if let Ok(p) = embedded_jattach() {
+        return Ok(p);
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -197,9 +203,32 @@ fn jattach_bin() -> Result<std::path::PathBuf, String> {
             }
         }
     }
-    Err("jattach not found — Windows inject needs jattach.exe on PATH or MCGRAFT_JATTACH set \
+    Err("jattach not found — Windows inject needs jattach.exe on PATH, MCGRAFT_JATTACH set, or a build that embeds it \
          (from https://github.com/jattach/jattach). Windows attach is experimental / not yet verified end-to-end."
         .into())
+}
+
+/// Extract the build-time-embedded jattach.exe to a private temp file once and return its path (kept alive for the
+/// process via the OnceLock; unpredictable mkstemp name).
+#[cfg(all(windows, embed_jattach))]
+fn embedded_jattach() -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static EXTRACTED: OnceLock<Result<tempfile::TempPath, String>> = OnceLock::new();
+    match EXTRACTED.get_or_init(|| {
+        static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_JATTACH_EMBEDDED"));
+        let mut tmp = tempfile::Builder::new()
+            .prefix("mcgraft-jattach-")
+            .suffix(".exe")
+            .tempfile()
+            .map_err(|e| format!("extract embedded jattach: {e}"))?;
+        tmp.write_all(BYTES).map_err(|e| format!("extract embedded jattach: {e}"))?;
+        tmp.flush().ok();
+        Ok(tmp.into_temp_path())
+    }) {
+        Ok(tp) => Ok(tp.to_path_buf()),
+        Err(e) => Err(e.clone()),
+    }
 }
 
 /// Non-Unix, non-Windows (unlikely) — inject unsupported.
