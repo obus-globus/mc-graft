@@ -14,7 +14,9 @@ public final class DuckDispatch {
     // For a SHARED duck interface (one a real bundle class genuinely implements), a receiver may be a real implementor
     // rather than a de-implemented mixin target; these cache the interface Class + the real interface method for it.
     private static final Map<String,Class<?>> IFACES = new ConcurrentHashMap<>();
-    private static final Map<Key,Method> REAL_METHODS = new ConcurrentHashMap<>();
+    // The real interface method depends only on (iface, name, desc), not the receiver class — key it that way so a
+    // shared interface with many receiver classes doesn't spawn a redundant cache entry per class.
+    private static final Map<String,Method> REAL_METHODS = new ConcurrentHashMap<>();
 
     private record Impl(String targetName, String sidecarName) {}
     private record Key(Class<?> receiver, String iface, String name, String desc) {}
@@ -50,7 +52,7 @@ public final class DuckDispatch {
             Key key = new Key(receiver.getClass(), iface, name, desc);
             Class<?> ic = ifaceClass(iface);
             if (ic != null && ic.isInstance(receiver)) {                   // genuine implementor: call the real interface method
-                Method rm = REAL_METHODS.computeIfAbsent(key, k -> realMethod(ic, k));
+                Method rm = REAL_METHODS.computeIfAbsent(iface + "\0" + name + "\0" + desc, k -> realMethod(ic, name, desc));
                 return rm.invoke(receiver, args);                         // normal instance call (receiver NOT prepended)
             }
             Method m = METHODS.computeIfAbsent(key, DuckDispatch::resolve);   // de-implemented (duck) target: sidecar static
@@ -71,10 +73,10 @@ public final class DuckDispatch {
         });
     }
 
-    private static Method realMethod(Class<?> ic, Key key) {
+    private static Method realMethod(Class<?> ic, String name, String desc) {
         try {
-            MethodType mt = MethodType.fromMethodDescriptorString(key.desc, SYS);
-            Method m = ic.getMethod(key.name, mt.parameterArray());
+            MethodType mt = MethodType.fromMethodDescriptorString(desc, SYS);
+            Method m = ic.getMethod(name, mt.parameterArray());
             m.setAccessible(true);
             return m;
         } catch (Throwable t) { throw re(t); }

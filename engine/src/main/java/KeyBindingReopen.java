@@ -1,5 +1,6 @@
 import org.objectweb.asm.*;
 import org.objectweb.asm.tree.*;
+import mcgraft.rt.InjectionLogger;
 
 /** Reopen fabric-api's keybinding registry for late (post-attach) registration.
  *
@@ -39,6 +40,14 @@ public final class KeyBindingReopen {
             }
             if (ifnull == null) continue;   // no guard present -> nothing to strip
             LabelNode target = ifnull.label;
+            // Confirm the branch-not-taken path actually throws IllegalStateException (the real guard signature) before
+            // excising the prologue. Guards against a future fabric-api whose leading IFNULL is something else — stripping
+            // then would corrupt the method, so we leave it unchanged and warn instead.
+            if (!throwsIllegalState(ifnull.getNext(), target)) {
+                InjectionLogger.warn("KeyBindingReopen: leading IFNULL in " + owner
+                    + ".registerKeyMapping does not guard an IllegalStateException throw — leaving the method unchanged");
+                continue;
+            }
             for (AbstractInsnNode p = m.instructions.getFirst(); p != null && p != target; ) {
                 AbstractInsnNode next = p.getNext();
                 m.instructions.remove(p);
@@ -50,5 +59,15 @@ public final class KeyBindingReopen {
         ClassWriter w = new ClassWriter(new ClassReader(bytes), ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
         c.accept(w);
         return w.toByteArray();
+    }
+
+    /** True if the span {@code [from, to)} constructs and throws an IllegalStateException (the guard's throw path). */
+    private static boolean throwsIllegalState(AbstractInsnNode from, AbstractInsnNode to) {
+        boolean sawNew = false;
+        for (AbstractInsnNode p = from; p != null && p != to; p = p.getNext()) {
+            if (p.getOpcode() == Opcodes.NEW && ((TypeInsnNode) p).desc.equals("java/lang/IllegalStateException")) sawNew = true;
+            if (p.getOpcode() == Opcodes.ATHROW && sawNew) return true;
+        }
+        return false;
     }
 }

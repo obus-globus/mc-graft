@@ -30,7 +30,12 @@ public final class StateReflect {
             Field f = Class.forName(stateInternal.replace('/','.'), false, SYS).getDeclaredField(name);
             f.setAccessible(true);
             return f;
-        } catch (Throwable t) { /* fall through to the real class */ }
+        } catch (Throwable t) {
+            // A relocated field is registered but its $State field couldn't be resolved — the shim is misconfigured.
+            // Surface it (the fall-through below will otherwise throw a misleading NoSuchFieldException at the mod site).
+            InjectionLogger.warn("StateReflect: relocated field " + name + " on " + target.getName()
+                + " registered but $State lookup failed (" + stateInternal + "): " + t);
+        }
         return target.getDeclaredField(name);
     }
 

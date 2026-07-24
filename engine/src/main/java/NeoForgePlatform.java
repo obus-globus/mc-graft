@@ -38,7 +38,7 @@ final class NeoForgePlatform implements LoaderPlatform {
     private File agentJar;
     private final Map<String,byte[]> baseline = new HashMap<>();
     private final Set<String> ownedPkgs = new HashSet<>();
-    private boolean lbActivated;
+    private boolean payloadActivated;
 
     NeoForgePlatform(Instrumentation inst){ this.inst = inst; }
 
@@ -58,15 +58,15 @@ final class NeoForgePlatform implements LoaderPlatform {
         this.agentJar = agentJar;
         RetransformConverter.SIDECAR_PKG = SIDECAR_PKG;                          // relocate sidecars out of module `minecraft`
         Path tmp = Files.createTempDirectory("mcgraft-nf-"); tmp.toFile().deleteOnExit();
-        List<URL> urls = new ArrayList<>(); Path lbBundle = null; int pushed = 0, skipped = 0;
+        List<URL> urls = new ArrayList<>(); Path payloadBundle = null; int pushed = 0, skipped = 0;
         try (JarFile jf = new JarFile(agentJar)) { for (var en = jf.entries(); en.hasMoreElements();) { JarEntry e = en.nextElement(); String n = e.getName();
             if (!n.startsWith("agent-libs/") || !n.endsWith(".jar")) continue;
             String base = new File(n).getName();
-            boolean isLb = base.equals("payload.jar");
-            if (!isLb && isLoaderProvided(base)) { skipped++; continue; }         // asm/mixin/mixinextras -> NeoForge-provided (parent-first)
+            boolean isPayload = base.equals("payload.jar");
+            if (!isPayload && isLoaderProvided(base)) { skipped++; continue; }         // asm/mixin/mixinextras -> NeoForge-provided (parent-first)
             Path o = tmp.resolve(base);
             try (InputStream in = jf.getInputStream(e)) { Files.copy(in, o, StandardCopyOption.REPLACE_EXISTING); } o.toFile().deleteOnExit();
-            if (isLb) { lbBundle = o; scanPackages(o, ownedPkgs); }
+            if (isPayload) { payloadBundle = o; scanPackages(o, ownedPkgs); }
             urls.add(o.toUri().toURL()); pushed++;
             // Stage this jar's bundled (jar-in-jar) dependencies too, onto the same PayloadLoader.
             for (java.nio.file.Path nested : FullInjectAgent.extractNestedJars(o, tmp)) {
@@ -74,7 +74,7 @@ final class NeoForgePlatform implements LoaderPlatform {
                 scanPackages(nested, ownedPkgs); urls.add(nested.toUri().toURL()); pushed++;
             }
         } }
-        if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
+        if (payloadBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         ownedPkgs.add(SIDECAR_PKG);                                              // relocated sidecars are defined + resolved here
         // Install PayloadLoader as the TCL's child-first fallback (chained to FML's original fallback) and register payload
         // packages in parentLoaders so FML's mixin byte reader locates the payload mixin classes during transformation.
@@ -83,7 +83,7 @@ final class NeoForgePlatform implements LoaderPlatform {
         tcl.getClass().getMethod("setFallbackClassLoader", ClassLoader.class).invoke(tcl, lb);
         registerParentLoaders(tcl, lb);
         InjectionLogger.info("staged payload onto loader: "+pushed+" jar(s), "+skipped+" loader-provided skipped; ownedPkgs="+ownedPkgs.size()+"; TCL="+tcl);
-        return lbBundle;
+        return payloadBundle;
     }
     /** Hard identity-split hazards NeoForge provides itself — resolved parent-first via the TCL, never on the PayloadLoader.
      *  mcef is excluded too: the bundled Fabric-flavoured mcef jar's MCEF.<clinit> transitively references Sodium
@@ -159,7 +159,7 @@ final class NeoForgePlatform implements LoaderPlatform {
 
     // ---- §1c: baselines (X_others) captured while the payload's late-added config is UNVISITED -------------------------------
     public void prepareBaselines(java.util.List<String> internalTargets) throws Exception {
-        if (lbActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
+        if (payloadActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
         int n = 0;
         for (String internal : internalTargets) {
             byte[] pre = rawBytes(internal); if (pre == null) continue;
@@ -181,7 +181,7 @@ final class NeoForgePlatform implements LoaderPlatform {
             }
             baseline.put(internal, xOthers == null ? pre : xOthers); n++;
         }
-        InjectionLogger.info("captured "+n+" non-LB mod baselines (X_others)");
+        InjectionLogger.info("captured "+n+" non-payload mod baselines (X_others)");
     }
 
     // ---- §1c: X for a target = X_all after forcing the payload's config to select; delta isolated against X_others ----------
@@ -189,7 +189,7 @@ final class NeoForgePlatform implements LoaderPlatform {
         String internal = dotted.replace('.','/');
         byte[] in = rawBytes(internal); if (in == null) in = originalO; if (in == null) return null;
         fTransformedCount.setInt(processor, 0);                                  // probe workaround: promote the payload's pending config
-        lbActivated = true;
+        payloadActivated = true;
         byte[] X;
         try { X = (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in); }
         catch (Throwable t) {

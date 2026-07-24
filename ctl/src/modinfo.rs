@@ -82,7 +82,7 @@ fn dep_range(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Array(a) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" | "),
-        other => other.to_string(),
+        _ => "*".to_string(), // unexpected shape (fabric.mod.json deps are string|array) -> show "any" rather than raw JSON
     }
 }
 

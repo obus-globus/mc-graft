@@ -52,15 +52,16 @@ fn ensure_socket(pid: i32) -> Result<PathBuf, String> {
     if sock.exists() {
         return Ok(sock);
     }
-    // Create the attach trigger. The JVM's SIGQUIT handler checks its cwd first, then /tmp; create it where we can.
+    // Create the attach trigger. The JVM's SIGQUIT handler checks its cwd first, then /tmp; create it in that order.
+    // Use create_new so a concurrent attach's trigger is never truncated: if the file already exists we reuse it and
+    // leave cleanup to whoever created it (owned = false), so we don't yank another attacher's trigger out from under it.
     let candidates = [
         PathBuf::from(format!("/proc/{pid}/cwd/.attach_pid{pid}")),
         dir.join(format!(".attach_pid{pid}")),
     ];
-    let trigger = candidates
+    let (trigger, owned) = candidates
         .iter()
-        .find(|c| fs::File::create(c).is_ok())
-        .cloned()
+        .find_map(|c| create_trigger(c))
         .ok_or_else(|| "could not create the attach trigger file (permission denied?)".to_string())?;
 
     let r = (|| {
@@ -77,8 +78,21 @@ fn ensure_socket(pid: i32) -> Result<PathBuf, String> {
              (not launched with -XX:+DisableAttachMechanism)?"
         ))
     })();
-    let _ = fs::remove_file(&trigger);
+    if owned {
+        let _ = fs::remove_file(&trigger);
+    }
     r
+}
+
+/// Create an attach trigger at `path`, returning `(path, owned)`. `owned` is true when we created the file (and are
+/// responsible for removing it), false when it already existed (a concurrent attach — reuse it, don't clean it up).
+/// `None` when the location is not writable, so the caller can try the next candidate. Never truncates an existing file.
+fn create_trigger(path: &Path) -> Option<(PathBuf, bool)> {
+    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_) => Some((path.to_path_buf(), true)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Some((path.to_path_buf(), false)),
+        Err(_) => None,
+    }
 }
 
 /// Load `agent_jar` into the JVM `pid`, passing `agent_args` (the raw agent option string — already separator-joined).

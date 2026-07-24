@@ -259,8 +259,9 @@ fn config_included(name: &str, filter: &[String]) -> bool {
     }
 }
 
-/// Distinct 2-segment package prefixes (internal names, e.g. "xaero/lib") of the classes in the payload's bundled
-/// jar-in-jar library mods. Used to caller-rewrite those library classes (they cast to their own mixins' duck interfaces).
+/// Distinct package prefixes (internal names, e.g. "xaero/lib") of the classes in the payload's bundled jar-in-jar
+/// library mods — up to 2 segments deep, or the whole package for shallower ones. Used to caller-rewrite those library
+/// classes (they cast to their own mixins' duck interfaces).
 fn jij_package_roots(payload: &Path) -> Vec<String> {
     let mut roots: BTreeSet<String> = BTreeSet::new();
     let Ok(bytes) = std::fs::read(payload) else { return Vec::new() };
@@ -272,9 +273,12 @@ fn jij_package_roots(payload: &Path) -> Vec<String> {
             if !name.ends_with(".class") {
                 continue;
             }
-            let parts: Vec<&str> = name.splitn(3, '/').collect();
-            if parts.len() >= 3 {
-                roots.insert(format!("{}/{}", parts[0], parts[1]));
+            // class entry = <pkg-seg>*/<Name>.class; keep up to the first 2 package segments as the rewrite root.
+            // (A 1-segment package like "foo/Bar.class" yields "foo"; the default package is skipped.)
+            let comps: Vec<&str> = name.split('/').collect();
+            if comps.len() >= 2 {
+                let depth = (comps.len() - 1).min(2);
+                roots.insert(comps[..depth].join("/"));
             }
         }
     }
@@ -410,7 +414,13 @@ fn resolve_dep(coord: &str) -> Result<(String, Vec<u8>), String> {
         return Err(format!("bad Maven coordinate (need group:artifact:version): {coord}"));
     }
     let (group, artifact, version) = (parts[0], parts[1], parts[2]);
-    let filename = format!("{artifact}-{version}.jar");
+    // An optional 4th part is a Maven classifier (group:artifact:version:classifier); fold it into the filename rather
+    // than silently fetching the base jar.
+    let classifier = parts.get(3).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let filename = match classifier {
+        Some(c) => format!("{artifact}-{version}-{c}.jar"),
+        None => format!("{artifact}-{version}.jar"),
+    };
     let rel = format!("{}/{}/{}/{}", group.replace('.', "/"), artifact, version, filename);
     let repos = [
         "https://repo1.maven.org/maven2",

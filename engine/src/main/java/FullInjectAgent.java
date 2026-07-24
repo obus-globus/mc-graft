@@ -9,7 +9,7 @@ import mcgraft.rt.InjectionLogger;
 public class FullInjectAgent {
     static LoaderPlatform PLATFORM;                                               // loader-specific seams (vanilla/Fabric/NeoForge)
     static ClassLoader SYS;                                                       // == PLATFORM.targetLoader(); holds net.minecraft.* + staged LB
-    static final boolean DEBUG = Boolean.getBoolean("lb.agent.debug");
+    static final boolean DEBUG = Boolean.getBoolean("mcgraft.agent.debug");
     static final Set<String> definedSynth = ConcurrentHashMap.newKeySet();
     static final Set<String> definingSynth = ConcurrentHashMap.newKeySet();
     static final Map<String,Conv> convMap = new ConcurrentHashMap<>();             // internal -> conversion holder
@@ -23,7 +23,7 @@ public class FullInjectAgent {
     static final Map<String,Boolean> npField = new ConcurrentHashMap<>();          // owner#name -> non-public?
     static final Map<String,Boolean> npMethod = new ConcurrentHashMap<>();         // owner#name desc -> non-public?
     static final Set<String> INACC = ConcurrentHashMap.newKeySet();                // already-loaded package-private MC classes the payload references by type
-    static final Set<String> preBootstrapLb = ConcurrentHashMap.newKeySet();       // payload classes present before normal on-load caller rewriting
+    static final Set<String> preBootstrapPayload = ConcurrentHashMap.newKeySet();       // payload classes present before normal on-load caller rewriting
     static Set<String> GENUINE_IFACES = java.util.Collections.emptySet();          // interfaces a real (non-mixin) bundle class implements; ∩ GIFACE -> shared duck interfaces
     /** per-target conversion: target' bytes + sidecar/state (defined LAZILY in the CFT with the target's real PD). */
     static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; volatile boolean defined;
@@ -52,10 +52,10 @@ public class FullInjectAgent {
         RetransformConverter.CLASS_BYTES = PLATFORM::originalBytes;
         InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
         File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
-        Path lbBundle = PLATFORM.stageBundle(inst, self);
+        Path payloadBundle = PLATFORM.stageBundle(inst, self);
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
-        RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle, cfg.callerRewritePackages);
-        GENUINE_IFACES = scanGenuineImplementors(lbBundle, cfg.callerRewritePackages);
+        RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(payloadBundle, cfg.callerRewritePackages);
+        GENUINE_IFACES = scanGenuineImplementors(payloadBundle, cfg.callerRewritePackages);
         // Also caller-rewrite the applied dependency (fabric-api) runtime: its own classes cast MC objects to duck
         // interfaces its mixins add. Match by prefix (they are not in the payload jar). Only when dep-mixins are applied.
         Set<String> crPrefixes = new HashSet<>(cfg.callerRewritePackages);
@@ -65,7 +65,7 @@ public class FullInjectAgent {
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
-        if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, lbBundle);   // so the mod's self-metadata lookups resolve
+        if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, payloadBundle);   // so the mod's self-metadata lookups resolve
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
             +(cfg.hasEventBootstrap()?" eventBootstrap="+cfg.evtStart+(cfg.hasReadinessProbe()?" (async)":" (sync)"):""));
@@ -274,13 +274,13 @@ public class FullInjectAgent {
             else InjectionLogger.warn("keybinding registry class not modifiable; late keybinds may fail");
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 
-        preflightLbClasses(lbBundle,awRes,gadded,gfield,ifaceMap);
+        preflightLbClasses(payloadBundle,awRes,gadded,gfield,ifaceMap);
         if(LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();
             throw new IllegalStateException("Late-attach preflight failed before target retransformation; see report");
         }
 
-        for(Class<?> c:inst.getAllLoadedClasses())if(RetransformConverter.PAYLOAD_CLASSES.contains(c.getName().replace('.','/')))preBootstrapLb.add(c.getName());
+        for(Class<?> c:inst.getAllLoadedClasses())if(RetransformConverter.PAYLOAD_CLASSES.contains(c.getName().replace('.','/')))preBootstrapPayload.add(c.getName());
         if(cfg.joinGateScreen!=null) mcgraft.rt.JoinGate.block();
 
         // Bootstrap the payload on the Minecraft thread while target hooks are still INACTIVE. A payload whose init is
@@ -450,7 +450,7 @@ public class FullInjectAgent {
         InjectionLogger.info("retransformed "+rt+"/"+targets.size()+" already-loaded targets on MC main thread ("
             +dt+"ms total; rebase "+(tRebase/1_000_000)+"ms/"+nRebase+" classes, verify "+(tVerify/1_000_000)+"ms)");
         List<Class<?>> callers=new ArrayList<>();
-        for (Class<?> c : inst.getAllLoadedClasses()) if (preBootstrapLb.contains(c.getName())&&inst.isModifiableClass(c)) callers.add(c);
+        for (Class<?> c : inst.getAllLoadedClasses()) if (preBootstrapPayload.contains(c.getName())&&inst.isModifiableClass(c)) callers.add(c);
         batchRetransform(inst, callers, "caller");
         LateAttachVerifier.writeReport();
         // Only a FATAL error aborts here; tolerable per-target/caller residue must not force the join gate closed.

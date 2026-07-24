@@ -13,7 +13,7 @@ import mcgraft.rt.InjectionLogger;
  *  runtime helpers (mcgraft.rt.*) resolve on Knot via parent delegation — a single mcgraft.rt.Platform identity for agent + the payload.
  *
  *  X-acquisition workaround (proven by the probe): a post-boot Mixins.addConfiguration is only applied by a direct
- *  transformClassBytes when (1) the the payload configs are downgraded to required:false (else MixinTargetAlreadyLoadedException
+ *  transformClassBytes when (1) the payload configs are downgraded to required:false (else MixinTargetAlreadyLoadedException
  *  on already-loaded targets) and (2) MixinProcessor.transformedCount is reset to 0 before the transform (forces
  *  checkSelect -> select -> prepareConfigs to promote the pending config). Both are asserted; a Mixin version drift
  *  fails loud. */
@@ -33,7 +33,7 @@ final class FabricPlatform implements LoaderPlatform {
     private Object aw;                      // vspike.AccessWidener (parsed as DATA for INACC/Resolver)
     private File agentJar;
     private final Map<String,byte[]> baseline = new HashMap<>();   // internal -> X_others (all mods except LB) = loaded schema
-    private boolean lbActivated;                                   // has the transformedCount reset selected the payload's configig yet
+    private boolean payloadActivated;                                   // has the transformedCount reset selected the payload's config yet
 
     // ---- §1a: KnotClassLoader ---------------------------------------------------------------------------------------
     public ClassLoader targetLoader(){ try {
@@ -62,15 +62,15 @@ final class FabricPlatform implements LoaderPlatform {
         Set<String> onCp = new HashSet<>();
         for (String p : System.getProperty("java.class.path","").split(File.pathSeparator)) { String b = new File(p).getName().toLowerCase(); if(!b.isEmpty()) onCp.add(b); }
         Path tmp = Files.createTempDirectory("mcgraft-fabric-"); tmp.toFile().deleteOnExit();
-        Path lbBundle = null; int pushed = 0, skipped = 0;
+        Path payloadBundle = null; int pushed = 0, skipped = 0;
         try (JarFile jf = new JarFile(agentJar)) { for (var en = jf.entries(); en.hasMoreElements();) { JarEntry e = en.nextElement(); String n = e.getName();
             if (!n.startsWith("agent-libs/") || !n.endsWith(".jar")) continue;
             String base = new File(n).getName();
-            boolean isLb = base.equals("payload.jar");
-            if (!isLb && (onCp.contains(base.toLowerCase()) || isLoaderProvided(base))) { skipped++; continue; }   // fabric-api/kotlin/asm/mixin/... already present
+            boolean isPayload = base.equals("payload.jar");
+            if (!isPayload && (onCp.contains(base.toLowerCase()) || isLoaderProvided(base))) { skipped++; continue; }   // fabric-api/kotlin/asm/mixin/... already present
             Path o = tmp.resolve(base);
             try (InputStream in = jf.getInputStream(e)) { Files.copy(in, o, StandardCopyOption.REPLACE_EXISTING); } o.toFile().deleteOnExit();
-            if (isLb) { lbBundle = o; addToClassPath(o, payloadPrefixes(o).toArray(new String[0])); }
+            if (isPayload) { payloadBundle = o; addToClassPath(o, payloadPrefixes(o).toArray(new String[0])); }
             else addToClassPath(o);
             pushed++;
             // Stage this jar's bundled (jar-in-jar) dependencies too — the Fabric loader would; late-attach must.
@@ -80,9 +80,9 @@ final class FabricPlatform implements LoaderPlatform {
                 addToClassPath(nested); pushed++;
             }
         } }
-        if (lbBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
+        if (payloadBundle == null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         InjectionLogger.info("staged onto Knot: pushed "+pushed+" jar(s), skipped "+skipped+" already-present; Knot="+knot);
-        return lbBundle;
+        return payloadBundle;
     }
     /** Hard identity-split hazards Fabric provides itself — never push these to Knot even if not on the -cp scan. */
     private static boolean isLoaderProvided(String base){ String b=base.toLowerCase();
@@ -221,7 +221,7 @@ final class FabricPlatform implements LoaderPlatform {
 
     // ---- §1c: baselines (X_others) captured while the payload is UNVISITED, then the payload activated -------------------------------
     public void prepareBaselines(java.util.List<String> internalTargets) throws Exception {
-        if (lbActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
+        if (payloadActivated) throw new IllegalStateException("prepareBaselines after payload already activated");
         // On an IDLE Knot client (bare Fabric: nothing transformed since boot) processor.transformedCount is 0, so the
         // first baseline transform would trip Mixin's checkSelect (unvisited>0 && transformedCount==0) and PROMOTE our
         // still-pending payload config mid-baseline — contaminating X_others with the payload and erasing its delta in
@@ -250,7 +250,7 @@ final class FabricPlatform implements LoaderPlatform {
             }
             baseline.put(internal, xOthers == null ? pre : xOthers); n++;
         }
-        InjectionLogger.info("captured "+n+" non-LB mod baselines (X_others)");
+        InjectionLogger.info("captured "+n+" non-payload mod baselines (X_others)");
     }
 
     // ---- §1c: X for an already-loaded target = X_all (X_others + LB) after forcing the payload's config to select --------------
@@ -259,7 +259,7 @@ final class FabricPlatform implements LoaderPlatform {
         byte[] in = getPreMixinClassBytes(internal);
         if (in == null) in = originalO;                                            // fall back to the raw baseline
         fTransformedCount.setInt(processor, 0);                                    // probe workaround #2: promote the payload's pending config
-        lbActivated = true;
+        payloadActivated = true;
         byte[] X = driveTransform(dotted, in);
         if (X == null) return null;
         byte[] base = originalO != null ? originalO : baseline.get(internal);      // X_others baseline
@@ -283,7 +283,7 @@ final class FabricPlatform implements LoaderPlatform {
 
     /** MixinExtras (and other injectors) name their synthetic bridges `...$<methods.size()>`; that counter is a global
      *  post-pass over the fully-assembled class, so the payload's added methods shift EVERY other mod's bridge suffix between the
-     *  no-LB baseline (X_others) and the with-LB output (X_all). Re-map X_all's non-LB counter-suffixed synthetics back
+     *  no-payload baseline (X_others) and the with-LB output (X_all). Re-map X_all's non-payload counter-suffixed synthetics back
      *  to the baseline's names (matched by name-without-trailing-$digits + descriptor) so the converter's O-vs-X diff
      *  isolates only the payload's real additions. the payload's own synthetics keep their (unmatched) names and go to the sidecar. */
     static byte[] alignSynthetics(byte[] xOthers, byte[] xAll) {
@@ -343,7 +343,7 @@ final class FabricPlatform implements LoaderPlatform {
         InjectionLogger.error("DEFINE-FAIL "+dotted+" -> "+c.getClass().getSimpleName()+": "+c.getMessage());
         return false; } }
 
-    // ---- §1b: schema baseline O. For a mixin target = X_others (loaded schema: all non-LB mods). For everything else
+    // ---- §1b: schema baseline O. For a mixin target = X_others (loaded schema: all non-payload mods). For everything else
     //           (hierarchy metadata over arbitrary classes) = raw Knot bytes (no the payload mixin targets them, so X_others==raw). -
     public byte[] originalBytes(String internalName){ byte[] b = baseline.get(internalName); return b != null ? b : getRawClassBytes(internalName); }
 
