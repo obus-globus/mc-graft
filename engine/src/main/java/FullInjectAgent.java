@@ -50,8 +50,8 @@ public class FullInjectAgent {
         InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
         File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         Path lbBundle = PLATFORM.stageBundle(inst, self);
-        RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle);
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
+        RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle, cfg.callerRewritePackages);
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
@@ -298,14 +298,28 @@ public class FullInjectAgent {
     static String simpleName(String fqcn) { int i = fqcn.lastIndexOf('.'); return i < 0 ? fqcn : fqcn.substring(i + 1); }
 
     /** Internal names of every class in the staged payload jar; used to tell a payload-defined duck interface from a
-     *  pre-existing/vanilla interface a mixin also implements. */
-    static Set<String> readPayloadClasses(Path payloadJar) {
+     *  pre-existing/vanilla interface a mixin also implements, and as the caller-rewrite set. When callerRewritePackages
+     *  is set (bundled library mods whose own runtime casts to their mixins' dropped duck interfaces, e.g. xaerolib),
+     *  the payload's jar-in-jar module classes under those internal-name prefixes are included so those callers are
+     *  rewritten too — bundled libraries are effectively part of the payload. */
+    static Set<String> readPayloadClasses(Path payloadJar, List<String> callerRewritePackages) {
         Set<String> names = new HashSet<>();
         try (JarFile jf = new JarFile(payloadJar.toFile())) {
             for (var en = jf.entries(); en.hasMoreElements();) { String n = en.nextElement().getName();
-                if (n.endsWith(".class")) names.add(n.substring(0, n.length() - 6)); }
+                if (n.endsWith(".class")) names.add(n.substring(0, n.length() - 6));
+                else if (!callerRewritePackages.isEmpty() && n.startsWith("META-INF/jars/") && n.endsWith(".jar")) {
+                    try (var in = jf.getInputStream(jf.getJarEntry(n)); var jin = new java.util.jar.JarInputStream(in)) {
+                        for (java.util.jar.JarEntry e; (e = jin.getNextJarEntry()) != null; ) { String cn = e.getName();
+                            if (!cn.endsWith(".class")) continue;
+                            String internal = cn.substring(0, cn.length() - 6);
+                            for (String pre : callerRewritePackages) if (internal.startsWith(pre)) { names.add(internal); break; }
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            }
         } catch (Throwable t) { InjectionLogger.warn("could not read payload class names: " + rootMsg(t)); }
-        InjectionLogger.info("payload classes indexed: " + names.size());
+        InjectionLogger.info("payload classes indexed: " + names.size()
+            + (callerRewritePackages.isEmpty() ? "" : " (incl. bundled-library classes under " + callerRewritePackages + ")"));
         return names;
     }
 

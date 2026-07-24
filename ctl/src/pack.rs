@@ -121,6 +121,13 @@ fn graft_properties<F: FnMut(&str)>(
     s.push_str(&format!("payload.mixins={}\n", info.mixins.join(",")));
     if !dep_configs.is_empty() {
         s.push_str(&format!("payload.mixins.deps={}\n", dep_configs.join(",")));
+        // Bundled library mods (jar-in-jar, e.g. xaerolib) whose mixins we just applied also have their OWN runtime
+        // cast to the duck interfaces those mixins add; caller-rewrite those library classes too.
+        let roots = jij_package_roots(payload);
+        if !roots.is_empty() {
+            s.push_str(&format!("payload.callerRewrite.packages={}\n", roots.join(",")));
+            log(&format!("  bundled-library caller-rewrite packages: {roots:?}"));
+        }
     }
     s.push_str(&format!("payload.entrypoints.main={}\n", main_eps.join(",")));
     s.push_str(&format!("payload.entrypoints.client={}\n", client_eps.join(",")));
@@ -233,6 +240,28 @@ fn config_included(name: &str, filter: &[String]) -> bool {
         let lower = name.to_ascii_lowercase();
         filter.iter().any(|t| lower.contains(&t.to_ascii_lowercase()))
     }
+}
+
+/// Distinct 2-segment package prefixes (internal names, e.g. "xaero/lib") of the classes in the payload's bundled
+/// jar-in-jar library mods. Used to caller-rewrite those library classes (they cast to their own mixins' duck interfaces).
+fn jij_package_roots(payload: &Path) -> Vec<String> {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    let Ok(bytes) = std::fs::read(payload) else { return Vec::new() };
+    for jar in jij_jars(&bytes) {
+        let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(jar)) else { continue };
+        for i in 0..zip.len() {
+            let Ok(e) = zip.by_index(i) else { continue };
+            let name = e.name();
+            if !name.ends_with(".class") {
+                continue;
+            }
+            let parts: Vec<&str> = name.splitn(3, '/').collect();
+            if parts.len() >= 3 {
+                roots.insert(format!("{}/{}", parts[0], parts[1]));
+            }
+        }
+    }
+    roots.into_iter().collect()
 }
 
 /// Return the raw bytes of every `META-INF/jars/*.jar` bundled in `jar_bytes` (one level).

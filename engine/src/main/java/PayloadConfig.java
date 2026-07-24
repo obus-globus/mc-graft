@@ -46,6 +46,9 @@ public final class PayloadConfig {
     // from the payload jar. Used to scope the caller-rewrite preflight + the already-loaded-payload snapshot so the
     // engine makes no assumption about any one mod's package. Empty -> the engine falls back to the payload class set.
     public final List<String> payloadPackages;
+    // Internal-name prefixes of bundled library mods (e.g. xaero/lib) whose OWN runtime casts to duck interfaces their
+    // mixins add to MC classes; those library classes must be caller-rewritten too (payload.callerRewrite.packages).
+    public final List<String> callerRewritePackages;
     // a system property the payload reads to locate its data/game directory (e.g. a mod that reads "vspike.gameDir").
     // null -> the injector does not set any such property. (bootstrap.gameDirProperty=...)
     public final String gameDirProperty;
@@ -88,6 +91,7 @@ public final class PayloadConfig {
         reloadResources = Boolean.parseBoolean(p.getProperty("bootstrap.reloadResources", "false").trim());
         thawRegistries = csv(p.getProperty("bootstrap.thawRegistries", ""));
         payloadPackages = csv(p.getProperty("payload.packages", ""));
+        callerRewritePackages = csv(p.getProperty("payload.callerRewrite.packages", ""));
         gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
         registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());

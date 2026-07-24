@@ -112,3 +112,26 @@ on join: `xaero.common.events.CommonEvents.onPlayerWorldJoin` reads a null `serv
 session object). Xaero's server bootstrap that creates `serverData` depends on further fabric-api server
 integration that did not fire under late-attach. Not fixed. (Multiplayer — client-only half + the codec
 bridge — is untested here; no external 26.2 server available in the harness.)
+
+### Xaero in-world: peeled to the fundamental descriptor blocker
+Continuing past the codec bridge (which gets the client to log into a world), the singleplayer blockers
+peeled one layer at a time, each fix working:
+- serverData null -> fabric-api ServerLifecycleEvents.SERVER_STARTED never fired -> applied fabric-api's
+  lifecycle mixin (applyDependencyMixins=lifecycle); the event then fires and Xaero's serverStarting runs.
+- "Registry is not frozen yet" -> xaerolib's OWN mixin MixinMinecraftClientFabric (which drives its deferred
+  loadCommonLater/freeze) was never applied -> applied xaerolib's mixin configs (applyDependencyMixins=xaerolib).
+- ClassCastException ServerPlayer -> IServerPlayer -> xaerolib's runtime (ServerPlayerData) casts to a duck
+  interface its mixin adds, and only the payload's classes were caller-rewritten -> added
+  payload.callerRewrite.packages (caller-rewrite bundled-library classes, e.g. xaero/lib), which the packer
+  auto-emits when a bundled library's mixins are applied.
+- Then: DROPPED_INTERFACE_DESCRIPTOR on xaero/common/graphics/CustomRenderTypes — its methods take
+  xaero/lib/client/graphics/ITextureBinding (a duck interface xaerolib's render mixin adds to an MC class) as a
+  PARAMETER. Dropping that interface puts it in a method signature -> descriptor erasure -> schema change. This
+  is the SAME fundamental limitation documented for Meteor above (duck interfaces in method signatures are
+  inherently incompatible with the retransform model). Not a peelable layer — the architectural ceiling.
+
+So Xaero's Minimap under late-attach: the CLIENT fully initialises and (with bridgePayloadCodecs) connects to a
+world; full singleplayer in-world rendering is blocked by xaerolib's render-layer duck-interface-in-signature
+use, which is the Meteor-class limit. New generic, opt-in machinery landed along the way (bridgePayloadCodecs,
+applyDependencyMixins, payload.callerRewrite.packages) that helps fabric-api/bundled-library mods that do NOT
+hit the descriptor blocker.
