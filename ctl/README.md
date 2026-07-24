@@ -62,6 +62,23 @@ The result is byte-for-byte structurally identical to the Gradle-built agent (sa
 manifest, and bundled deps). The base jar is looked up under `<repo>/build/agent/`, next to the `mcgraft` executable,
 or `~/.config/mcgraft/`, so a standalone install (binary + base jar, no JDK, no repo) can build agents out of the box.
 
+## Payload patches (`pack --patch`)
+
+`pack` can apply user patches to the payload jar *before* packing — repeatable `--patch <path>`, applied in order
+(the GUI's *Quick pack* mode has an equivalent "Patches" list):
+
+```
+mcgraft pack -p yourmod.jar --patch tweaks.mcpatch --patch overlay.zip -o agent.jar
+```
+
+Each `--patch` is a `.mcpatch` bundle (a directory or zip with a `manifest.toml`) or a bare `.jar`/`.zip` overlay. v1
+(JDK-free) supports **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** (RFC-7396
+JSON merge, e.g. editing `fabric.mod.json`). Patches apply before mod-info derivation, so a merge on `fabric.mod.json`
+correctly changes the derived id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on
+`sha256` mismatch (override with `--no-verify-base`). See [`../docs/patches.md`](../docs/patches.md) for the full format
+and the deferred phase-2 features (bytecode `[[patch]]` via Krakatau, `new/` assembled classes, RFC-6902 `jsonpatch`).
+Example bundle: [`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
+
 ## How attach works
 
 `inject` resolves the target's attach socket (`/tmp/.java_pid<pid>`), creating the trigger file and sending SIGQUIT if

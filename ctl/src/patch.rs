@@ -532,4 +532,74 @@ mod tests {
         assert!(claim(&mut w, "x", "p2", OnConflict::Error, &mut log).is_err());
         assert!(claim(&mut w, "x", "p3", OnConflict::PatchWins, &mut log).is_ok());
     }
+
+    // Exercises the full apply_one pipeline over an in-memory zip bundle (the .mcpatch-zip path) — manifest parse,
+    // base guard, delete, overlay, and JSON merge — without touching the filesystem.
+    #[test]
+    fn zip_bundle_pipeline() {
+        let base = jar_with(&[
+            ("fabric.mod.json", br#"{"id":"demo","depends":{"minecraft":"*"}}"#),
+            ("keep.txt", b"k"),
+            ("gone.txt", b"g"),
+        ]);
+        let base_sha = hex(&Sha256::digest(&base));
+        let opts = Options { no_verify_base: false };
+        let mut log = |_: &str| {};
+
+        let mut z: HashMap<String, Vec<u8>> = HashMap::new();
+        z.insert(
+            "manifest.toml".into(),
+            b"[bundle]\nformat = 1\n[target]\nmod = \"demo\"\n[[delete]]\npath = \"gone.txt\"\n[[merge]]\npath = \"fabric.mod.json\"\nfile = \"m.json\"\n".to_vec(),
+        );
+        z.insert("overlay/new.txt".into(), b"N".to_vec());
+        z.insert("m.json".into(), br#"{"depends":{"fabric-api":"*"}}"#.to_vec());
+
+        let mut jar = Jar::read(&base).unwrap();
+        let mut written = HashMap::new();
+        apply_one(&mut jar, &Source::Zip(z), "b.mcpatch", &base_sha, Some("demo"), &opts, &mut written, &mut log).unwrap();
+
+        assert!(jar.file("gone.txt").is_none(), "delete");
+        assert_eq!(jar.file("new.txt"), Some(&b"N"[..]), "overlay add");
+        assert_eq!(jar.file("keep.txt"), Some(&b"k"[..]), "untouched");
+        let fmj: Value = serde_json::from_slice(jar.file("fabric.mod.json").unwrap()).unwrap();
+        assert_eq!(fmj["depends"]["fabric-api"], "*", "merge added");
+        assert_eq!(fmj["depends"]["minecraft"], "*", "merge preserved");
+    }
+
+    #[test]
+    fn bare_overlay_zip() {
+        let base = jar_with(&[("a.txt", b"old"), ("b.txt", b"b")]);
+        let base_sha = hex(&Sha256::digest(&base));
+        let opts = Options { no_verify_base: false };
+        let mut log = |_: &str| {};
+        let mut z: HashMap<String, Vec<u8>> = HashMap::new(); // no manifest -> bare overlay: every entry overlaid
+        z.insert("a.txt".into(), b"new".to_vec());
+        z.insert("c.txt".into(), b"c".to_vec());
+        let mut jar = Jar::read(&base).unwrap();
+        let mut written = HashMap::new();
+        apply_one(&mut jar, &Source::Zip(z), "bare.zip", &base_sha, None, &opts, &mut written, &mut log).unwrap();
+        assert_eq!(jar.file("a.txt"), Some(&b"new"[..]), "overlay replace");
+        assert_eq!(jar.file("c.txt"), Some(&b"c"[..]), "overlay add");
+        assert_eq!(jar.file("b.txt"), Some(&b"b"[..]), "untouched");
+    }
+
+    #[test]
+    fn rejects_deferred_bytecode_and_bad_sha() {
+        let base = jar_with(&[("fabric.mod.json", br#"{"id":"demo"}"#)]);
+        let base_sha = hex(&Sha256::digest(&base));
+        let opts = Options { no_verify_base: false };
+        let mut log = |_: &str| {};
+        // [[patch]] bytecode section is rejected (deferred phase 2)
+        let mut z: HashMap<String, Vec<u8>> = HashMap::new();
+        z.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[[patch]]\nclass=\"x\"\nformat=\"krakatau-diff\"\nfile=\"x\"\n".to_vec());
+        let mut jar = Jar::read(&base).unwrap();
+        assert!(apply_one(&mut jar, &Source::Zip(z.clone()), "p", &base_sha, None, &opts, &mut HashMap::new(), &mut log).is_err());
+        // sha256 base guard mismatch hard-fails
+        let mut z2: HashMap<String, Vec<u8>> = HashMap::new();
+        z2.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[target]\nsha256=\"deadbeef\"\n".to_vec());
+        assert!(apply_one(&mut jar, &Source::Zip(z2.clone()), "p", &base_sha, None, &opts, &mut HashMap::new(), &mut log).is_err());
+        // ...but --no-verify-base overrides it
+        let opts_off = Options { no_verify_base: true };
+        assert!(apply_one(&mut jar, &Source::Zip(z2), "p", &base_sha, None, &opts_off, &mut HashMap::new(), &mut log).is_ok());
+    }
 }
