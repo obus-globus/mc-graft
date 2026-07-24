@@ -27,7 +27,9 @@ public class FullInjectAgent {
     static Set<String> GENUINE_IFACES = java.util.Collections.emptySet();          // interfaces a real (non-mixin) bundle class implements; ∩ GIFACE -> shared duck interfaces
     /** per-target conversion: target' bytes + sidecar/state (defined LAZILY in the CFT with the target's real PD). */
     static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; volatile boolean defined;
+        boolean whole;   // future-loaded target defined WHOLE (added members kept on the class); no sidecar/state to define
         boolean define(ProtectionDomain pd){ synchronized(this){ if(defined) return true;
+            if(whole){ defined=true; return true; }   // the whole class carries its own added members; nothing external to define
             boolean ok = defineSynthetics(target, pd) & defineSynthetics(sidecar, pd)
                        & FullInjectAgent.define(stateName.replace('/','.'), state, pd)
                        & FullInjectAgent.define(sidecarName.replace('/','.'), sidecar, pd);
@@ -99,12 +101,36 @@ public class FullInjectAgent {
         RetransformConverter.SHARED_IFACES = shared;
         if (!shared.isEmpty()) InjectionLogger.info("shared duck interfaces (phantom, guarded dispatch): " + shared);
         InjectionLogger.info("phase A: "+txMap.size()+" transformed; global added-methods="+gadded.size()+" added-fields="+gfield.size());
+        // A FUTURE-loaded target (not loaded at attach) has no schema constraint at define time, so it can be defined
+        // WHOLE — the mixin-added members kept on the class — letting a mod reflectively read its own added field
+        // (LevelChunk.getDeclaredField("xaero_chunkClean")). Eligible: not preloaded AND adds no interface (an added
+        // interface stays dropped so a value of it dispatches uniformly; the guarded DuckDispatch still resolves a whole
+        // target that genuinely implements a shared one). Their added methods/fields are self-referenced (handlers called
+        // by the target's own woven methods; the field read natively), so remove them from the global caller-rewrite
+        // tables — callers then access them natively on the whole class instead of routing to a (nonexistent) sidecar.
+        Set<String> wholeTargets = new HashSet<>();
+        for (String t : targets) {
+            if (preLoaded.contains(t)) continue;
+            boolean addsIface = false; for (var e : giface.values()) for (String[] v : e) if (v[0].equals(t)) addsIface = true;
+            if (addsIface) continue;
+            boolean adds = false; for (String[] v : gadded.values()) if (v[0].equals(t)) { adds = true; break; }
+            if (!adds) for (String[] v : gfield.values()) if (v[0].equals(t)) { adds = true; break; }
+            if (adds) wholeTargets.add(t);
+        }
+        if (!wholeTargets.isEmpty()) {
+            gadded.values().removeIf(v -> wholeTargets.contains(v[0]));
+            gfield.values().removeIf(v -> wholeTargets.contains(v[0]));
+            InjectionLogger.info("future-loaded targets defined WHOLE (added members kept on the class): " + wholeTargets);
+        }
         // Phase B: stage every conversion against the complete global tables.
         int conv=0, eager=0; List<String> skipped=new ArrayList<>();
         LinkedHashMap<String,Conv> pendingConv=new LinkedHashMap<>();
         Map<String,List<String[]>> pendingIfaces=new HashMap<>();
         for (var e : txMap.entrySet()) { String internal = e.getKey(); try {
             byte[] O = e.getValue()[0], X = e.getValue()[1];
+            if (wholeTargets.contains(internal)) {   // define the full mixin output at (future) load time — no sidecar/state
+                Conv cw = new Conv(); cw.whole = true; cw.target = X; pendingConv.put(internal, cw); conv++; continue;
+            }
             RetransformConverter c = new RetransformConverter(internal); RetransformConverter.Result res = c.run(O, X);
             Conv cv = new Conv(); cv.target=res.target; cv.sidecar=res.sidecar; cv.state=c.stateBytes(); cv.sidecarName=res.sidecarName; cv.stateName=c.stateName();
             if (!LateAttachVerifier.verifyConversion(internal, O, cv.target, cv.sidecar, cv.state, gadded, gfield, giface)) {
@@ -149,6 +175,16 @@ public class FullInjectAgent {
             try {
                 boolean connect = n.equals(JoinGateRewriter.CONNECT_SCREEN);
                 Conv cv = convMap.get(n);
+                if (cv!=null && cv.whole) {
+                    // Whole future-loaded target: define the full mixin output, with its references to OTHER (dropped)
+                    // targets caller-rewritten. If it somehow already loaded (c!=null), a schema-adding redefine is
+                    // illegal — let the JVM keep the pristine class (that mod hook is inert this session).
+                    if (c != null) { InjectionLogger.warn("whole target "+n+" was already loaded; cannot add its mixin members via retransform (inert this session)"); return null; }
+                    byte[] t = ifaceMap.isEmpty() ? cv.target : RetransformConverter.rewriteCaller(cv.target, ifaceMap);
+                    if(connect) t = JoinGateRewriter.rewrite(n, t);
+                    byte[] w = awApply(n, t); if (w != null) t = w;
+                    return t;
+                }
                 if (cv!=null) {
                     byte[] t;
                     if (c==null) t = cv.target;
