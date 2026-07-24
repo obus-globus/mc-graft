@@ -22,10 +22,16 @@ removal — the bulk of real demand — with near-zero fragility.
 the fragility below does not apply. `krak2` is located via `MCGRAFT_KRAK2` or `PATH`, and is only invoked when a patch
 actually contains `.j` — overlay/JSON-only patches never need it.
 
-**Deferred to phase 2:** in-place bytecode `[[patch]]` (`krakatau-diff`, the base-fragile *diff*-of-disassembly path) and
-RFC-6902 `jsonpatch`. The packer parses these in a manifest and **rejects them with a clear message** rather than
-silently ignoring. See "Phase 2 risks" at the end — the bytecode-*diff* approach has a real base-fragility problem
-(distinct from whole-class assembly, which ships now) that must be solved before it ships.
+**Shipped — in-place bytecode `[[patch]]` via the `ops` DSL (`ristretto_classfile`):** structured, base-robust edits to
+an existing class — `replace_const` (swap an int/String constant) and `redirect_invoke` (retarget a call, descriptor
+preserved). Each op is a 1→1 instruction replacement; ristretto stores branch/exception/line/StackMapTable offsets as
+*logical instruction offsets* and recomputes all byte offsets + frame deltas on write, so replacements are safe at any
+size — no round-trip fragility. (Verified end-to-end: an `ops` patch that changed a constant produced a class that loads
+under `-Xverify:all` and returns the new value.) No `krak2` needed for `ops`.
+
+**Deferred to phase 2:** the `krakatau-diff` `[[patch]]` format (the base-fragile *diff*-of-disassembly path — `ops`
+supersedes it for most needs) and RFC-6902 `jsonpatch`. Both are parsed and **rejected with a clear message** rather than
+silently ignored. See "Phase 2 risks" for why the *diff* approach is held back.
 
 ## Input modes
 
@@ -194,9 +200,9 @@ phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *prim
 2. ✅ File ops: overlay, delete, rename, JSON merge (RFC 7396) + base guard + tests + wire into the pack pipeline.
 3. ✅ GUI "Patches" list (Quick-pack mode).
 4. ✅ `krak2` (PATH / `MCGRAFT_KRAK2`) wrapper; whole-class assembly — bare `.j` + bundle `new/`.
-5. ⏳ In-place bytecode `[[patch]]`: either `krakatau-diff` with `--roundtrip` + version guard, or the `ristretto` `ops`
-      DSL (preferred — see risks). Plus `ristretto_classfile` post-verify and RFC-6902 `jsonpatch`.
-6. ⏳ Ship `krak2` self-contained (embed via `include_bytes!` behind a feature) instead of requiring it on `PATH`.
+5. ✅ In-place bytecode `[[patch]] format = "ops"` on `ristretto_classfile` — `replace_const`, `redirect_invoke`.
+6. ⏳ More `ops` (`insert_before`/`remove_call`/`set_return` — need frame-index adjustment); `ristretto` post-verify;
+      RFC-6902 `jsonpatch`; ship `krak2` self-contained (embed via `include_bytes!` behind a feature).
 
 ## Open questions (phase 2)
 

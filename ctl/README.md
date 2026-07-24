@@ -79,12 +79,15 @@ bare Krakatau `.j` file. Supported (all JDK-free):
 - **Whole-class Krakatau assembly** — a bare `.j` file, or a bundle `new/` directory of `.j` files, assembled and
   added/replaced by declared class name. Needs the `krak2` binary on `PATH` or via `MCGRAFT_KRAK2` (only when a patch
   actually contains `.j`).
+- **In-place bytecode `[[patch]] format = "ops"`** — structured edits to an existing class via `ristretto_classfile`:
+  `replace_const` (swap an int/String constant) and `redirect_invoke` (retarget a call). Base-robust (1→1 instruction
+  replacement; offsets + stack-map frames recomputed on write), no `krak2` needed.
 
 Patches apply before mod-info derivation, so a merge on `fabric.mod.json` correctly changes the derived
 id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on `sha256` mismatch (override
-with `--no-verify-base`). Deferred to phase 2: in-place bytecode `[[patch]]` (Krakatau *diff*) and RFC-6902 `jsonpatch`
-(both rejected with a message for now). See [`../docs/patches.md`](../docs/patches.md) for the full format; example
-bundle at [`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
+with `--no-verify-base`). Deferred to phase 2: the `krakatau-diff` `[[patch]]` format and RFC-6902 `jsonpatch` (both
+rejected with a message for now). See [`../docs/patches.md`](../docs/patches.md) for the full format; example bundle at
+[`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
 
 ## How attach works
 

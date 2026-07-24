@@ -33,3 +33,4 @@ ureq = { version = "2", features = ["tls"] }
 cafebabe = "0.8"
 toml = "0.8"
 sha2 = "0.10"
+ristretto_classfile = "0.30.0"

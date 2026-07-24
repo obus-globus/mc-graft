@@ -21,3 +21,17 @@ path = "assets/demo/stale.txt"
 path = "fabric.mod.json"       # RFC-7396 merge: add a dependency + a client entrypoint; null values delete keys
 file = "meta/fabric.mod.merge.json"
 kind = "merge"
+
+# In-place bytecode edits to an existing class (ristretto ops; no krak2 needed):
+[[patch]]
+class  = "com/demo/HudRenderer"
+format = "ops"
+  [[patch.op]]
+  action = "replace_const"      # bump a hardcoded range 64 -> 256 in one method
+  in     = "getMaxRange()I"
+  from   = 64
+  to     = 256
+  [[patch.op]]
+  action = "redirect_invoke"    # retarget a call (descriptor preserved)
+  from   = "java/lang/System.currentTimeMillis()J"
+  to     = "com/demo/FakeClock.now"

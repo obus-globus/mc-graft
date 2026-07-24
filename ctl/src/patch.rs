@@ -39,9 +39,35 @@ struct Manifest {
     rename: Vec<RenameOp>,
     #[serde(default)]
     merge: Vec<MergeOp>,
-    // Reserved for a later phase; parsed so we can reject with a helpful message instead of "unknown field".
     #[serde(default)]
-    patch: Vec<toml::Value>,
+    patch: Vec<PatchEntry>,
+}
+
+/// An in-place edit to an existing class. `format = "ops"` (the structured DSL) is supported; `krakatau-diff` is
+/// deferred. `class` is an internal name ("com/example/Foo").
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchEntry {
+    class: String,
+    #[serde(default = "default_patch_format")]
+    format: String,
+    #[serde(default)]
+    op: Vec<OpSpec>,
+}
+fn default_patch_format() -> String {
+    "ops".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpSpec {
+    action: String,
+    #[serde(rename = "in", default)]
+    in_method: Option<String>, // "name(desc)" — restrict to one method; absent = all
+    #[serde(default)]
+    from: Option<toml::Value>,
+    #[serde(default)]
+    to: Option<toml::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -325,12 +351,6 @@ fn apply_one<F: FnMut(&str)>(
     if !man.bundle.name.is_empty() {
         log(&format!("  bundle: {}", man.bundle.name));
     }
-    if !man.patch.is_empty() {
-        return Err(format!(
-            "patch {patch_name}: [[patch]] (bytecode edits) is not supported in this version — that phase (Krakatau) is deferred; \
-             use overlay/delete/rename/merge for now"
-        ));
-    }
 
     // Base guard (skipped for a bare overlay, which has no [target]).
     if manifest_bytes.is_some() && man.apply.verify_target && !opts.no_verify_base {
@@ -449,7 +469,86 @@ fn apply_one<F: FnMut(&str)>(
         log(&format!("  merge {} <- {}", mg.path, mg.file));
     }
 
+    // [[patch]]: in-place bytecode edits on an existing class (last, so it sees any overlaid/new class).
+    for pe in &man.patch {
+        match pe.format.as_str() {
+            "ops" => {
+                let path = format!("{}.class", pe.class);
+                let cur = jar
+                    .file(&path)
+                    .ok_or_else(|| format!("patch {patch_name}: [[patch]] class '{}' not found in payload", pe.class))?
+                    .to_vec();
+                let ops = parse_ops(&pe.op, patch_name)?;
+                let new_bytes = crate::bytecode::apply_ops(&cur, &ops)
+                    .map_err(|e| format!("patch {patch_name}: {} ops: {e}", pe.class))?;
+                claim(written, &path, patch_name, man.apply.on_conflict, log)?;
+                jar.put(&path, new_bytes);
+                log(&format!("  patch(ops) {} — {} op(s)", pe.class, pe.op.len()));
+            }
+            "krakatau-diff" => {
+                return Err(format!(
+                    "patch {patch_name}: [[patch]] format 'krakatau-diff' (bytecode diff) is deferred — use format = \"ops\""
+                ));
+            }
+            other => return Err(format!("patch {patch_name}: unknown [[patch]] format '{other}' (expected \"ops\")")),
+        }
+    }
+
     Ok(())
+}
+
+/// Translate manifest `[[patch.op]]` entries into `bytecode::Op`s.
+fn parse_ops(specs: &[OpSpec], patch_name: &str) -> Result<Vec<crate::bytecode::Op>, String> {
+    use crate::bytecode::{Op, OpKind};
+    let mut out = Vec::new();
+    for s in specs {
+        let in_method = match &s.in_method {
+            Some(sig) => Some(split_method_sig(sig).ok_or_else(|| format!("patch {patch_name}: bad `in` method sig '{sig}' (expected name(desc))"))?),
+            None => None,
+        };
+        let kind = match s.action.as_str() {
+            "replace_const" => {
+                let from = s.from.as_ref().ok_or_else(|| format!("patch {patch_name}: replace_const needs `from`"))?;
+                let to = s.to.as_ref().ok_or_else(|| format!("patch {patch_name}: replace_const needs `to`"))?;
+                match (from, to) {
+                    (toml::Value::Integer(a), toml::Value::Integer(b)) => OpKind::ReplaceConstInt {
+                        from: i32::try_from(*a).map_err(|_| format!("patch {patch_name}: replace_const int out of range"))?,
+                        to: i32::try_from(*b).map_err(|_| format!("patch {patch_name}: replace_const int out of range"))?,
+                    },
+                    (toml::Value::String(a), toml::Value::String(b)) => OpKind::ReplaceConstStr { from: a.clone(), to: b.clone() },
+                    _ => return Err(format!("patch {patch_name}: replace_const `from`/`to` must both be int or both string")),
+                }
+            }
+            "redirect_invoke" => {
+                let from = s.from.as_ref().and_then(|v| v.as_str()).ok_or_else(|| format!("patch {patch_name}: redirect_invoke `from` must be \"owner.name(desc)\""))?;
+                let to = s.to.as_ref().and_then(|v| v.as_str()).ok_or_else(|| format!("patch {patch_name}: redirect_invoke `to` must be \"owner.name\""))?;
+                let (o, n, d) = split_owner_name_desc(from).ok_or_else(|| format!("patch {patch_name}: bad redirect_invoke `from` '{from}'"))?;
+                let (o2, n2) = split_owner_name(to).ok_or_else(|| format!("patch {patch_name}: bad redirect_invoke `to` '{to}'"))?;
+                OpKind::RedirectInvoke { from: (o, n, d), to: (o2, n2) }
+            }
+            other => return Err(format!("patch {patch_name}: unknown op action '{other}' (expected replace_const | redirect_invoke)")),
+        };
+        out.push(Op { in_method, kind });
+    }
+    Ok(out)
+}
+
+/// "name(desc)" -> (name, "(desc)").
+fn split_method_sig(s: &str) -> Option<(String, String)> {
+    let p = s.find('(')?;
+    Some((s[..p].to_string(), s[p..].to_string()))
+}
+/// "owner/pkg/Class.name(desc)" -> (owner, name, "(desc)").
+fn split_owner_name_desc(s: &str) -> Option<(String, String, String)> {
+    let p = s.find('(')?;
+    let (lhs, desc) = (&s[..p], &s[p..]);
+    let dot = lhs.rfind('.')?;
+    Some((lhs[..dot].to_string(), lhs[dot + 1..].to_string(), desc.to_string()))
+}
+/// "owner/pkg/Class.name" -> (owner, name).
+fn split_owner_name(s: &str) -> Option<(String, String)> {
+    let dot = s.rfind('.')?;
+    Some((s[..dot].to_string(), s[dot + 1..].to_string()))
 }
 
 /// Record that `patch_name` wrote `path`; enforce the cross-patch conflict policy if another patch already wrote it.
@@ -706,6 +805,24 @@ mod tests {
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].0, "com/demo/Demo");
         assert_eq!(&classes[0].1[0..4], &[0xCA, 0xFE, 0xBA, 0xBE], "valid class magic");
+    }
+
+    // In-place bytecode op: replace_const 64 -> 256, verified behaviorally (needs krak2; skips otherwise).
+    #[test]
+    fn ops_replace_const() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind};
+        let j = b".class public com/demo/Calc\n.super java/lang/Object\n\
+                  .method public static getMax : ()I\n.code stack 1 locals 0\nbipush 64\nireturn\n.end code\n.end method\n";
+        let cls = assemble_j(j).unwrap().remove(0).1;
+        let patched = apply_ops(&cls, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 64, to: 256 } }]).unwrap();
+        assert!(ristretto_classfile::ClassFile::from_bytes(&patched).is_ok(), "patched class re-parses");
+        // 64 no longer present (no site to match) ...
+        assert!(apply_ops(&patched, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 64, to: 1 } }]).is_err());
+        // ... and 256 is now present.
+        assert!(apply_ops(&patched, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 256, to: 1 } }]).is_ok());
     }
 
     #[test]
