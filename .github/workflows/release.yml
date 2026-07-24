@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # The precompiled base jar the JDK-free `mcgraft pack` splices payloads into.
+  base:
+    name: Build base jar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew agentBase --no-daemon --console=plain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc-graft-base
+          path: build/agent/mc-graft-base.jar
+          if-no-files-found: error
+
+  # The control app (CLI + GUI), statically-ish linked Linux x86_64 binary.
+  binary:
+    name: Build mcgraft (Linux x86_64)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ctl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ctl
+      - run: cargo build --release
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp target/release/mcgraft dist/mcgraft-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcgraft-linux-x86_64
+          path: ctl/dist/mcgraft-linux-x86_64
+          if-no-files-found: error
+
+  # Attach both artifacts to the GitHub release for the pushed tag.
+  release:
+    name: Publish release
+    needs: [base, binary]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/mc-graft-base/mc-graft-base.jar
+            artifacts/mcgraft-linux-x86_64/mcgraft-linux-x86_64
+          generate_release_notes: true

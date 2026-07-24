@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the payload-independent agent base (engine + mixin service + ASM/Mixin). The engine compiles against only
+  # ASM + Sponge-Mixin + the JDK — no Minecraft on the classpath — so this is self-contained.
+  agent:
+    name: Agent (Gradle / Java 25)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build agent base
+        run: ./gradlew agentBase --no-daemon --console=plain
+
+      - name: Upload base jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-graft-base
+          path: build/agent/mc-graft-base.jar
+          if-no-files-found: error
+
+  # Build, lint and test the Rust control app (CLI + GUI).
+  ctl:
+    name: ctl (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ctl
+    steps:
+      - uses: actions/checkout@v4
+
+      # System libraries the GUI links: X11/Wayland/OpenGL for eframe (winit + glow) and GTK3 for rfd's file dialogs.
+      - name: Install GUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ctl
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Upload mcgraft binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcgraft-linux-x86_64
+          path: ctl/target/release/mcgraft
+          if-no-files-found: error
