@@ -27,6 +27,14 @@ enum Msg {
     InjectDone(Result<(), String>),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum BuildMode {
+    /// Drive Gradle's agentJar task (needs a JDK + the mc-graft repo checkout).
+    Gradle,
+    /// Splice the payload into the precompiled base jar in-process (no JDK, no Gradle).
+    NoJdk,
+}
+
 struct App {
     // discovery
     jvms: Vec<procs::Jvm>,
@@ -42,6 +50,8 @@ struct App {
     preset: String,
     build_preset_name: String,
     agent_name: String,
+    build_mode: BuildMode,
+    base_jar: String,
     // inject inputs
     agent_jar: String,
     game_dir: GameDir,
@@ -64,6 +74,13 @@ impl App {
         let (tx, rx) = channel();
         let repo = build::find_repo_root(None).ok();
         let presets = repo.as_ref().map(|r| config::discover_presets(r)).unwrap_or_default();
+        // Locate the precompiled base jar; if not yet built but a repo is present, pre-fill its canonical build path so
+        // the Quick-pack field guides the user to `./gradlew agentBase`.
+        let base_jar = crate::pack::find_base_jar(repo.as_deref())
+            .or_else(|| repo.as_ref().map(|r| r.join("build/agent/mc-graft-base.jar")));
+        // Default to Gradle when a repo checkout is present (fully featured); otherwise the no-JDK packer, so a standalone
+        // install (binary + base jar, no JDK/repo) can build agents out of the box.
+        let build_mode = if repo.is_some() { BuildMode::Gradle } else { BuildMode::NoJdk };
         let mut app = App {
             jvms: Vec::new(),
             selected: None,
@@ -77,6 +94,8 @@ impl App {
             preset: "None".into(),
             build_preset_name: String::new(),
             agent_name: "mc-graft-agent.jar".into(),
+            build_mode,
+            base_jar: base_jar.map(|p| p.display().to_string()).unwrap_or_default(),
             agent_jar: String::new(),
             game_dir: GameDir::ClientDir,
             custom_dir: String::new(),
@@ -170,14 +189,18 @@ impl App {
     }
 
     fn start_build(&mut self, ctx: &egui::Context) {
-        let Some(repo) = self.repo.clone() else {
-            self.log_line("[warn] no mc-graft repo root found (set it via the CLI --repo, or run from the repo)");
-            return;
-        };
         if self.payload.trim().is_empty() {
             self.log_line("[warn] pick a payload mod jar first");
             return;
         }
+        if self.build_mode == BuildMode::NoJdk {
+            self.start_pack(ctx);
+            return;
+        }
+        let Some(repo) = self.repo.clone() else {
+            self.log_line("[warn] no mc-graft repo root found (set it via the CLI --repo, or run from the repo)");
+            return;
+        };
         self.busy = true;
         self.status = "Building agent…".into();
         self.log_line("---- build ----");
@@ -210,6 +233,50 @@ impl App {
                 let _ = tx2.send(Msg::Line(l.to_string()));
                 ctx2.request_repaint();
             });
+            let _ = tx.send(Msg::BuildDone(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// JDK-free build: splice the payload into the precompiled base jar in-process (pack.rs). Needs the mod info
+    /// (already parsed for the info card) and a base jar; no Gradle, no JDK.
+    fn start_pack(&mut self, ctx: &egui::Context) {
+        let base = PathBuf::from(self.base_jar.trim());
+        if !base.is_file() {
+            self.log_line("[warn] no base jar — build it once with `./gradlew agentBase`, or point 'Base jar' at mc-graft-base.jar");
+            return;
+        }
+        let info = match &self.payload_info {
+            Some(Ok(m)) => m.clone(),
+            _ => {
+                self.log_line("[warn] payload is not a readable Fabric mod jar");
+                return;
+            }
+        };
+        let payload = PathBuf::from(self.payload.trim());
+        let out = self
+            .repo
+            .clone()
+            .map(|r| r.join("build/agent").join(&self.agent_name))
+            .unwrap_or_else(|| std::env::temp_dir().join(&self.agent_name));
+        if let Some(d) = out.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let cfg = self.cfg.clone();
+
+        self.busy = true;
+        self.status = "Packing agent (no JDK)…".into();
+        self.log_line("---- pack (no JDK) ----");
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let res = crate::pack::pack_agent(&base, &payload, &info, &cfg, &out, |l| {
+                let _ = tx2.send(Msg::Line(l.to_string()));
+                ctx2.request_repaint();
+            })
+            .map(|()| out.clone());
             let _ = tx.send(Msg::BuildDone(res));
             ctx.request_repaint();
         });
@@ -380,6 +447,21 @@ impl eframe::App for App {
                     ui.label("Agent name");
                     ui.text_edit_singleline(&mut self.agent_name);
                 });
+                // Build method: Gradle (needs a JDK + repo) or the in-process no-JDK packer (needs the base jar).
+                ui.horizontal(|ui| {
+                    ui.label("Build method");
+                    ui.radio_value(&mut self.build_mode, BuildMode::Gradle, "Gradle (JDK)")
+                        .on_hover_text("Drive Gradle's agentJar task — needs a JDK and the mc-graft repo checkout.");
+                    ui.radio_value(&mut self.build_mode, BuildMode::NoJdk, "Quick pack (no JDK)")
+                        .on_hover_text("Splice the payload into the precompiled base jar in-process — no JDK, no Gradle.");
+                });
+                if self.build_mode == BuildMode::NoJdk {
+                    path_row(ui, "Base jar", &mut self.base_jar, &["jar"]);
+                    if !PathBuf::from(self.base_jar.trim()).is_file() {
+                        ui.colored_label(egui::Color32::from_rgb(220, 170, 60),
+                            "base jar not found — build once with ./gradlew agentBase (JDK), then packing is JDK-free");
+                    }
+                }
                 // Config preset (bundled examples/* + load-from-file) — pre-fills the Advanced fields below.
                 ui.horizontal(|ui| {
                     ui.label("Config preset");

@@ -155,6 +155,29 @@ tasks.register<Jar>("agentJar") {
     doLast { logger.lifecycle("mc-graft agent -> ${archiveFile.get().asFile} (payload: ${payloadJar.name})") }
 }
 
+// Reusable, payload-INDEPENDENT agent base: engine + mixin service + ASM/Mixin, with the agent manifest — but NO
+// payload, graft.properties, or mixin-targets.txt. The `ctl` Rust packer splices a payload jar + its derived
+// graft.properties/mixin-targets + Maven deps into this to produce a full agent jar WITHOUT a JDK (build this once).
+tasks.register<Jar>("agentBase") {
+    group = "mc-graft"
+    description = "Build the payload-independent agent base (for the JDK-free ctl packer)."
+    dependsOn("mixinserviceClasses", "engineClasses")
+    archiveFileName.set("mc-graft-base.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("agent"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    val asmVer = asmVersion
+    manifest {
+        attributes("Agent-Class" to "FullInjectAgent", "Can-Retransform-Classes" to "true", "Can-Redefine-Classes" to "true")
+        attributes(mapOf("Implementation-Title" to "ASM", "Implementation-Version" to asmVer), "org/objectweb/asm/")
+    }
+    from(agentInfra.map { zipTree(it) }) {
+        exclude("META-INF/services/**", "module-info.class", "META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA", "META-INF/MANIFEST.MF")
+    }
+    from(sourceSets["mixinservice"].output)
+    from(sourceSets["engine"].output)
+    doLast { logger.lifecycle("mc-graft base -> ${archiveFile.get().asFile}") }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Read the payload's fabric.mod.json and emit graft.properties (the engine's PayloadConfig). Any optional override file
 // (an event-bootstrap / readiness probe for a mod with no entrypoint, e.g. LiquidBounce) is appended verbatim.

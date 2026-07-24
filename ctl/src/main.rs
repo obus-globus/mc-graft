@@ -8,6 +8,7 @@ mod build;
 mod config;
 mod gui;
 mod modinfo;
+mod pack;
 mod procs;
 mod store;
 
@@ -36,6 +37,8 @@ enum Cmd {
     List,
     /// Build the mc-graft agent jar for a payload mod (drives Gradle's agentJar task).
     Build(BuildCliArgs),
+    /// Assemble an agent jar WITHOUT a JDK/Gradle, splicing a payload into the precompiled base jar.
+    Pack(PackArgs),
     /// Inject the mc-graft agent into a running Minecraft JVM.
     Inject(InjectArgs),
     /// Follow an existing injection log file.
@@ -66,6 +69,25 @@ struct BuildCliArgs {
     #[arg(short, long, value_name = "NAME")]
     name: Option<String>,
     /// mc-graft repo root (default: auto-detect from cwd/exe).
+    #[arg(long, value_name = "DIR")]
+    repo: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct PackArgs {
+    /// The Fabric mod jar to pack into an agent.
+    #[arg(short, long)]
+    payload: PathBuf,
+    /// The precompiled base jar (Gradle `agentBase` output). Default: auto-detect under the repo's build/agent.
+    #[arg(short, long, value_name = "JAR")]
+    base: Option<PathBuf>,
+    /// Optional config .properties (same keys as the agent's graft.properties overrides).
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Output agent jar path (default: <payload-id>-agent.jar in cwd).
+    #[arg(short, long, value_name = "FILE")]
+    out: Option<PathBuf>,
+    /// mc-graft repo root (used only to auto-detect the base jar; default: auto-detect from cwd/exe).
     #[arg(long, value_name = "DIR")]
     repo: Option<PathBuf>,
 }
@@ -103,6 +125,7 @@ fn main() {
         }
         Some(Cmd::List) => cmd_list(),
         Some(Cmd::Build(a)) => cmd_build(a),
+        Some(Cmd::Pack(a)) => cmd_pack(a),
         Some(Cmd::Inject(a)) => cmd_inject(a),
         Some(Cmd::Logs { file, follow }) => {
             if let Err(e) = follow_log(&file, 0, follow, Instant::now() + Duration::from_secs(600)) {
@@ -144,6 +167,40 @@ fn cmd_build(a: BuildCliArgs) {
     };
     match build::build_agent(&repo, &req, |l| println!("{l}")) {
         Ok(jar) => println!("\nAgent built: {}", jar.display()),
+        Err(e) => die(&e),
+    }
+}
+
+fn cmd_pack(a: PackArgs) {
+    if !a.payload.is_file() {
+        die(&format!("payload jar not found: {}", a.payload.display()));
+    }
+    let info = modinfo::read_jar(&a.payload).unwrap_or_else(|e| die(&e));
+    eprintln!("Payload: {}", info.summary());
+
+    // Locate the precompiled base jar.
+    let base = a.base.clone().unwrap_or_else(|| {
+        let repo = a
+            .repo
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| build::find_repo_root(None))
+            .unwrap_or_else(|e| die(&e));
+        repo.join("build/agent/mc-graft-base.jar")
+    });
+
+    let cfg = match &a.config {
+        Some(p) => {
+            let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+            config::AgentConfig::from_properties(&text)
+        }
+        None => config::AgentConfig::default(),
+    };
+
+    let out = a.out.clone().unwrap_or_else(|| PathBuf::from(format!("{}-agent.jar", info.id)));
+
+    match pack::pack_agent(&base, &a.payload, &info, &cfg, &out, |l| println!("{l}")) {
+        Ok(()) => println!("\nAgent packed (JDK-free): {}", out.display()),
         Err(e) => die(&e),
     }
 }
