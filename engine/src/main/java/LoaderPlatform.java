@@ -57,4 +57,9 @@ interface LoaderPlatform {
      *  Late-attach builds the loader's mod list before the payload exists, so without this such a lookup throws. No-op
      *  on loaders without a Fabric mod registry (vanilla/NeoForge). payloadJar is the staged payload jar path. */
     default void registerPayloadMod(PayloadConfig cfg, Path payloadJar) {}
+
+    /** (Fabric-only, opt-in) Bridge fabric-api's PayloadTypeRegistry into MC's live custom-payload codec dispatch, so a
+     *  mod that registers a custom packet type can encode/decode it under late-attach even though fabric-api's own
+     *  networking mixins (which normally wire that up) were never applied. No-op on other loaders. */
+    default void bridgePayloadCodecs() {}
 }

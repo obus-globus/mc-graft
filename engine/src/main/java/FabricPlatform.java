@@ -185,18 +185,23 @@ final class FabricPlatform implements LoaderPlatform {
             InjectionLogger.info("applied "+pc.accessWidener+" (namespace "+ns+") to live Knot ClassTweaker ("+awBytes.length+" bytes)");
         }
 
-        // 2) register the payload's mixin configs into the live service, then downgrade them to required:false (probe workaround #1).
-        for (String c : pc.mixinConfigs) Mixins.addConfiguration(c);
-        int downgraded = 0;
+        // 2) register the payload's mixin configs into the live service, then downgrade them to required:false (probe
+        //    workaround #1). Dependency-mod configs (e.g. fabric-api's own modules) are registered the same way, so the
+        //    converter applies them to the already-loaded MC classes a late-attached fabric-api never got to patch.
+        List<String> allConfigs = new ArrayList<>(pc.mixinConfigs);
+        allConfigs.addAll(pc.depMixinConfigs);
+        for (String c : allConfigs) { try { Mixins.addConfiguration(c); } catch (Throwable t) { InjectionLogger.warn("mixin config not registrable: "+c+" -> "+t.getClass().getSimpleName()+": "+t.getMessage()); } }
+        int downgraded = 0, depConfigs = 0;
         for (Object cfg : Mixins.getConfigs()) {                                   // org.spongepowered.asm.mixin.transformer.Config
             String name = (String) cfg.getClass().getMethod("getName").invoke(cfg);
-            if (name == null || !pc.mixinConfigs.contains(name)) continue;
+            if (name == null || !allConfigs.contains(name)) continue;
             Object mixinConfig = cfg.getClass().getMethod("getConfig").invoke(cfg); // IMixinConfig -> MixinConfig
             Field req = mixinConfig.getClass().getDeclaredField("required"); req.setAccessible(true); req.setBoolean(mixinConfig, false);
             downgraded++;
+            if (pc.depMixinConfigs.contains(name)) depConfigs++;
         }
         if (downgraded == 0) throw new IllegalStateException("required:false workaround failed: no payload Config found via Mixins.getConfigs() (Mixin API drift)");
-        InjectionLogger.info("registered "+downgraded+" payload mixin config(s), downgraded to required:false");
+        InjectionLogger.info("registered "+downgraded+" mixin config(s) ("+depConfigs+" from dependencies), downgraded to required:false");
 
         // 3) acquire the LIVE transformer + processor.transformedCount + method handles (all Knot-visible, via reflection).
         Class<?> svcKnot = fc("net.fabricmc.loader.impl.launch.knot.MixinServiceKnot");
@@ -398,6 +403,80 @@ final class FabricPlatform implements LoaderPlatform {
     // ---- reflection helpers -----------------------------------------------------------------------------------------
     private byte[] getRawClassBytes(String internal){ try { return (byte[]) mGetRawBytes.invoke(delegate, internal); } catch(Throwable t){ return null; } }
     private byte[] getPreMixinClassBytes(String internal){ try { return (byte[]) mGetPreMixinBytes.invoke(delegate, internal); } catch(Throwable t){ return null; } }
+    // ---- Bridge fabric-api's PayloadTypeRegistry into MC's live custom-payload codec dispatch -----------------------
+    // MC's custom-payload StreamCodec (CustomPacketPayload$1) dispatches encode/decode by channel id via an immutable
+    // `val$idToType` map (vanilla payloads only) + a `val$fallback` that yields DiscardedPayload for unknown ids —
+    // whose codec then throws a ClassCastException when a mod tries to send its own payload. fabric-api normally wires
+    // mod payloads in via its own networking MIXINS; under late-attach those were never applied. A mod's registration
+    // into fabric-api's PayloadTypeRegistry DOES still succeed, so we simply swap each of MC's four dispatch codecs'
+    // fallback for one that consults the paired fabric-api registry first (live, so registration order doesn't matter).
+    @Override public void bridgePayloadCodecs() {
+        try {
+            Class<?> reg = Class.forName("net.fabricmc.fabric.impl.networking.PayloadTypeRegistryImpl", false, knot);
+            Class<?> fbC = Class.forName("net.minecraft.network.protocol.common.custom.CustomPacketPayload$FallbackProvider", false, knot);
+            Field ptF = reg.getDeclaredField("packetTypes"); ptF.setAccessible(true);
+            // Each MC custom-payload dispatch codec paired with the fabric-api registries whose types it must resolve.
+            // Clientbound splits its codec by phase (GAMEPLAY/CONFIG); serverbound has a single STREAM_CODEC used for
+            // both phases, so it consults both serverbound registries.
+            String[][] pairs = {
+                {"net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket", "GAMEPLAY_STREAM_CODEC", "CLIENTBOUND_PLAY"},
+                {"net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket", "CONFIG_STREAM_CODEC",   "CLIENTBOUND_CONFIGURATION"},
+                {"net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket", "STREAM_CODEC",          "SERVERBOUND_PLAY", "SERVERBOUND_CONFIGURATION"},
+            };
+            int bridged = 0;
+            for (String[] p : pairs) {
+                try {
+                    Object mcCodec = Class.forName(p[0], false, knot).getField(p[1]).get(null);
+                    Object dispatch = unwrapDispatch(mcCodec, 0);
+                    if (dispatch == null) { InjectionLogger.warn("payload codec bridge: no dispatch codec inside "+p[0]+"."+p[1]); continue; }
+                    Map<?, ?>[] typeMaps = new Map<?, ?>[p.length - 2];
+                    for (int i = 2; i < p.length; i++) typeMaps[i - 2] = (Map<?, ?>) ptF.get(reg.getField(p[i]).get(null));
+                    Field fbF = dispatch.getClass().getDeclaredField("val$fallback"); fbF.setAccessible(true);
+                    Object orig = fbF.get(dispatch);
+                    Object proxy = java.lang.reflect.Proxy.newProxyInstance(knot, new Class<?>[]{fbC}, new PayloadFallback(orig, typeMaps));
+                    fbF.set(dispatch, proxy);
+                    bridged++;
+                } catch (Throwable t) {
+                    InjectionLogger.warn("payload codec bridge skipped "+p[0]+"."+p[1]+": "+t.getClass().getSimpleName()+": "+t.getMessage());
+                }
+            }
+            InjectionLogger.info("bridged "+bridged+"/3 custom-payload codec(s) to fabric-api PayloadTypeRegistry");
+        } catch (Throwable t) {
+            InjectionLogger.warn("bridgePayloadCodecs failed (mod custom packets may not encode): "+t.getClass().getSimpleName()+": "+t.getMessage());
+        }
+    }
+
+    /** Walk a StreamCodec `.map(...)` wrapper chain to the underlying CustomPacketPayload$1 dispatch codec. */
+    private Object unwrapDispatch(Object codec, int depth) throws Exception {
+        if (codec == null || depth > 8) return null;
+        if (codec.getClass().getName().equals("net.minecraft.network.protocol.common.custom.CustomPacketPayload$1")) return codec;
+        for (Field f : codec.getClass().getDeclaredFields()) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+            if (!f.getType().getName().equals("net.minecraft.network.codec.StreamCodec")) continue;
+            f.setAccessible(true);
+            Object inner = unwrapDispatch(f.get(codec), depth + 1);
+            if (inner != null) return inner;
+        }
+        return null;
+    }
+
+    /** Fallback that resolves a mod-registered payload codec from fabric-api's registry, else defers to MC's original. */
+    private static final class PayloadFallback implements java.lang.reflect.InvocationHandler {
+        private final Object orig;          // MC's original FallbackProvider (yields DiscardedPayload for truly-unknown ids)
+        private final Map<?, ?>[] typeMaps; // fabric-api PayloadTypeRegistryImpl.packetTypes: Identifier -> CustomPacketPayload$TypeAndCodec
+        PayloadFallback(Object orig, Map<?, ?>[] typeMaps) { this.orig = orig; this.typeMaps = typeMaps; }
+        public Object invoke(Object proxy, Method m, Object[] args) throws Throwable {
+            if ("create".equals(m.getName()) && args != null && args.length == 1) {
+                for (Map<?, ?> types : typeMaps) {
+                    Object tac = types.get(args[0]);                     // TypeAndCodec for this channel id, if a mod registered it
+                    if (tac != null) return tac.getClass().getMethod("codec").invoke(tac);
+                }
+            }
+            try { return m.invoke(orig, args); }
+            catch (java.lang.reflect.InvocationTargetException e) { throw e.getCause(); }
+        }
+    }
+
     private static Class<?> fc(String dotted) throws ClassNotFoundException { return Class.forName(dotted); }
     private static Method findByteMethod(Object target, String name){
         for (Class<?> k = target.getClass(); k != null; k = k.getSuperclass()) {

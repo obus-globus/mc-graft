@@ -671,6 +671,7 @@ fn advanced_config(ui: &mut egui::Ui, c: &mut config::AgentConfig) {
     }
     ui.label(egui::RichText::new("Dependencies & packaging").strong());
     field(ui, "payload.dependencies", "maven coords, comma-separated", &mut c.deps);
+    field(ui, "bootstrap.applyDependencyMixins", "\"\" off · \"*\" all · else config-name filter e.g. networking", &mut c.apply_dep_mixins);
     field(ui, "payload.mixins.neoforge", "NeoForge mixin config set", &mut c.neoforge_mixins);
     field(ui, "payload.packages", "internal-name prefixes (fat jars)", &mut c.packages);
 
@@ -680,6 +681,7 @@ fn advanced_config(ui: &mut egui::Ui, c: &mut config::AgentConfig) {
     field(ui, "bootstrap.thawRegistries", "e.g. minecraft:sound_event", &mut c.thaw_registries);
     ui.checkbox(&mut c.register_mod_container, "bootstrap.registerModContainer (Fabric self-metadata)");
     ui.checkbox(&mut c.reopen_key_bindings, "bootstrap.reopenKeyBindings (allow late fabric-api keybind registration)");
+    ui.checkbox(&mut c.bridge_payload_codecs, "bootstrap.bridgePayloadCodecs (wire fabric-api custom packets into MC's live codec)");
     field(ui, "bootstrap.gameDirProperty", "e.g. vspike.gameDir", &mut c.game_dir_property);
     field(ui, "bootstrap.joinGate.screen", "e.g. net/minecraft/.../ConnectScreen", &mut c.join_gate_screen);
 

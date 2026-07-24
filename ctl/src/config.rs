@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct AgentConfig {
     // packaging / dependencies
     pub deps: String,               // payload.dependencies (comma-separated Maven coords)
+    pub apply_dep_mixins: String,   // bootstrap.applyDependencyMixins: "" off, "*" all, else config-name substring filter
     pub neoforge_mixins: String,    // payload.mixins.neoforge
     pub packages: String,           // payload.packages
     // registry / reload lifecycle
@@ -17,6 +18,7 @@ pub struct AgentConfig {
     pub thaw_registries: String,    // bootstrap.thawRegistries
     pub register_mod_container: bool, // bootstrap.registerModContainer
     pub reopen_key_bindings: bool,  // bootstrap.reopenKeyBindings
+    pub bridge_payload_codecs: bool, // bootstrap.bridgePayloadCodecs
     pub game_dir_property: String,  // bootstrap.gameDirProperty
     pub join_gate_screen: String,   // bootstrap.joinGate.screen
     // event bootstrap (for mods with no entrypoint)
@@ -49,12 +51,14 @@ impl AgentConfig {
             let (k, v) = (k.trim(), v.trim().to_string());
             match k {
                 "payload.dependencies" => c.deps = v,
+                "bootstrap.applyDependencyMixins" => c.apply_dep_mixins = v,
                 "payload.mixins.neoforge" => c.neoforge_mixins = v,
                 "payload.packages" => c.packages = v,
                 "bootstrap.reloadResources" => c.reload_resources = v.eq_ignore_ascii_case("true"),
                 "bootstrap.thawRegistries" => c.thaw_registries = v,
                 "bootstrap.registerModContainer" => c.register_mod_container = v.eq_ignore_ascii_case("true"),
                 "bootstrap.reopenKeyBindings" => c.reopen_key_bindings = v.eq_ignore_ascii_case("true"),
+                "bootstrap.bridgePayloadCodecs" => c.bridge_payload_codecs = v.eq_ignore_ascii_case("true"),
                 "bootstrap.gameDirProperty" => c.game_dir_property = v,
                 "bootstrap.joinGate.screen" => c.join_gate_screen = v,
                 "bootstrap.event.manager" => c.evt_manager = v,
@@ -83,6 +87,7 @@ impl AgentConfig {
         }
         let mut o = String::new();
         kv(&mut o, "payload.dependencies", &self.deps);
+        kv(&mut o, "bootstrap.applyDependencyMixins", &self.apply_dep_mixins);
         kv(&mut o, "payload.mixins.neoforge", &self.neoforge_mixins);
         kv(&mut o, "payload.packages", &self.packages);
         if self.reload_resources {
@@ -94,6 +99,9 @@ impl AgentConfig {
         }
         if self.reopen_key_bindings {
             o.push_str("bootstrap.reopenKeyBindings=true\n");
+        }
+        if self.bridge_payload_codecs {
+            o.push_str("bootstrap.bridgePayloadCodecs=true\n");
         }
         kv(&mut o, "bootstrap.gameDirProperty", &self.game_dir_property);
         kv(&mut o, "bootstrap.joinGate.screen", &self.join_gate_screen);

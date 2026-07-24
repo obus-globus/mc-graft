@@ -28,6 +28,9 @@ public final class PayloadConfig {
 
     public final String id, accessWidener;
     public final List<String> mixinConfigs, neoforgeMixins, mainEntrypoints, clientEntrypoints;
+    // Mixin configs from the payload's DEPENDENCY mods (e.g. fabric-api's own modules) that must also be applied under
+    // late-attach — normally these apply at startup, but a late-attached fabric-api never patched the loaded MC classes.
+    public final List<String> depMixinConfigs;
     // built-in registries the payload writes into during init (e.g. minecraft:sound_event) — thawed narrowly and kept
     // open across a resource reload, instead of thawing every registry (which collides with the reload's re-freeze).
     public final List<String> thawRegistries;
@@ -58,12 +61,17 @@ public final class PayloadConfig {
     // client init would throw. With this set, mc-graft strips that guard and splices late-registered keybinds into the
     // live options so they function and appear in Controls. (bootstrap.reopenKeyBindings=true)
     public final boolean reopenKeyBindings;
+    // (Fabric) bridge fabric-api's PayloadTypeRegistry into MC's live custom-payload codec dispatch, so a mod that
+    // registers a custom packet type (e.g. Xaero's xaerominimap:main) can encode/decode it under late-attach without
+    // fabric-api's own networking mixins being applied. (bootstrap.bridgePayloadCodecs=true)
+    public final boolean bridgePayloadCodecs;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
         String aw = p.getProperty("payload.accessWidener", "").trim();
         accessWidener = aw.isEmpty() ? null : aw;
         mixinConfigs = csv(p.getProperty("payload.mixins", ""));
+        depMixinConfigs = csv(p.getProperty("payload.mixins.deps", ""));
         List<String> nf = csv(p.getProperty("payload.mixins.neoforge", ""));
         neoforgeMixins = nf.isEmpty() ? mixinConfigs : nf;   // NeoForge-patched MC needs its own companion set if provided
         mainEntrypoints = csv(p.getProperty("payload.entrypoints.main", ""));
@@ -84,6 +92,7 @@ public final class PayloadConfig {
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
         registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());
         reopenKeyBindings = Boolean.parseBoolean(p.getProperty("bootstrap.reopenKeyBindings", "false").trim());
+        bridgePayloadCodecs = Boolean.parseBoolean(p.getProperty("bootstrap.bridgePayloadCodecs", "false").trim());
     }
 
     /** True when the payload owns a class under one of its declared package roots. Empty roots -> false (callers then

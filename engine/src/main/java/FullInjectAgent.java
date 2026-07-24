@@ -231,6 +231,7 @@ public class FullInjectAgent {
             Object mc = mcCls.getMethod("getInstance").invoke(null);
             Runnable kick = () -> { RegistryThawSession thaw=null; try {
                 if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("Bootstrap class preflight produced verification errors");
+                if(cfg.bridgePayloadCodecs) PLATFORM.bridgePayloadCodecs();   // wire fabric-api PayloadTypeRegistry into MC's live codec dispatch
                 // Off the reload path: thaw ALL registries so the payload can register into them post-freeze.
                 // On the reload path: thawing everything collides with the reload re-freezing the dynamic RegistryAccess
                 // ("Tags already present"), so thaw ONLY the specific built-in registries the payload writes to

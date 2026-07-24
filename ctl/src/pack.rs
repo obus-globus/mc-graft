@@ -45,14 +45,7 @@ pub fn pack_agent<F: FnMut(&str)>(
             base.display()
         ));
     }
-    log("deriving graft.properties…");
-    let props = graft_properties(payload, info, cfg, &mut log);
-
-    log("deriving mixin targets from @Mixin annotations…");
-    let targets = derive_mixin_targets(payload, &info.mixins)?;
-    log(&format!("  {} target class(es)", targets.len()));
-    let targets_txt = targets.join("\n") + "\n";
-
+    // Resolve declared Maven dependencies first (their bytes feed dependency-mixin scanning below).
     let coords: Vec<String> = cfg
         .deps
         .split(',')
@@ -67,13 +60,50 @@ pub fn pack_agent<F: FnMut(&str)>(
         libs.push((name, bytes));
     }
 
+    log("deriving mixin targets from @Mixin annotations…");
+    let mut targets: BTreeSet<String> = derive_mixin_targets(payload, &info.mixins)?.into_iter().collect();
+    log(&format!("  {} payload target class(es)", targets.len()));
+
+    // Optionally also apply the DEPENDENCY mods' own mixins (fabric-api etc.) — needed for mods that rely on
+    // fabric-api's runtime hooks (custom-payload networking, etc.) that a late-attached fabric-api never installed.
+    let mut dep_configs: Vec<String> = Vec::new();
+    let dep_filter: Vec<String> = cfg
+        .apply_dep_mixins
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !dep_filter.is_empty() {
+        log(&format!("scanning dependency mods for mixin configs (filter: {})…", cfg.apply_dep_mixins.trim()));
+        let before = targets.len();
+        let (dcfgs, dtargets) = dep_mixins(payload, &libs, &dep_filter);
+        dep_configs = dcfgs;
+        targets.extend(dtargets);
+        log(&format!(
+            "  {} dependency mixin config(s), +{} target(s) (total {})",
+            dep_configs.len(),
+            targets.len() - before,
+            targets.len()
+        ));
+    }
+    let targets_txt = targets.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+
+    log("deriving graft.properties…");
+    let props = graft_properties(payload, info, cfg, &dep_configs, &mut log);
+
     log("assembling agent jar…");
     assemble(base, payload, &props, &targets_txt, &libs, out)?;
     log(&format!("packed {}", out.display()));
     Ok(())
 }
 
-fn graft_properties<F: FnMut(&str)>(payload: &Path, info: &ModInfo, cfg: &AgentConfig, log: &mut F) -> String {
+fn graft_properties<F: FnMut(&str)>(
+    payload: &Path,
+    info: &ModInfo,
+    cfg: &AgentConfig,
+    dep_configs: &[String],
+    log: &mut F,
+) -> String {
     // Bundled (jar-in-jar) dependency mods have their own Fabric entrypoints that set up state the payload needs (e.g.
     // xaerolib's XaeroLib.INSTANCE). Fabric would run them as normal mods; a late-attach must too, and BEFORE the
     // payload's — so prepend them to the entrypoint lists (deps first).
@@ -89,6 +119,9 @@ fn graft_properties<F: FnMut(&str)>(payload: &Path, info: &ModInfo, cfg: &AgentC
     s.push_str(&format!("payload.id={}\n", info.id));
     s.push_str(&format!("payload.accessWidener={}\n", info.access_widener.clone().unwrap_or_default()));
     s.push_str(&format!("payload.mixins={}\n", info.mixins.join(",")));
+    if !dep_configs.is_empty() {
+        s.push_str(&format!("payload.mixins.deps={}\n", dep_configs.join(",")));
+    }
     s.push_str(&format!("payload.entrypoints.main={}\n", main_eps.join(",")));
     s.push_str(&format!("payload.entrypoints.client={}\n", client_eps.join(",")));
     let over = cfg.to_properties();
@@ -143,27 +176,115 @@ fn derive_mixin_targets(payload: &Path, configs: &[String]) -> Result<Vec<String
     let mut out: BTreeSet<String> = BTreeSet::new();
     for cfg in configs {
         let Some(json) = read_zip_string(&mut zip, cfg) else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { continue };
-        let Some(pkg) = v["package"].as_str().map(|p| p.replace('.', "/")) else { continue };
-        let mut classes: Vec<String> = Vec::new();
-        for key in ["mixins", "client", "server"] {
-            if let Some(a) = v[key].as_array() {
-                for m in a {
-                    if let Some(s) = m.as_str() {
-                        classes.push(s.to_string());
+        targets_from_config(&mut zip, &json, &mut out);
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Given a mixin config JSON and the jar it lives in, add every `@Mixin` target (internal name) to `out`. The mixin
+/// classes named by the config's mixins/client/server arrays are read from the same jar.
+fn targets_from_config<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, json: &str, out: &mut BTreeSet<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
+    let Some(pkg) = v["package"].as_str().map(|p| p.replace('.', "/")) else { return };
+    let mut classes: Vec<String> = Vec::new();
+    for key in ["mixins", "client", "server"] {
+        if let Some(a) = v[key].as_array() {
+            for m in a {
+                if let Some(s) = m.as_str() {
+                    classes.push(s.to_string());
+                }
+            }
+        }
+    }
+    for mn in classes {
+        let path = format!("{}/{}.class", pkg, mn.replace('.', "/"));
+        let Some(bytes) = read_zip_bytes(zip, &path) else { continue };
+        for t in mixin_targets_of(&bytes) {
+            out.insert(t);
+        }
+    }
+}
+
+/// Discover the mixin configs (and their `@Mixin` targets) of the payload's DEPENDENCY mods, so a late-attached
+/// fabric-api (and any bundled library mod) gets its own mixins applied to the already-loaded MC classes it would
+/// normally patch at startup. Scans the payload's bundled JiJ mods and every resolved Maven dependency jar, recursing
+/// into their own bundled JiJ modules (fabric-api ships its modules that way). Server-only configs are skipped.
+/// Returns (config resource names, target internal names).
+fn dep_mixins(payload: &Path, dep_jars: &[(String, Vec<u8>)], filter: &[String]) -> (Vec<String>, BTreeSet<String>) {
+    let mut configs: Vec<String> = Vec::new();
+    let mut targets: BTreeSet<String> = BTreeSet::new();
+    // the payload's own bundled JiJ mods (e.g. xaerolib)
+    if let Ok(bytes) = std::fs::read(payload) {
+        for nested in jij_jars(&bytes) {
+            scan_jar_mixins(&nested, filter, &mut configs, &mut targets, 0);
+        }
+    }
+    // resolved Maven dependency jars (e.g. fabric-api, which bundles its modules as JiJ)
+    for (_, bytes) in dep_jars {
+        scan_jar_mixins(bytes, filter, &mut configs, &mut targets, 0);
+    }
+    (configs, targets)
+}
+
+/// True if a config resource name passes the filter: `["*"]` matches everything, otherwise the name must contain one
+/// of the (case-insensitive) substring tokens (e.g. "networking").
+fn config_included(name: &str, filter: &[String]) -> bool {
+    filter.iter().any(|t| t == "*") || {
+        let lower = name.to_ascii_lowercase();
+        filter.iter().any(|t| lower.contains(&t.to_ascii_lowercase()))
+    }
+}
+
+/// Return the raw bytes of every `META-INF/jars/*.jar` bundled in `jar_bytes` (one level).
+fn jij_jars(jar_bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(jar_bytes.to_vec())) else { return out };
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter(|n| n.starts_with("META-INF/jars/") && n.ends_with(".jar"))
+        .collect();
+    for n in names {
+        if let Some(b) = read_zip_bytes(&mut zip, &n) {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Scan one dependency jar for mixin configs it declares (from fabric.mod.json `mixins`, non-server) + their targets,
+/// then recurse into its bundled JiJ modules. Bounded recursion depth guards against pathological nesting.
+fn scan_jar_mixins(jar_bytes: &[u8], filter: &[String], configs: &mut Vec<String>, targets: &mut BTreeSet<String>, depth: u32) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(jar_bytes.to_vec())) else { return };
+    if let Some(fmj) = read_zip_string(&mut zip, "fabric.mod.json") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fmj) {
+            if let Some(arr) = v["mixins"].as_array() {
+                for m in arr {
+                    // a mixins entry is a bare "cfg.mixins.json" or { "config": "...", "environment": "client|common|server|*" }
+                    let name = m.as_str().map(String::from).or_else(|| {
+                        let env = m["environment"].as_str().unwrap_or("*");
+                        (env != "server").then(|| m["config"].as_str().map(String::from)).flatten()
+                    });
+                    if let Some(name) = name {
+                        if !config_included(&name, filter) {
+                            continue;
+                        }
+                        if !configs.contains(&name) {
+                            configs.push(name.clone());
+                        }
+                        if let Some(json) = read_zip_string(&mut zip, &name) {
+                            targets_from_config(&mut zip, &json, targets);
+                        }
                     }
                 }
             }
         }
-        for mn in classes {
-            let path = format!("{}/{}.class", pkg, mn.replace('.', "/"));
-            let Some(bytes) = read_zip_bytes(&mut zip, &path) else { continue };
-            for t in mixin_targets_of(&bytes) {
-                out.insert(t);
-            }
-        }
     }
-    Ok(out.into_iter().collect())
+    for nested in jij_jars(jar_bytes) {
+        scan_jar_mixins(&nested, filter, configs, targets, depth + 1);
+    }
 }
 
 /// Extract `@Mixin(value=…, targets=…)` targets (as internal names) from a mixin class's bytecode.

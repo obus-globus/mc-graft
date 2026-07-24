@@ -74,3 +74,41 @@ incompatible with this late-attach model on Fabric, and that should be documente
 limitation. Reproduce with:
 `./gradlew agentJar -Ppayload=<meteor.jar> -PbootstrapConfig=examples/meteor/bootstrap.properties`
 against a bare Fabric 26.1.2 client (see the session harness under `/tmp/mc2612/`).
+
+---
+
+## fabric-api-dependent mods under late-attach (Xaero's Minimap)
+
+Xaero's Minimap (fabric-26.2-26.4.2) injects and its CLIENT fully initialises (all 3 load stages)
+and connects to a world. Getting there surfaced a series of generic late-attach gaps, now fixed:
+- TCCL set to Knot while driving the transformer (ServiceLoader-based mixin-config plugins, e.g.
+  xaerolib's IPlatformMixinHelper) — else the config-plugin throws mid-transform and cascades.
+- null access-widener handling (Xaero declares none).
+- bootstrap.reopenKeyBindings: ASM-strip fabric-api KeyMappingRegistryImpl's post-GameOptions guard.
+- packer invokes bundled jar-in-jar dependency mods' entrypoints (xaerolib) before the payload's.
+- bootstrap.bridgePayloadCodecs: bridge fabric-api's PayloadTypeRegistry into MC's live custom-payload
+  codec dispatch (swap each dispatch codec's FallbackProvider) so mod packets encode/decode — WITHOUT
+  applying fabric-api's own networking mixins. This eliminated the encode ClassCastException and the
+  client now logs into the world.
+
+### Root limitation: fabric-api's OWN mixins are not applied under late-attach
+mc-graft applies the PAYLOAD's mixin configs, not its dependencies'. fabric-api normally patches MC at
+startup via its own mixins (networking codec hooks, keybinding/options wiring, lifecycle events, ...).
+Under late-attach those never ran, so any fabric-api runtime path a payload leans on is dormant/broken.
+An opt-in `bootstrap.applyDependencyMixins=<filter>` was built (packer scans dep jars' mixin configs +
+targets; engine registers them through the converter). Scoped to networking it CONVERTS cleanly (52
+targets, 0 skipped) but then fabric-api's OWN runtime casts MC objects to interfaces its accessor
+mixins add (e.g. ServerLoginPacketListenerImplAccessor) — and mc-graft only caller-rewrites the
+payload's classes, not fabric-api's, so those casts throw. Making fabric-api fully correct under
+late-attach ≈ re-implementing fabric-api's load-time contract inside the retransform engine
+(caller-rewrite fabric-api's classes; and/or define future-loaded accessor targets whole — but the
+BetterChat note above shows Knot may not honor schema-changing on-load output, which would kill the
+latter). Judged a multi-week, open-ended effort; not pursued. `applyDependencyMixins` stays experimental
+and default-off.
+
+### Xaero remaining blocker: singleplayer server companion
+With the codec bridge, Xaero connects to a world, but in SINGLEPLAYER the integrated server disconnects
+on join: `xaero.common.events.CommonEvents.onPlayerWorldJoin` reads a null `serverData` (its server-side
+session object). Xaero's server bootstrap that creates `serverData` depends on further fabric-api server
+integration that did not fire under late-attach. Not fixed. (Multiplayer — client-only half + the codec
+bridge — is untested here; no external 26.2 server available in the harness.)
