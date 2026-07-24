@@ -9,6 +9,7 @@ mod config;
 mod gui;
 mod modinfo;
 mod procs;
+mod store;
 
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};

@@ -2,6 +2,7 @@
 //! payload, and inject it into a running Minecraft — with a live log. Long operations run on background threads and
 //! stream lines back through a channel so the window never blocks.
 
+use crate::store::{GameDir, InjectConfig, Store};
 use crate::{attach, build, config, modinfo, procs};
 use eframe::egui;
 use std::path::PathBuf;
@@ -26,13 +27,6 @@ enum Msg {
     InjectDone(Result<(), String>),
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum GameDir {
-    ClientDir,
-    WorkingDir,
-    Custom,
-}
-
 struct App {
     // discovery
     jvms: Vec<procs::Jvm>,
@@ -46,12 +40,17 @@ struct App {
     cfg: config::AgentConfig,
     presets: Vec<config::Preset>,
     preset: String,
+    build_preset_name: String,
     agent_name: String,
     // inject inputs
     agent_jar: String,
     game_dir: GameDir,
     custom_dir: String,
     tolerate: bool,
+    inject_preset: String,
+    inject_preset_name: String,
+    // saved presets (persisted)
+    store: Store,
     // runtime
     log: Vec<String>,
     busy: bool,
@@ -76,11 +75,15 @@ impl App {
             cfg: config::AgentConfig::default(),
             presets,
             preset: "None".into(),
+            build_preset_name: String::new(),
             agent_name: "mc-graft-agent.jar".into(),
             agent_jar: String::new(),
             game_dir: GameDir::ClientDir,
             custom_dir: String::new(),
             tolerate: false,
+            inject_preset: String::new(),
+            inject_preset_name: String::new(),
+            store: Store::load(),
             log: Vec::new(),
             busy: false,
             status: "Ready.".into(),
@@ -386,11 +389,24 @@ impl eframe::App for App {
                         if ui.selectable_label(cur == "None", "None").clicked() {
                             load = Some(("None".into(), config::AgentConfig::default()));
                         }
+                        if !self.presets.is_empty() {
+                            ui.separator();
+                            ui.weak("bundled");
+                        }
                         for p in &self.presets {
                             if ui.selectable_label(cur == p.name, &p.name).clicked() {
                                 if let Ok(t) = std::fs::read_to_string(&p.path) {
                                     load = Some((p.name.clone(), config::AgentConfig::from_properties(&t)));
                                 }
+                            }
+                        }
+                        if !self.store.build.is_empty() {
+                            ui.separator();
+                            ui.weak("saved");
+                        }
+                        for (name, ac) in &self.store.build {
+                            if ui.selectable_label(cur == *name, format!("★ {name}")).clicked() {
+                                load = Some((name.clone(), ac.clone()));
                             }
                         }
                     });
@@ -405,6 +421,20 @@ impl eframe::App for App {
                     if let Some((n, c)) = load {
                         self.preset = n;
                         self.cfg = c;
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.build_preset_name).desired_width(110.0).hint_text("save as…"));
+                    if ui.button("Save").clicked() {
+                        let name = self.build_preset_name.trim().to_string();
+                        if !name.is_empty() {
+                            self.store.build.insert(name.clone(), self.cfg.clone());
+                            let msg = match self.store.save() {
+                                Ok(()) => format!("[ok] saved build preset '{name}'"),
+                                Err(e) => format!("[error] save preset: {e}"),
+                            };
+                            self.log.push(msg);
+                            self.preset = name;
+                            self.build_preset_name.clear();
+                        }
                     }
                 });
                 egui::CollapsingHeader::new("Advanced options (all config keys)").default_open(false).show(ui, |ui| {
@@ -429,6 +459,53 @@ impl eframe::App for App {
                     path_row(ui, "Custom data dir", &mut self.custom_dir, &[]);
                 }
                 ui.checkbox(&mut self.tolerate, "Tolerate other-mod mixin failures (modded loaders)");
+                // Inject presets: save/apply the data-dir mode + options (+ agent jar).
+                ui.horizontal(|ui| {
+                    ui.label("Inject preset");
+                    let cur = self.inject_preset.clone();
+                    let mut apply: Option<(String, InjectConfig)> = None;
+                    egui::ComboBox::from_id_source("inject_preset")
+                        .selected_text(if cur.is_empty() { "—" } else { &cur })
+                        .show_ui(ui, |ui| {
+                            if self.store.inject.is_empty() {
+                                ui.weak("(none saved)");
+                            }
+                            for (name, ic) in &self.store.inject {
+                                if ui.selectable_label(cur == *name, name).clicked() {
+                                    apply = Some((name.clone(), ic.clone()));
+                                }
+                            }
+                        });
+                    if let Some((n, ic)) = apply {
+                        self.inject_preset = n;
+                        self.game_dir = ic.game_dir;
+                        self.custom_dir = ic.custom_dir;
+                        self.tolerate = ic.tolerate;
+                        if !ic.agent_jar.is_empty() {
+                            self.agent_jar = ic.agent_jar;
+                        }
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.inject_preset_name).desired_width(110.0).hint_text("save as…"));
+                    if ui.button("Save").clicked() {
+                        let name = self.inject_preset_name.trim().to_string();
+                        if !name.is_empty() {
+                            let ic = InjectConfig {
+                                game_dir: self.game_dir,
+                                custom_dir: self.custom_dir.clone(),
+                                tolerate: self.tolerate,
+                                agent_jar: self.agent_jar.clone(),
+                            };
+                            self.store.inject.insert(name.clone(), ic);
+                            let msg = match self.store.save() {
+                                Ok(()) => format!("[ok] saved inject preset '{name}'"),
+                                Err(e) => format!("[error] save preset: {e}"),
+                            };
+                            self.log.push(msg);
+                            self.inject_preset = name;
+                            self.inject_preset_name.clear();
+                        }
+                    }
+                });
                 ui.add_space(4.0);
                 let target = self.selected.map(|p| p.to_string()).unwrap_or_else(|| "none".into());
                 let can = !self.busy && self.selected.is_some() && PathBuf::from(self.agent_jar.trim()).is_file();

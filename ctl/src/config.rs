@@ -2,9 +2,11 @@
 //! auto-derived from `fabric.mod.json`). Modeled as structured fields so the UI can expose every option, load presets
 //! from the bundled `examples/*/bootstrap.properties`, and serialize back to a `.properties` file the build consumes.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentConfig {
     // packaging / dependencies
     pub deps: String,               // payload.dependencies (comma-separated Maven coords)

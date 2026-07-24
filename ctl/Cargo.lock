@@ -1808,6 +1808,7 @@ dependencies = [
  "eframe",
  "egui",
  "rfd",
+ "serde",
  "serde_json",
  "ureq",
  "zip",
