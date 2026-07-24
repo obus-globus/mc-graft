@@ -92,8 +92,8 @@ format  = 1                       # manifest schema version
 [apply]
 on-conflict   = "error"           # error | overlay-wins | patch-wins
 verify-target = true              # base guard on/off (see below); default true
-# default order (overridable); structural first, content next, edits last:
-order = ["delete", "rename", "overlay", "new", "merge", "patch"]
+# The apply order is fixed (structural first, content next, edits last):
+#   delete -> rename -> overlay -> new -> merge -> patch
 
 # --- base guard (only enforced when verify-target = true) ---
 [target]

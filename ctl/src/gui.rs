@@ -293,16 +293,14 @@ impl App {
                         ctx_a.request_repaint();
                     })?
                 };
-                let effective = patched.as_deref().unwrap_or(&payload);
+                let effective = patched.as_ref().map(|t| t.path()).unwrap_or(&payload);
                 let info = if patched.is_some() { crate::modinfo::read_jar(effective)? } else { info0.clone() };
                 let r = crate::pack::pack_agent(&base, effective, &info, &cfg, &out, |l| {
                     let _ = tx_b.send(Msg::Line(l.to_string()));
                     ctx_b.request_repaint();
                 })
                 .map(|()| out.clone());
-                if let Some(tmp) = &patched {
-                    let _ = std::fs::remove_file(tmp); // best-effort cleanup of the patched temp jar
-                }
+                drop(patched); // delete the patched temp jar (NamedTempFile RAII)
                 r
             })();
             let _ = tx.send(Msg::BuildDone(result));

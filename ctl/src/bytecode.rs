@@ -32,24 +32,24 @@ pub enum OpKind {
 pub fn apply_ops(class_bytes: &[u8], ops: &[Op]) -> Result<Vec<u8>, String> {
     let mut cf = ClassFile::from_bytes(class_bytes).map_err(|e| format!("parse class: {e}"))?;
     let cp = &mut cf.constant_pool; // disjoint field borrow from cf.methods below
-    let mut total = 0usize;
+    let mut hits = vec![0usize; ops.len()]; // per-op, so a single op matching nothing is still an error
     for m in &mut cf.methods {
         let mname = cp.try_get_utf8(m.name_index).map_err(|e| e.to_string())?.to_string();
         let mdesc = cp.try_get_utf8(m.descriptor_index).map_err(|e| e.to_string())?.to_string();
         for attr in &mut m.attributes {
             let Attribute::Code { code, .. } = attr else { continue };
-            for op in ops {
+            for (oi, op) in ops.iter().enumerate() {
                 if let Some((n, d)) = &op.in_method {
                     if *n != mname || *d != mdesc {
                         continue;
                     }
                 }
-                total += apply_op(code, &op.kind, cp)?;
+                hits[oi] += apply_op(code, &op.kind, cp)?;
             }
         }
     }
-    if total == 0 {
-        return Err("no matching site found — the ops patched nothing (check class/method/from values)".into());
+    if let Some(oi) = hits.iter().position(|h| *h == 0) {
+        return Err(format!("op #{} matched no site — patched nothing (check class/method/`in`/`from`)", oi + 1));
     }
     let mut out = Vec::new();
     cf.to_bytes(&mut out).map_err(|e| format!("serialize class: {e}"))?;
@@ -84,16 +84,18 @@ fn apply_op(code: &mut [Instruction], kind: &OpKind, cp: &mut ConstantPool) -> R
         }
         OpKind::RedirectInvoke { from, to } => {
             for ins in code.iter_mut() {
-                let (idx, iface) = match &*ins {
-                    Instruction::Invokevirtual(x) | Instruction::Invokestatic(x) | Instruction::Invokespecial(x) => (Some(*x), false),
-                    Instruction::Invokeinterface(x, _) => (Some(*x), true),
-                    _ => (None, false),
+                let idx = match &*ins {
+                    Instruction::Invokevirtual(x) | Instruction::Invokestatic(x) | Instruction::Invokespecial(x) => Some(*x),
+                    Instruction::Invokeinterface(x, _) => Some(*x),
+                    _ => None,
                 };
                 let Some(ci) = idx else { continue };
-                let Some((o, nm, d)) = resolve_ref(cp, ci, iface) else { continue };
+                // Resolve as either a Methodref or InterfaceMethodref (invokestatic/-special on a Java-8+ interface
+                // method uses InterfaceMethodref); preserve that kind when writing the new ref.
+                let Some((was_iface, o, nm, d)) = resolve_ref(cp, ci) else { continue };
                 if o == from.0 && nm == from.1 && d == from.2 {
                     let cls = cp.add_class(&to.0).map_err(|e| e.to_string())?;
-                    let ni = if iface {
+                    let ni = if was_iface {
                         cp.add_interface_method_ref(cls, &to.1, &from.2).map_err(|e| e.to_string())?
                     } else {
                         cp.add_method_ref(cls, &to.1, &from.2).map_err(|e| e.to_string())?
@@ -145,16 +147,19 @@ fn int_push(v: i32, cp: &mut ConstantPool) -> Result<Instruction, String> {
     })
 }
 
-/// Resolve a method/interface-method ref constant to `(owner-internal-name, name, descriptor)`.
-fn resolve_ref(cp: &ConstantPool, index: u16, iface: bool) -> Option<(String, String, String)> {
-    let (class_index, nat_index) = if iface {
-        cp.try_get_interface_method_ref(index).ok()?
-    } else {
-        cp.try_get_method_ref(index).ok()?
+/// Resolve a Methodref or InterfaceMethodref constant to `(is_interface, owner-internal-name, name, descriptor)`.
+/// Tries both kinds regardless of the calling opcode, since invokestatic/-special can reference either.
+fn resolve_ref(cp: &ConstantPool, index: u16) -> Option<(bool, String, String, String)> {
+    let (iface, class_index, nat_index) = match cp.try_get_method_ref(index) {
+        Ok((c, n)) => (false, *c, *n),
+        Err(_) => {
+            let (c, n) = cp.try_get_interface_method_ref(index).ok()?;
+            (true, *c, *n)
+        }
     };
-    let owner = cp.try_get_class(*class_index).ok()?.to_string();
-    let (name_index, desc_index) = cp.try_get_name_and_type(*nat_index).ok()?;
+    let owner = cp.try_get_class(class_index).ok()?.to_string();
+    let (name_index, desc_index) = cp.try_get_name_and_type(nat_index).ok()?;
     let name = cp.try_get_utf8(*name_index).ok()?.to_string();
     let desc = cp.try_get_utf8(*desc_index).ok()?.to_string();
-    Some((owner, name, desc))
+    Some((iface, owner, name, desc))
 }

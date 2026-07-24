@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ----------------------------------------------------------------------------------------------- manifest schema
 
@@ -53,6 +52,11 @@ struct PatchEntry {
     format: String,
     #[serde(default)]
     op: Vec<OpSpec>,
+    // Only meaningful for the (deferred) `krakatau-diff` format; accepted here so such a manifest parses and reaches the
+    // friendly "deferred" message rather than an opaque unknown-field error.
+    #[serde(default)]
+    #[allow(dead_code)]
+    file: Option<String>,
 }
 fn default_patch_format() -> String {
     "ops".to_string()
@@ -263,14 +267,15 @@ pub struct Options {
     pub no_verify_base: bool,
 }
 
-/// Apply `patches` (in order) to `payload`, writing the result to a temp jar and returning its path. Returns `Ok(None)`
-/// when `patches` is empty (caller uses the original payload). The caller owns cleanup of the returned temp path.
+/// Apply `patches` (in order) to `payload`, writing the result to a private temp jar. Returns the `NamedTempFile`
+/// (whose `.path()` the caller feeds to the pack pipeline) — it deletes itself when dropped. `Ok(None)` when `patches`
+/// is empty (caller uses the original payload).
 pub fn apply_patches<F: FnMut(&str)>(
     payload: &Path,
     patches: &[PathBuf],
     opts: &Options,
     mut log: F,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<tempfile::NamedTempFile>, String> {
     if patches.is_empty() {
         return Ok(None);
     }
@@ -297,9 +302,14 @@ pub fn apply_patches<F: FnMut(&str)>(
     }
 
     let out_bytes = jar.write()?;
-    let tmp = std::env::temp_dir().join(format!("mcgraft-patched-{}.jar", std::process::id()));
-    std::fs::write(&tmp, &out_bytes).map_err(|e| format!("write patched jar {}: {e}", tmp.display()))?;
-    log(&format!("patched payload → {} ({} KiB)", tmp.display(), out_bytes.len() / 1024));
+    let mut tmp = tempfile::Builder::new()
+        .prefix("mcgraft-patched-")
+        .suffix(".jar")
+        .tempfile()
+        .map_err(|e| format!("create temp jar: {e}"))?;
+    tmp.write_all(&out_bytes).map_err(|e| format!("write patched jar: {e}"))?;
+    tmp.flush().ok();
+    log(&format!("patched payload → {} ({} KiB)", tmp.path().display(), out_bytes.len() / 1024));
     Ok(Some(tmp))
 }
 
@@ -388,6 +398,7 @@ fn apply_one<F: FnMut(&str)>(
                 return Err(format!("patch {patch_name}: rename target '{}' already exists", r.to));
             }
             Some(b) => {
+                reject_unsafe_entry(&r.to)?;
                 jar.remove(&r.from);
                 jar.put(&r.to, b);
                 claim(written, &r.to, patch_name, man.apply.on_conflict, log)?;
@@ -399,6 +410,7 @@ fn apply_one<F: FnMut(&str)>(
     // overlay/: every file under it replaces (or adds) the same jar path.
     for rel in src.list_under("overlay") {
         let Some(bytes) = src.read(&format!("overlay/{rel}")) else { continue };
+        reject_unsafe_entry(&rel)?;
         claim(written, &rel, patch_name, man.apply.on_conflict, log)?;
         let verb = if jar.file(&rel).is_some() { "replace" } else { "add" };
         jar.put(&rel, bytes);
@@ -599,8 +611,6 @@ fn json_merge(target: &mut Value, patch: &Value) {
 
 // ----------------------------------------------------------------------------------------------- Krakatau assembly
 
-static KRAK_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Locate the `krak2` binary: `MCGRAFT_KRAK2` override, else the embedded copy (if this build bundled one), else `krak2`
 /// on `PATH`. Only called when a patch actually contains Krakatau assembly, so overlay/JSON/ops patches never need it.
 fn krak2_bin() -> Result<PathBuf, String> {
@@ -625,45 +635,51 @@ fn krak2_bin() -> Result<PathBuf, String> {
         .into())
 }
 
-/// Extract the build-time-embedded `krak2` to a temp file once and return its path.
+/// Extract the build-time-embedded `krak2` to a private temp file once and return its path. The `NamedTempFile` is kept
+/// alive for the process lifetime in the `OnceLock` (so the path stays valid to exec) and is created with an
+/// unpredictable mkstemp name + O_EXCL, avoiding the predictable-temp-file hazard.
 #[cfg(embed_krak2)]
 fn embedded_krak2() -> Result<PathBuf, String> {
     use std::sync::OnceLock;
-    static EXTRACTED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    EXTRACTED
-        .get_or_init(|| {
-            static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_KRAK2_EMBEDDED"));
-            let path = std::env::temp_dir().join(format!("mcgraft-krak2-{}", std::process::id()));
-            std::fs::write(&path, BYTES).map_err(|e| format!("extract embedded krak2: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| format!("chmod embedded krak2: {e}"))?;
-            }
-            Ok(path)
-        })
-        .clone()
+    // Keep a TempPath (not NamedTempFile): the file persists for the process (deleted on exit) but its writable fd is
+    // CLOSED — Linux refuses to exec a file that still has an open writable descriptor (ETXTBSY).
+    static EXTRACTED: OnceLock<Result<tempfile::TempPath, String>> = OnceLock::new();
+    match EXTRACTED.get_or_init(|| {
+        static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_KRAK2_EMBEDDED"));
+        let mut tmp = tempfile::Builder::new()
+            .prefix("mcgraft-krak2-")
+            .tempfile()
+            .map_err(|e| format!("extract embedded krak2: {e}"))?;
+        tmp.write_all(BYTES).map_err(|e| format!("extract embedded krak2: {e}"))?;
+        tmp.flush().ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod embedded krak2: {e}"))?;
+        }
+        Ok(tmp.into_temp_path()) // closes the fd, keeps the file on disk
+    }) {
+        Ok(tp) => Ok(tp.to_path_buf()),
+        Err(e) => Err(e.clone()),
+    }
 }
 
 /// Assemble one Krakatau `.j` source into its class(es); returns `(internal-name, class-bytes)` per class. A `.j` may
 /// declare more than one class; each is placed by its declared name (the `.class` directive), not any filename.
 fn assemble_j(j_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let bin = krak2_bin()?;
-    let seq = KRAK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stem = std::env::temp_dir().join(format!("mcgraft-krak-{}-{seq}", std::process::id()));
-    let in_j = stem.with_extension("j");
-    let out_jar = stem.with_extension("jar");
+    // A private temp dir (mkdtemp: unpredictable name, not attacker-guessable) holding the .j input and .jar output;
+    // it and its contents are removed when `dir` drops.
+    let dir = tempfile::Builder::new().prefix("mcgraft-krak-").tempdir().map_err(|e| format!("temp dir: {e}"))?;
+    let in_j = dir.path().join("in.j");
+    let out_jar = dir.path().join("out.jar");
     std::fs::write(&in_j, j_bytes).map_err(|e| format!("write temp .j: {e}"))?;
-    let run = Command::new(&bin).arg("asm").arg("--out").arg(&out_jar).arg(&in_j).output();
-    let _ = std::fs::remove_file(&in_j);
-    let run = run.map_err(|e| format!("run krak2: {e}"))?;
+    let run = Command::new(&bin).arg("asm").arg("--out").arg(&out_jar).arg(&in_j).output().map_err(|e| format!("run krak2: {e}"))?;
     if !run.status.success() {
-        let _ = std::fs::remove_file(&out_jar);
         return Err(format!("krak2 asm failed: {}", String::from_utf8_lossy(&run.stderr).trim()));
     }
     let jar_bytes = std::fs::read(&out_jar).map_err(|e| format!("read krak2 output: {e}"))?;
-    let _ = std::fs::remove_file(&out_jar);
     let mut zip = zip::ZipArchive::new(Cursor::new(jar_bytes)).map_err(|e| format!("krak2 output not a jar: {e}"))?;
     let mut classes = Vec::new();
     for i in 0..zip.len() {
@@ -692,10 +708,20 @@ fn apply_assembled<F: FnMut(&str)>(
 ) -> Result<(), String> {
     for (internal, bytes) in assemble_j(j_bytes)? {
         let path = format!("{internal}.class");
+        reject_unsafe_entry(&path)?;
         claim(written, &path, patch_name, policy, log)?;
         let verb = if jar.file(&path).is_some() { "replace" } else { "add" };
         jar.put(&path, bytes);
         log(&format!("  assemble {verb} {path}"));
+    }
+    Ok(())
+}
+
+/// Reject a jar entry name that is absolute or contains a `..`/backslash component. Entry names flow from patch content
+/// (overlay paths, rename targets, a `.j`'s declared class), so keep them well-formed jar paths defensively.
+fn reject_unsafe_entry(name: &str) -> Result<(), String> {
+    if name.starts_with('/') || name.contains('\\') || name.split('/').any(|c| c == "..") {
+        return Err(format!("unsafe patch entry name '{name}' (absolute path or ..-traversal)"));
     }
     Ok(())
 }
@@ -858,11 +884,13 @@ mod tests {
         let base_sha = hex(&Sha256::digest(&base));
         let opts = Options { no_verify_base: false };
         let mut log = |_: &str| {};
-        // [[patch]] bytecode section is rejected (deferred phase 2)
+        // [[patch]] krakatau-diff parses (has a `file` field) and reaches the friendly "deferred" message, not an
+        // opaque unknown-field TOML error.
         let mut z: HashMap<String, Vec<u8>> = HashMap::new();
-        z.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[[patch]]\nclass=\"x\"\nformat=\"krakatau-diff\"\nfile=\"x\"\n".to_vec());
+        z.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[[patch]]\nclass=\"com/x/Y\"\nformat=\"krakatau-diff\"\nfile=\"x.diff\"\n".to_vec());
         let mut jar = Jar::read(&base).unwrap();
-        assert!(apply_one(&mut jar, &Source::Zip(z.clone()), "p", &base_sha, None, &opts, &mut HashMap::new(), &mut log).is_err());
+        let err = apply_one(&mut jar, &Source::Zip(z.clone()), "p", &base_sha, None, &opts, &mut HashMap::new(), &mut log).unwrap_err();
+        assert!(err.contains("krakatau-diff"), "should hit the friendly deferred message, got: {err}");
         // sha256 base guard mismatch hard-fails
         let mut z2: HashMap<String, Vec<u8>> = HashMap::new();
         z2.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[target]\nsha256=\"deadbeef\"\n".to_vec());
@@ -870,5 +898,87 @@ mod tests {
         // ...but --no-verify-base overrides it
         let opts_off = Options { no_verify_base: true };
         assert!(apply_one(&mut jar, &Source::Zip(z2), "p", &base_sha, None, &opts_off, &mut HashMap::new(), &mut log).is_ok());
+    }
+
+    // A .mcpatch DIRECTORY bundle (Source::Dir + list_under) — previously only the zip path was tested.
+    #[test]
+    fn dir_bundle_pipeline() {
+        let base = jar_with(&[("fabric.mod.json", br#"{"id":"demo"}"#), ("keep.txt", b"k")]);
+        let base_sha = hex(&Sha256::digest(&base));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.toml"), b"[bundle]\nformat = 1\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("overlay/assets/demo")).unwrap();
+        std::fs::write(dir.path().join("overlay/assets/demo/x.txt"), b"X").unwrap();
+        let mut jar = Jar::read(&base).unwrap();
+        let opts = Options { no_verify_base: false };
+        let mut log = |_: &str| {};
+        apply_one(&mut jar, &Source::Dir(dir.path().to_path_buf()), "d", &base_sha, Some("demo"), &opts, &mut HashMap::new(), &mut log).unwrap();
+        assert_eq!(jar.file("assets/demo/x.txt"), Some(&b"X"[..]), "dir overlay applied");
+        assert_eq!(jar.file("keep.txt"), Some(&b"k"[..]), "untouched");
+    }
+
+    #[test]
+    fn unsafe_entry_names_rejected() {
+        assert!(reject_unsafe_entry("assets/ok.txt").is_ok());
+        assert!(reject_unsafe_entry("/etc/passwd").is_err());
+        assert!(reject_unsafe_entry("../../escape").is_err());
+        assert!(reject_unsafe_entry("a/../../b").is_err());
+    }
+
+    // --- ristretto ops (need krak2 to assemble the fixture class; skip cleanly otherwise) ---
+    #[test]
+    fn ops_redirect_invoke() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind};
+        let j = b".class public com/demo/T\n.super java/lang/Object\n\
+                  .method public static now : ()J\n.code stack 2 locals 0\n\
+                  invokestatic Method java/lang/System currentTimeMillis ()J\nlreturn\n.end code\n.end method\n";
+        let cls = assemble_j(j).unwrap().remove(0).1;
+        let red = Op {
+            in_method: None,
+            kind: OpKind::RedirectInvoke {
+                from: ("java/lang/System".into(), "currentTimeMillis".into(), "()J".into()),
+                to: ("com/demo/Clock".into(), "now".into()),
+            },
+        };
+        let patched = apply_ops(&cls, std::slice::from_ref(&red)).unwrap();
+        assert!(ristretto_classfile::ClassFile::from_bytes(&patched).is_ok());
+        // the original call site is gone, so re-applying the same redirect now matches nothing -> error
+        assert!(apply_ops(&patched, std::slice::from_ref(&red)).is_err());
+    }
+
+    #[test]
+    fn ops_replace_const_str() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind};
+        let j = b".class public com/demo/S\n.super java/lang/Object\n\
+                  .method public static tag : ()Ljava/lang/String;\n.code stack 1 locals 0\nldc 'old'\nareturn\n.end code\n.end method\n";
+        let cls = assemble_j(j).unwrap().remove(0).1;
+        let op = |a: &str, b: &str| Op { in_method: None, kind: OpKind::ReplaceConstStr { from: a.into(), to: b.into() } };
+        let patched = apply_ops(&cls, &[op("old", "new")]).unwrap();
+        assert!(ristretto_classfile::ClassFile::from_bytes(&patched).is_ok());
+        assert!(apply_ops(&patched, &[op("old", "x")]).is_err(), "'old' gone");
+        assert!(apply_ops(&patched, &[op("new", "x")]).is_ok(), "'new' present");
+    }
+
+    // M2 regression: an op that matches nothing errors even when another op in the same patch matched.
+    #[test]
+    fn ops_every_op_must_match() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind};
+        let j = b".class public com/demo/C\n.super java/lang/Object\n\
+                  .method public static m : ()I\n.code stack 1 locals 0\nbipush 64\nireturn\n.end code\n.end method\n";
+        let cls = assemble_j(j).unwrap().remove(0).1;
+        let ops = [
+            Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 64, to: 256 } }, // matches
+            Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 99, to: 1 } },   // matches nothing
+        ];
+        assert!(apply_ops(&cls, &ops).is_err(), "an op matching nothing must fail even if another matched");
     }
 }

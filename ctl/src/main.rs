@@ -185,20 +185,7 @@ fn cmd_pack(a: PackArgs) {
         die(&format!("payload jar not found: {}", a.payload.display()));
     }
 
-    // Apply any user patches to the payload jar FIRST — a merge on fabric.mod.json must be visible to everything below
-    // (mod id, mixins, deps, entrypoints). The patched jar is a temp file we clean up after packing.
-    let patched = if a.patches.is_empty() {
-        None
-    } else {
-        let opts = patch::Options { no_verify_base: a.no_verify_base };
-        patch::apply_patches(&a.payload, &a.patches, &opts, |l| println!("{l}")).unwrap_or_else(|e| die(&e))
-    };
-    let payload: &Path = patched.as_deref().unwrap_or(&a.payload);
-
-    let info = modinfo::read_jar(payload).unwrap_or_else(|e| die(&e));
-    eprintln!("Payload: {}", info.summary());
-
-    // Locate the precompiled base jar.
+    // Resolve inputs that don't depend on the patched jar first, so a failure here can't leak a patched temp file.
     let base = a.base.clone().unwrap_or_else(|| {
         let repo = a
             .repo
@@ -208,7 +195,6 @@ fn cmd_pack(a: PackArgs) {
             .unwrap_or_else(|e| die(&e));
         repo.join("build/agent/mc-graft-base.jar")
     });
-
     let cfg = match &a.config {
         Some(p) => {
             let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
@@ -217,16 +203,26 @@ fn cmd_pack(a: PackArgs) {
         None => config::AgentConfig::default(),
     };
 
+    // Apply any user patches to the payload jar — a merge on fabric.mod.json must be visible to everything below (mod id,
+    // mixins, deps, entrypoints). `patched` is a NamedTempFile that deletes itself when it drops (all exit paths below).
+    let patched = if a.patches.is_empty() {
+        None
+    } else {
+        let opts = patch::Options { no_verify_base: a.no_verify_base };
+        patch::apply_patches(&a.payload, &a.patches, &opts, |l| println!("{l}")).unwrap_or_else(|e| die(&e))
+    };
+    let payload: &Path = patched.as_ref().map(|t| t.path()).unwrap_or(&a.payload);
+
+    let info = modinfo::read_jar(payload).unwrap_or_else(|e| die(&e));
+    eprintln!("Payload: {}", info.summary());
+
     let out = a.out.clone().unwrap_or_else(|| PathBuf::from(format!("{}-agent.jar", info.id)));
 
-    let result = pack::pack_agent(&base, payload, &info, &cfg, &out, |l| println!("{l}"));
-    if let Some(tmp) = &patched {
-        let _ = std::fs::remove_file(tmp); // best-effort cleanup of the patched temp jar
-    }
-    match result {
+    match pack::pack_agent(&base, payload, &info, &cfg, &out, |l| println!("{l}")) {
         Ok(()) => println!("\nAgent packed (JDK-free): {}", out.display()),
         Err(e) => die(&e),
     }
+    drop(patched); // delete the patched temp jar (also happens on normal scope-exit)
 }
 
 fn cmd_inject(a: InjectArgs) {

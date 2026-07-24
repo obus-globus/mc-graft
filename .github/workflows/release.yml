@@ -48,8 +48,11 @@ jobs:
           workspaces: ctl
       - name: Build krak2 (Krakatau) to embed
         working-directory: .
+        env:
+          KRAK2_COMMIT: ae49743af92bbab1684b19bb1bee22b0a64d8ce5   # pinned Krakatau v2 (do not float on branch HEAD)
         run: |
-          git clone --depth 1 --branch v2 https://github.com/Storyyeller/Krakatau /tmp/krakatau
+          git clone https://github.com/Storyyeller/Krakatau /tmp/krakatau
+          git -C /tmp/krakatau checkout "$KRAK2_COMMIT"
           cargo build --release --manifest-path /tmp/krakatau/Cargo.toml
       - name: Build mcgraft (embedding krak2 so .j patches are self-contained)
         env:
