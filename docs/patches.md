@@ -35,9 +35,12 @@ offsets as *logical instruction offsets* and recomputes byte offsets + frame del
 at any size. `set_return` writes a straight-line body (no frames needed) and drops the old StackMapTable. (All three
 verified end-to-end: patched classes load under `-Xverify:all` and return the new values.) No `krak2` needed for `ops`.
 
-**Deferred to phase 2:** the `krakatau-diff` `[[patch]]` format (the base-fragile *diff*-of-disassembly path — `ops`
-supersedes it for most needs) and RFC-6902 `jsonpatch`. Both are parsed and **rejected with a clear message** rather than
-silently ignored. See "Phase 2 risks" for why the *diff* approach is held back.
+**Shipped — RFC-6902 `jsonpatch`:** `[[merge]] kind = "jsonpatch"` applies a JSON Patch document (an array of
+add/remove/replace/move/copy/test ops with JSON pointers) via the `json-patch` crate — for precise array-element edits
+that RFC-7396 `merge` can't express.
+
+**Deferred:** only the `krakatau-diff` `[[patch]]` format (the base-fragile *diff*-of-disassembly path — the `ops` DSL
+supersedes it for most needs), parsed and **rejected with a clear message**. See "Phase 2 risks" for why it's held back.
 
 ## Input modes
 
@@ -210,8 +213,9 @@ phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *prim
 6. ✅ Ship `krak2` self-contained — `build.rs` embeds it via `include_bytes!` when built with
       `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2` (else runtime falls back to `MCGRAFT_KRAK2` / `PATH`). Release CI bundles it.
 7. ✅ `set_return` op (whole-body replacement; no frame-index adjustment needed).
-8. ⏳ Stack-changing ops (`insert_before`/`remove_call` — need frame-index adjustment); `ristretto` post-verify of
-      patched classes; RFC-6902 `jsonpatch`; the `krakatau-diff` `[[patch]]` format.
+8. ✅ RFC-6902 `jsonpatch` (`[[merge]] kind = "jsonpatch"`, via the `json-patch` crate).
+9. ⏳ Stack-changing ops (`insert_before`/`remove_call` — need frame-index adjustment); `ristretto` post-verify of
+      patched classes; the `krakatau-diff` `[[patch]]` format; cross-platform + non-blocking GUI pickers.
 
 ## Open questions (phase 2)
 

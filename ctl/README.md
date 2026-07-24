@@ -74,8 +74,8 @@ mcgraft pack -p yourmod.jar --patch tweaks.mcpatch --patch overlay.zip -o agent.
 Each `--patch` is a `.mcpatch` bundle (a directory or zip with a `manifest.toml`), a bare `.jar`/`.zip` overlay, or a
 bare Krakatau `.j` file. Supported (all JDK-free):
 
-- **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** (RFC-7396 JSON merge, e.g.
-  editing `fabric.mod.json`) — no external tools.
+- **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** — RFC-7396 JSON merge
+  (`kind = "merge"`, the default) or RFC-6902 JSON Patch (`kind = "jsonpatch"`) on e.g. `fabric.mod.json`. No external tools.
 - **Whole-class Krakatau assembly** — a bare `.j` file, or a bundle `new/` directory of `.j` files, assembled and
   added/replaced by declared class name. Uses `krak2`: released binaries **embed it** (built with
   `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2`); otherwise it's found via `MCGRAFT_KRAK2` or `PATH`. Only needed when a patch

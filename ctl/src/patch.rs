@@ -458,12 +458,6 @@ fn apply_one<F: FnMut(&str)>(
     }
 
     for mg in &man.merge {
-        if mg.kind != "merge" {
-            return Err(format!(
-                "patch {patch_name}: merge kind '{}' is not supported yet (only RFC-7396 'merge'); 'jsonpatch' is deferred",
-                mg.kind
-            ));
-        }
         let target = jar
             .file(&mg.path)
             .ok_or_else(|| format!("patch {patch_name}: merge target '{}' not found in payload", mg.path))?;
@@ -472,13 +466,27 @@ fn apply_one<F: FnMut(&str)>(
             .ok_or_else(|| format!("patch {patch_name}: merge file '{}' not found in bundle", mg.file))?;
         let mut doc: Value = serde_json::from_slice(target)
             .map_err(|e| format!("patch {patch_name}: merge target '{}' is not valid JSON: {e}", mg.path))?;
-        let overlay: Value = serde_json::from_slice(&patch_doc)
-            .map_err(|e| format!("patch {patch_name}: merge file '{}' is not valid JSON: {e}", mg.file))?;
-        json_merge(&mut doc, &overlay);
+        match mg.kind.as_str() {
+            "merge" => {
+                // RFC 7396 JSON Merge Patch.
+                let overlay: Value = serde_json::from_slice(&patch_doc)
+                    .map_err(|e| format!("patch {patch_name}: merge file '{}' is not valid JSON: {e}", mg.file))?;
+                json_merge(&mut doc, &overlay);
+            }
+            "jsonpatch" => {
+                // RFC 6902 JSON Patch (an array of add/remove/replace/move/copy/test ops).
+                let p: json_patch::Patch = serde_json::from_slice(&patch_doc).map_err(|e| {
+                    format!("patch {patch_name}: jsonpatch file '{}' is not a valid RFC-6902 patch: {e}", mg.file)
+                })?;
+                json_patch::patch(&mut doc, &p)
+                    .map_err(|e| format!("patch {patch_name}: applying jsonpatch '{}': {e}", mg.file))?;
+            }
+            other => return Err(format!("patch {patch_name}: merge kind '{other}' unknown (expected \"merge\" or \"jsonpatch\")")),
+        }
         let rendered = serde_json::to_vec_pretty(&doc).map_err(|e| format!("re-serialize {}: {e}", mg.path))?;
         claim(written, &mg.path, patch_name, man.apply.on_conflict, log)?;
         jar.put(&mg.path, rendered);
-        log(&format!("  merge {} <- {}", mg.path, mg.file));
+        log(&format!("  {} {} <- {}", mg.kind, mg.path, mg.file));
     }
 
     // [[patch]]: in-place bytecode edits on an existing class (last, so it sees any overlaid/new class).
@@ -842,6 +850,24 @@ mod tests {
         let fmj: Value = serde_json::from_slice(jar.file("fabric.mod.json").unwrap()).unwrap();
         assert_eq!(fmj["depends"]["fabric-api"], "*", "merge added");
         assert_eq!(fmj["depends"]["minecraft"], "*", "merge preserved");
+    }
+
+    // RFC-6902 jsonpatch via [[merge]] kind = "jsonpatch".
+    #[test]
+    fn jsonpatch_rfc6902() {
+        let base = jar_with(&[("fabric.mod.json", br#"{"id":"demo","depends":{"minecraft":"*"}}"#)]);
+        let base_sha = hex(&Sha256::digest(&base));
+        let mut z: HashMap<String, Vec<u8>> = HashMap::new();
+        z.insert("manifest.toml".into(), b"[bundle]\nformat=1\n[[merge]]\npath=\"fabric.mod.json\"\nfile=\"p.json\"\nkind=\"jsonpatch\"\n".to_vec());
+        z.insert("p.json".into(), br#"[{"op":"add","path":"/depends/fabric-api","value":"*"},{"op":"replace","path":"/id","value":"demo2"}]"#.to_vec());
+        let mut jar = Jar::read(&base).unwrap();
+        let opts = Options { no_verify_base: false };
+        let mut log = |_: &str| {};
+        apply_one(&mut jar, &Source::Zip(z), "p", &base_sha, None, &opts, &mut HashMap::new(), &mut log).unwrap();
+        let fmj: Value = serde_json::from_slice(jar.file("fabric.mod.json").unwrap()).unwrap();
+        assert_eq!(fmj["id"], "demo2", "replace op");
+        assert_eq!(fmj["depends"]["fabric-api"], "*", "add op");
+        assert_eq!(fmj["depends"]["minecraft"], "*", "untouched");
     }
 
     #[test]
