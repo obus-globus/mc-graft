@@ -52,6 +52,8 @@ struct App {
     agent_name: String,
     build_mode: BuildMode,
     base_jar: String,
+    patches: Vec<String>,       // payload patch bundles/overlays applied before packing (no-JDK path)
+    no_verify_base: bool,       // ignore each patch's [target] base guard
     // inject inputs
     agent_jar: String,
     game_dir: GameDir,
@@ -96,6 +98,8 @@ impl App {
             agent_name: "mc-graft-agent.jar".into(),
             build_mode,
             base_jar: base_jar.map(|p| p.display().to_string()).unwrap_or_default(),
+            patches: Vec::new(),
+            no_verify_base: false,
             agent_jar: String::new(),
             game_dir: GameDir::ClientDir,
             custom_dir: String::new(),
@@ -246,7 +250,7 @@ impl App {
             self.log_line("[warn] no base jar — build it once with `./gradlew agentBase`, or point 'Base jar' at mc-graft-base.jar");
             return;
         }
-        let info = match &self.payload_info {
+        let info0 = match &self.payload_info {
             Some(Ok(m)) => m.clone(),
             _ => {
                 self.log_line("[warn] payload is not a readable Fabric mod jar");
@@ -263,6 +267,13 @@ impl App {
             let _ = std::fs::create_dir_all(d);
         }
         let cfg = self.cfg.clone();
+        let patches: Vec<PathBuf> = self
+            .patches
+            .iter()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        let no_verify_base = self.no_verify_base;
 
         self.busy = true;
         self.status = "Packing agent (no JDK)…".into();
@@ -270,14 +281,31 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let tx2 = tx.clone();
-            let ctx2 = ctx.clone();
-            let res = crate::pack::pack_agent(&base, &payload, &info, &cfg, &out, |l| {
-                let _ = tx2.send(Msg::Line(l.to_string()));
-                ctx2.request_repaint();
-            })
-            .map(|()| out.clone());
-            let _ = tx.send(Msg::BuildDone(res));
+            let (tx_a, ctx_a) = (tx.clone(), ctx.clone());
+            let (tx_b, ctx_b) = (tx.clone(), ctx.clone());
+            let result: Result<PathBuf, String> = (|| {
+                // Apply patches to the payload first — a merge on fabric.mod.json changes the mod info below.
+                let patched = if patches.is_empty() {
+                    None
+                } else {
+                    crate::patch::apply_patches(&payload, &patches, &crate::patch::Options { no_verify_base }, |l| {
+                        let _ = tx_a.send(Msg::Line(l.to_string()));
+                        ctx_a.request_repaint();
+                    })?
+                };
+                let effective = patched.as_deref().unwrap_or(&payload);
+                let info = if patched.is_some() { crate::modinfo::read_jar(effective)? } else { info0.clone() };
+                let r = crate::pack::pack_agent(&base, effective, &info, &cfg, &out, |l| {
+                    let _ = tx_b.send(Msg::Line(l.to_string()));
+                    ctx_b.request_repaint();
+                })
+                .map(|()| out.clone());
+                if let Some(tmp) = &patched {
+                    let _ = std::fs::remove_file(tmp); // best-effort cleanup of the patched temp jar
+                }
+                r
+            })();
+            let _ = tx.send(Msg::BuildDone(result));
             ctx.request_repaint();
         });
     }
@@ -461,6 +489,42 @@ impl eframe::App for App {
                         ui.colored_label(egui::Color32::from_rgb(220, 170, 60),
                             "base jar not found — build once with ./gradlew agentBase (JDK), then packing is JDK-free");
                     }
+                    // Payload patches: applied to the mod jar before packing (overlay / delete / rename / JSON merge).
+                    egui::CollapsingHeader::new(format!("Patches ({})", self.patches.len()))
+                        .default_open(!self.patches.is_empty())
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Add bundle/zip…").clicked() {
+                                    if let Some(f) = rfd::FileDialog::new()
+                                        .add_filter("patch", &["mcpatch", "zip", "jar"]).pick_file()
+                                    {
+                                        self.patches.push(f.display().to_string());
+                                    }
+                                }
+                                if ui.button("Add folder…").clicked() {
+                                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                        self.patches.push(d.display().to_string());
+                                    }
+                                }
+                                ui.checkbox(&mut self.no_verify_base, "No base guard")
+                                    .on_hover_text("Ignore each patch's [target] sha256/mod-id base guard.");
+                            });
+                            let mut remove: Option<usize> = None;
+                            for (i, p) in self.patches.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✕").on_hover_text("remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                    ui.label(egui::RichText::new(p).monospace());
+                                });
+                            }
+                            if let Some(i) = remove {
+                                self.patches.remove(i);
+                            }
+                            if self.patches.is_empty() {
+                                ui.weak("Applied to the payload jar before packing, in order: overlay / delete / rename / JSON merge.");
+                            }
+                        });
                 }
                 // Config preset (bundled examples/* + load-from-file) — pre-fills the Advanced fields below.
                 ui.horizontal(|ui| {
