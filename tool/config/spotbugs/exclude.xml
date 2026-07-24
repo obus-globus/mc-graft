@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SpotBugs exclusions for the standalone injector tool (Swing UI + subprocess attach launcher). Keep tight — prefer
+     fixing over muting. -->
+<FindBugsFilter>
+
+    <!-- Reading a NATIVE subprocess's stdout (Windows `tasklist`, the jattach binary): the platform default charset is
+         the correct decoding for OS-command output, so DM_DEFAULT_ENCODING is intentional here (unlike UTF-8 text files). -->
+    <Match><Bug pattern="DM_DEFAULT_ENCODING"/></Match>
+
+    <!-- Best-effort UI/reflection probes deliberately swallow exceptions (fall back to a default); the code marks each. -->
+    <Match><Bug pattern="DE_MIGHT_IGNORE,REC_CATCH_EXCEPTION"/></Match>
+
+    <!-- defaultAgentPath(): a null ProtectionDomain/CodeSource/Location dereferences into the surrounding
+         catch(RuntimeException), which falls back to the bare jar name — the null path is guarded, not a live NPE. -->
+    <Match>
+        <Method name="defaultAgentPath"/>
+        <Bug pattern="NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE"/>
+    </Match>
+
+</FindBugsFilter>

@@ -1,5 +1,10 @@
+import com.github.spotbugs.snom.Confidence
+import com.github.spotbugs.snom.Effort
+import com.github.spotbugs.snom.SpotBugsTask
+
 plugins {
     application
+    id("com.github.spotbugs") version "6.1.7"   // Java linter (bug-pattern static analysis; see config/spotbugs/)
 }
 
 // Standalone injector window / attach launcher. Depends only on the JDK (com.sun.tools.attach when the jdk.attach
@@ -24,6 +29,25 @@ tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     // JdkAttacher references com.sun.tools.attach; make the jdk.attach module visible to the unnamed module at compile.
     options.compilerArgs.addAll(listOf("--add-modules", "jdk.attach"))
+}
+
+// SpotBugs — the Java linter for the standalone tool (same policy as the root build). Java 17 bytecode, so the stock
+// tool ASM reads it fine (no version override needed). Run `./gradlew spotbugsMain`; report in build/reports/spotbugs/.
+spotbugs {
+    toolVersion.set("4.9.3")
+    effort.set(Effort.MAX)
+    reportLevel.set(Confidence.MEDIUM)
+    excludeFilter.set(file("config/spotbugs/exclude.xml"))
+    ignoreFailures.set(false)
+}
+tasks.withType<SpotBugsTask>().configureEach {
+    reports.create("html") { required.set(true) }
+    reports.create("xml") { required.set(false) }
+}
+// The tool's own classes are Java 17, but SpotBugs also scans REFERENCED JDK classes (Swing, java.lang.*), which are
+// v69 when analysis runs on a JDK 25. Force ASM 9.8 (reads v69) onto the spotbugs classpath so those don't error.
+configurations.matching { it.name == "spotbugs" }.configureEach {
+    resolutionStrategy.eachDependency { if (requested.group == "org.ow2.asm") useVersion("9.8") }
 }
 
 tasks.jar {

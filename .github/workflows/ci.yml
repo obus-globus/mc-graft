@@ -50,6 +50,46 @@ jobs:
           path: build/reports/spotbugs/
           if-no-files-found: ignore
 
+  # Build + lint the standalone injector tool (its own Gradle build under tool/). Java 17 bytecode; no Minecraft/LB dep.
+  tool:
+    name: Tool (Gradle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tool
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build jar
+        run: ./gradlew jar --no-daemon --console=plain
+
+      - name: Lint (SpotBugs)
+        run: ./gradlew spotbugsMain --no-daemon --console=plain
+
+      - name: Upload tool jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: injector-tool
+          path: tool/build/libs/liquidbounce-injector-tool.jar
+          if-no-files-found: error
+
+      - name: Upload SpotBugs report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spotbugs-report-tool
+          path: tool/build/reports/spotbugs/
+          if-no-files-found: ignore
+
   # Build, lint and test the Rust control app (CLI + GUI).
   ctl:
     name: ctl (Rust)

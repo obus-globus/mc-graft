@@ -329,7 +329,7 @@ public final class InjectorUi extends JFrame {
         long startOffset = logFile.length();
         String successMarker = "initialization completed";
         logTailWorker = new SwingWorker<>() {
-            private boolean sawSuccess;
+            private volatile boolean sawSuccess;   // written on the worker thread, read in done() on the EDT
 
             @Override protected Void doInBackground() throws Exception {
                 long deadline = System.currentTimeMillis() + 5 * 60_000L;
