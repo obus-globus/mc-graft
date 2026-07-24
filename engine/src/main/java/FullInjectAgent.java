@@ -24,6 +24,7 @@ public class FullInjectAgent {
     static final Map<String,Boolean> npMethod = new ConcurrentHashMap<>();         // owner#name desc -> non-public?
     static final Set<String> INACC = ConcurrentHashMap.newKeySet();                // already-loaded package-private MC classes the payload references by type
     static final Set<String> preBootstrapLb = ConcurrentHashMap.newKeySet();       // payload classes present before normal on-load caller rewriting
+    static Set<String> GENUINE_IFACES = java.util.Collections.emptySet();          // interfaces a real (non-mixin) bundle class implements; ∩ GIFACE -> shared duck interfaces
     /** per-target conversion: target' bytes + sidecar/state (defined LAZILY in the CFT with the target's real PD). */
     static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; volatile boolean defined;
         boolean define(ProtectionDomain pd){ synchronized(this){ if(defined) return true;
@@ -52,6 +53,7 @@ public class FullInjectAgent {
         Path lbBundle = PLATFORM.stageBundle(inst, self);
         final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
         RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(lbBundle, cfg.callerRewritePackages);
+        GENUINE_IFACES = scanGenuineImplementors(lbBundle, cfg.callerRewritePackages);
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
@@ -91,6 +93,11 @@ public class FullInjectAgent {
             txMap.put(internal, new byte[][]{O, X}); RetransformConverter.collectAdded(internal, O, X, gadded, gfield, giface);
         } catch (Throwable e) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TRANSFORM_FAILURE",internal,"target",rootMsg(e)); InjectionLogger.error("transform fail "+internal+" -> "+rootMsg(e)); } }
         RetransformConverter.GADDED = gadded; RetransformConverter.GFIELD = gfield; RetransformConverter.GIFACE = giface;
+        // A mixin-added interface that a REAL bundle class also implements is "shared": keep it (phantom) instead of
+        // erasing it, and route its sites through DuckDispatch (which discriminates genuine implementors from ducks).
+        Set<String> shared = new HashSet<>(giface.keySet()); shared.retainAll(GENUINE_IFACES);
+        RetransformConverter.SHARED_IFACES = shared;
+        if (!shared.isEmpty()) InjectionLogger.info("shared duck interfaces (phantom, guarded dispatch): " + shared);
         InjectionLogger.info("phase A: "+txMap.size()+" transformed; global added-methods="+gadded.size()+" added-fields="+gfield.size());
         // Phase B: stage every conversion against the complete global tables.
         int conv=0, eager=0; List<String> skipped=new ArrayList<>();
@@ -321,6 +328,56 @@ public class FullInjectAgent {
         InjectionLogger.info("payload classes indexed: " + names.size()
             + (callerRewritePackages.isEmpty() ? "" : " (incl. bundled-library classes under " + callerRewritePackages + ")"));
         return names;
+    }
+
+    /** Lightweight class-header reader: name, superclass, direct super-interfaces, and whether it is a @Mixin. */
+    static final class Hdr extends org.objectweb.asm.ClassVisitor {
+        String name, superName; String[] ifaces; boolean mixin;
+        Hdr() { super(org.objectweb.asm.Opcodes.ASM9); }
+        public void visit(int v, int a, String n, String sig, String sup, String[] is) { name = n; superName = sup; ifaces = is; }
+        public org.objectweb.asm.AnnotationVisitor visitAnnotation(String desc, boolean vis) {
+            if ("Lorg/spongepowered/asm/mixin/Mixin;".equals(desc)) mixin = true; return null;
+        }
+    }
+
+    /** Every interface that a REAL (non-@Mixin) class in the staged bundle genuinely implements, transitively. Later
+     *  intersected with the mixin-ADDED interface set (GIFACE) to find the "shared" interfaces: those a payload mixin
+     *  adds to an MC target AND a real bundle class also implements, so a value of that type may be either kind at
+     *  runtime and the interface must be kept (phantom) rather than erased. Scans the payload jar + its jar-in-jar
+     *  library modules under the caller-rewrite prefixes (the libraries whose mixins are applied). */
+    static Set<String> scanGenuineImplementors(Path payloadJar, List<String> callerRewritePackages) {
+        Map<String,String[]> ifaces = new HashMap<>(); Map<String,String> supers = new HashMap<>(); Set<String> mixins = new HashSet<>();
+        java.util.function.BiConsumer<String,byte[]> parse = (n, b) -> { try {
+            Hdr h = new Hdr(); new ClassReader(b).accept(h, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            if (h.name == null) return;
+            ifaces.put(h.name, h.ifaces == null ? new String[0] : h.ifaces);
+            if (h.superName != null) supers.put(h.name, h.superName);
+            if (h.mixin) mixins.add(h.name);
+        } catch (Throwable ignore) {} };
+        try (JarFile jf = new JarFile(payloadJar.toFile())) {
+            for (var en = jf.entries(); en.hasMoreElements();) { var e = en.nextElement(); String n = e.getName();
+                if (n.endsWith(".class")) { try (var in = jf.getInputStream(e)) { parse.accept(n, in.readAllBytes()); } catch (Throwable ignore) {} }
+                else if (!callerRewritePackages.isEmpty() && n.startsWith("META-INF/jars/") && n.endsWith(".jar")) {
+                    try (var in = jf.getInputStream(e); var jin = new java.util.jar.JarInputStream(in)) {
+                        for (java.util.jar.JarEntry je; (je = jin.getNextJarEntry()) != null; ) { String cn = je.getName();
+                            if (!cn.endsWith(".class")) continue; String internal = cn.substring(0, cn.length() - 6);
+                            boolean inScope = false; for (String pre : callerRewritePackages) if (internal.startsWith(pre)) { inScope = true; break; }
+                            if (inScope) { try { parse.accept(cn, jin.readAllBytes()); } catch (Throwable ignore) {} }
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            }
+        } catch (Throwable t) { InjectionLogger.warn("genuine-implementor scan failed: " + rootMsg(t)); return java.util.Collections.emptySet(); }
+        Set<String> genuine = new HashSet<>();
+        for (String cls : ifaces.keySet()) {
+            if (mixins.contains(cls)) continue;   // a @Mixin's `implements IFoo` is the duck declaration, not a genuine impl
+            ArrayDeque<String> stack = new ArrayDeque<>(); Set<String> seen = new HashSet<>(); stack.push(cls);
+            while (!stack.isEmpty()) { String cur = stack.pop(); if (!seen.add(cur) || seen.size() > 4096) continue;
+                String[] is = ifaces.get(cur); if (is != null) for (String i : is) { genuine.add(i); stack.push(i); }
+                String sup = supers.get(cur); if (sup != null) stack.push(sup);
+            }
+        }
+        return genuine;
     }
 
     static long tRebase, tVerify; static int nRebase;   // per-class CFT cost instrumentation (retransform window)

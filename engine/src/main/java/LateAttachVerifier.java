@@ -154,7 +154,10 @@ public final class LateAttachVerifier {
             scanDesc(owner,artifact,method,h.getDesc(),di);
             if(h.getTag()>=Opcodes.H_GETFIELD&&h.getTag()<=Opcodes.H_PUTSTATIC)checkField(owner,artifact,method,h.getOwner(),h.getName(),h.getDesc(),rf);
             else checkMethod(owner,artifact,method,h.getOwner(),h.getName(),h.getDesc(),rm);
-            if(di.containsKey(h.getOwner()))add("ERROR","BOOTSTRAP_RESIDUAL_REF",owner,artifact,method,h.toString());
+            // A handle onto a SHARED interface method (a method-ref like IFoo::m) resolves against the real interface,
+            // which still exists; only a PURE-duck interface handle is a genuine residual. (A method-ref invoked on a
+            // de-implemented duck receiver would still ICCE at runtime — a known gap for pure method-refs.)
+            if(di.containsKey(h.getOwner()) && !RetransformConverter.isSharedIface(h.getOwner()))add("ERROR","BOOTSTRAP_RESIDUAL_REF",owner,artifact,method,h.toString());
         } else if(x instanceof ConstantDynamic cd) {
             scanDesc(owner,artifact,method,cd.getDescriptor(),di);
             inspectConst(owner,artifact,method,cd.getBootstrapMethod(),rm,rf,di,true);
@@ -181,8 +184,11 @@ public final class LateAttachVerifier {
         // satisfies it. A pre-existing/vanilla interface a mixin merely also implements still exists as a type with
         // real implementors, so a descriptor mentioning it is legal (its instanceof/cast/invokeinterface sites on the
         // de-implemented class are caught precisely + rewritten separately).
+        // A SHARED payload interface (genuinely implemented by a real bundle class) is NOT erased from descriptors:
+        // per JVMS the interface type verifies like Object, and its checked sites are routed through DuckDispatch. So a
+        // descriptor mentioning it is legal — only a PURE-duck payload interface (no genuine implementor) is a problem.
         for(String iface:dropped.keySet())
-            if(RetransformConverter.isPayloadIface(iface) && desc.contains("L"+iface+";"))
+            if(RetransformConverter.isPayloadIface(iface) && !RetransformConverter.isSharedIface(iface) && desc.contains("L"+iface+";"))
                 add("ERROR","DROPPED_INTERFACE_DESCRIPTOR",owner,artifact,method,desc);
     }
 

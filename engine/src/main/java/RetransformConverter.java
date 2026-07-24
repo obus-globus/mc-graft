@@ -383,6 +383,7 @@ public class RetransformConverter {
      *  interfaces still exist as types and are left untouched. */
     static String eraseIfaceInternal(String internal) {
         if (GIFACE == null || internal == null || !GIFACE.containsKey(internal) || !isPayloadIface(internal)) return internal;
+        if (isSharedIface(internal)) return internal;   // shared: keep the interface (phantom); sites route via DuckDispatch
         List<String[]> impls = GIFACE.get(internal);
         return (impls != null && impls.size() == 1) ? impls.get(0)[0] : "java/lang/Object";
     }
@@ -433,6 +434,13 @@ public class RetransformConverter {
     public static volatile Set<String> PAYLOAD_CLASSES = java.util.Collections.emptySet();
     /** True if the mixin-added interface is one the payload itself defines (vs a pre-existing runtime interface). */
     public static boolean isPayloadIface(String internal) { return PAYLOAD_CLASSES.contains(internal); }
+    /** Payload duck interfaces that are ALSO genuinely implemented by a real (non-mixin) bundle class — i.e. at runtime
+     *  a value of this interface type may be a genuine implementor OR a de-implemented (duck) target. Such interfaces
+     *  are NOT erased from descriptors ("phantom": the interface type is legal per JVMS since it verifies like Object);
+     *  their cast/instanceof/invokeinterface sites are always routed through DuckDispatch, which discriminates per
+     *  receiver (real interface call for genuine implementors, sidecar for duck targets). */
+    public static volatile Set<String> SHARED_IFACES = java.util.Collections.emptySet();
+    public static boolean isSharedIface(String internal) { return SHARED_IFACES.contains(internal); }
     String[] addedFieldTarget(String owner, String name, String desc) {
         if (GFIELD == null) return null;
         for (String c = owner; c != null && !c.equals("java/lang/Object"); c = superOf(c)) { String[] g = GFIELD.get(gkey(c, name, desc)); if (g != null) return g; }
@@ -496,7 +504,7 @@ public class RetransformConverter {
             if (GIFACE != null && p instanceof TypeInsnNode gti && GIFACE.containsKey(gti.desc)
                     && (gti.getOpcode() == Opcodes.CHECKCAST || gti.getOpcode() == Opcodes.INSTANCEOF)) {
                 List<String[]> impls = GIFACE.get(gti.desc);
-                if (impls.size() == 1) {
+                if (impls.size() == 1 && !isSharedIface(gti.desc)) {
                     gti.desc = impls.get(0)[0];
                 } else if (gti.getOpcode() == Opcodes.CHECKCAST) {
                     InsnList suffix = new InsnList(); suffix.add(new LdcInsnNode(gti.desc));
@@ -510,7 +518,7 @@ public class RetransformConverter {
                 }
             } else if (GIFACE != null && p instanceof MethodInsnNode gmi && gmi.getOpcode() == Opcodes.INVOKEINTERFACE && GIFACE.containsKey(gmi.owner)) {
                 List<String[]> impls = GIFACE.get(gmi.owner);
-                if (impls.size() == 1) {
+                if (impls.size() == 1 && !isSharedIface(gmi.owner)) {
                     String[] ts = impls.get(0);
                     m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + gmi.name, "(L" + ts[0] + ";" + gmi.desc.substring(1), false));
                 } else {
@@ -770,7 +778,7 @@ public class RetransformConverter {
                 if (p instanceof TypeInsnNode ti && ifaceMap.containsKey(ti.desc)
                         && (ti.getOpcode() == Opcodes.CHECKCAST || ti.getOpcode() == Opcodes.INSTANCEOF)) {
                     String iface = ti.desc; List<String[]> impls = ifaceMap.get(iface);
-                    if (impls.size() == 1) ti.desc = impls.get(0)[0];
+                    if (impls.size() == 1 && !isSharedIface(iface)) ti.desc = impls.get(0)[0];
                     else if (ti.getOpcode() == Opcodes.CHECKCAST) {
                         InsnList call = new InsnList(); call.add(new LdcInsnNode(iface));
                         call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "cast",
@@ -785,7 +793,7 @@ public class RetransformConverter {
                     n++;
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() == Opcodes.INVOKEINTERFACE && ifaceMap.containsKey(mi.owner)) {
                     List<String[]> impls = ifaceMap.get(mi.owner);
-                    if (impls.size() == 1) {
+                    if (impls.size() == 1 && !isSharedIface(mi.owner)) {
                         String[] ts = impls.get(0);
                         m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + mi.name, "(L" + ts[0] + ";" + mi.desc.substring(1), false));
                     } else {
