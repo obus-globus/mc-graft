@@ -18,6 +18,18 @@ pub struct AttachResult {
     pub output: String,
 }
 
+/// Parse a trailing signed integer out of a line that mentions "return code" (case-insensitive). Shared by both paths.
+fn parse_return_code(line: &str) -> Option<i32> {
+    let low = line.to_ascii_lowercase();
+    if !low.contains("return code") {
+        return None;
+    }
+    let tail = &low[low.find("return code").unwrap()..];
+    tail.split(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .rfind(|s| !s.is_empty() && *s != "-")
+        .and_then(|s| s.parse::<i32>().ok())
+}
+
 #[cfg(unix)]
 pub use unix_impl::load_agent;
 
@@ -128,29 +140,70 @@ mod unix_impl {
         let output = String::from_utf8_lossy(&buf).into_owned();
 
         let jvm_status = output.lines().next().unwrap_or("").trim().parse::<i32>().unwrap_or(-1);
-        let agent_rc = output.lines().find_map(parse_return_code);
+        let agent_rc = output.lines().find_map(super::parse_return_code);
 
         Ok(AttachResult { jvm_status, agent_rc, output })
     }
-
-    /// Parse a trailing signed integer out of a line that mentions "return code" (case-insensitive).
-    fn parse_return_code(line: &str) -> Option<i32> {
-        let low = line.to_ascii_lowercase();
-        if !low.contains("return code") {
-            return None;
-        }
-        let tail = &low[low.find("return code").unwrap()..];
-        tail.split(|c: char| !(c.is_ascii_digit() || c == '-'))
-            .rfind(|s| !s.is_empty() && *s != "-")
-            .and_then(|s| s.parse::<i32>().ok())
-    }
 }
 
-/// Windows attach isn't implemented yet (it needs a named pipe + `CreateRemoteThread` into `jvm.dll`, unlike the Unix
-/// socket protocol). Build and `pack` work here; inject from a Unix host for now.
-#[cfg(not(unix))]
-pub fn load_agent(_pid: i32, _agent_jar: &std::path::Path, _agent_args: &str) -> Result<AttachResult, String> {
-    Err("inject (attach) is not supported on Windows yet — build/pack agents here and inject from a Linux/macOS host. \
-         Windows attach (named-pipe + CreateRemoteThread) is planned."
+/// Windows attach via `jattach` (a mature native tool that performs the named-pipe + `CreateRemoteThread` dance that
+/// differs from the Unix socket protocol). We shell out to it rather than hand-rolling the unsafe FFI. `jattach` is
+/// found via `MCGRAFT_JATTACH` or `jattach.exe` on `PATH`.
+///
+/// NOTE: this path is implemented and compiles/lints on Windows, but is not yet verified end-to-end against a running
+/// Windows Minecraft — treat it as experimental until confirmed on a real Windows host.
+#[cfg(windows)]
+pub fn load_agent(pid: i32, agent_jar: &std::path::Path, agent_args: &str) -> Result<AttachResult, String> {
+    let jar = agent_jar
+        .canonicalize()
+        .map_err(|e| format!("agent jar {}: {e}", agent_jar.display()))?;
+    let bin = jattach_bin()?;
+    let option = if agent_args.is_empty() {
+        jar.display().to_string()
+    } else {
+        format!("{}={}", jar.display(), agent_args)
+    };
+    // jattach <pid> load instrument false "<jar>[=<args>]" — the JVM's response is relayed to stdout.
+    let out = std::process::Command::new(&bin)
+        .arg(pid.to_string())
+        .arg("load")
+        .arg("instrument")
+        .arg("false")
+        .arg(&option)
+        .output()
+        .map_err(|e| format!("run jattach: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let combined = format!("{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        return Err(format!("jattach failed (exit {:?}): {}", out.status.code(), combined.trim()));
+    }
+    // First numeric line of stdout is the JVM command status; the agent rc is the "return code: N" line if present.
+    let jvm_status = stdout.lines().find_map(|l| l.trim().parse::<i32>().ok()).unwrap_or(0);
+    let agent_rc = combined.lines().find_map(parse_return_code);
+    Ok(AttachResult { jvm_status, agent_rc, output: combined })
+}
+
+#[cfg(windows)]
+fn jattach_bin() -> Result<std::path::PathBuf, String> {
+    if let Some(p) = std::env::var_os("MCGRAFT_JATTACH") {
+        let p = std::path::PathBuf::from(p);
+        return if p.is_file() { Ok(p) } else { Err(format!("MCGRAFT_JATTACH is not a file: {}", p.display())) };
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let c = dir.join("jattach.exe");
+            if c.is_file() {
+                return Ok(c);
+            }
+        }
+    }
+    Err("jattach not found — Windows inject needs jattach.exe on PATH or MCGRAFT_JATTACH set \
+         (from https://github.com/jattach/jattach). Windows attach is experimental / not yet verified end-to-end."
         .into())
+}
+
+/// Non-Unix, non-Windows (unlikely) — inject unsupported.
+#[cfg(not(any(unix, windows)))]
+pub fn load_agent(_pid: i32, _agent_jar: &std::path::Path, _agent_args: &str) -> Result<AttachResult, String> {
+    Err("inject is not supported on this platform".into())
 }

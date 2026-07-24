@@ -6,10 +6,11 @@ Minecraft JVMs, and **inject** the agent into a live one — as a **CLI** and a 
 The attach path is a pure-Rust implementation of the HotSpot dynamic-attach protocol (Unix socket + SIGQUIT trigger):
 no JNI, no bundled `jattach` binary, and it needs no JDK on the machine running it.
 
-**Platforms.** `build`/`pack` (incl. all patch features) run on **Linux, macOS, and Windows**. `inject` (attach) and JVM
-discovery are **Linux/macOS only** for now — they use the Unix-socket attach protocol; on Windows `inject` returns a
-clear "not yet supported" message (Windows attach needs a named pipe + `CreateRemoteThread`, planned). So on Windows you
-can pack patched agents and copy them to a Linux/macOS host to inject.
+**Platforms.** `build`/`pack` (incl. all patch features) run on **Linux, macOS, and Windows**. `inject` (attach) + JVM
+discovery are fully native on **Linux/macOS** (pure-Rust Unix-socket protocol). On **Windows**, `inject` shells out to
+[`jattach`](https://github.com/jattach/jattach) (put `jattach.exe` on `PATH` or set `MCGRAFT_JATTACH`) — this path is
+**experimental / not yet verified end-to-end against a running Windows Minecraft**, so treat it as beta. If you'd rather
+not, pack patched agents on Windows and inject them from a Linux/macOS host.
 
 ## Build
 
