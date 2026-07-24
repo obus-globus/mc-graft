@@ -341,6 +341,9 @@ public class FullInjectAgent {
         }
         if (cfg.mainEntrypoints.isEmpty() && cfg.clientEntrypoints.isEmpty())
             throw new IllegalStateException("payload '"+cfg.id+"' declares no fabric entrypoints and no event-bootstrap override; nothing to initialize");
+        // Applied dependency-module client entrypoints first (e.g. indigo registering the active renderer), best-effort.
+        for (String cn : cfg.depClientEntrypoints) { try { callEntrypoint(cn, "onInitializeClient"); }
+            catch (Throwable t) { InjectionLogger.warn("dependency-module entrypoint "+cn+" failed (best-effort, continuing): "+rootMsg(t)); } }
         for (String cn : cfg.mainEntrypoints) callEntrypoint(cn, "onInitialize");
         for (String cn : cfg.clientEntrypoints) callEntrypoint(cn, "onInitializeClient");
     }

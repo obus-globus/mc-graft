@@ -28,6 +28,9 @@ public final class PayloadConfig {
 
     public final String id, accessWidener;
     public final List<String> mixinConfigs, neoforgeMixins, mainEntrypoints, clientEntrypoints;
+    // Client entrypoints of APPLIED dependency modules (e.g. indigo's renderer registration), invoked best-effort
+    // before the payload's so their setup is ready — a non-essential one that fails must not abort the payload.
+    public final List<String> depClientEntrypoints;
     // Mixin configs from the payload's DEPENDENCY mods (e.g. fabric-api's own modules) that must also be applied under
     // late-attach — normally these apply at startup, but a late-attached fabric-api never patched the loaded MC classes.
     public final List<String> depMixinConfigs;
@@ -79,6 +82,7 @@ public final class PayloadConfig {
         neoforgeMixins = nf.isEmpty() ? mixinConfigs : nf;   // NeoForge-patched MC needs its own companion set if provided
         mainEntrypoints = csv(p.getProperty("payload.entrypoints.main", ""));
         clientEntrypoints = csv(p.getProperty("payload.entrypoints.client", ""));
+        depClientEntrypoints = csv(p.getProperty("payload.entrypoints.depClient", ""));
         evtManager = blankToNull(p.getProperty("bootstrap.event.manager", ""));
         evtManagerInstance = p.getProperty("bootstrap.event.managerInstance", "INSTANCE").trim();
         evtBase = blankToNull(p.getProperty("bootstrap.event.base", ""));

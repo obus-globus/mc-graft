@@ -173,3 +173,18 @@ BlockStateModel.particleMaterial(BlockAndTintGetter,BlockPos,BlockState) but the
 the no-arg particleMaterial(); BlockStateModel is NOT a mixin target, so this is a genuine MC-snapshot API
 mismatch (Xaero fabric-26.2-26.4.2 built against a later 26.2 than the harness jar) — environmental, would
 crash the same way under normal Fabric. Not a mc-graft limitation.
+
+### Xaero: particleMaterial was fabric-api (fixed); remaining = caller-rewrite fabric-api's own runtime
+The in-world NoSuchMethodError (BlockStateModel.particleMaterial 3-arg) was NOT an MC-version mismatch — it is a
+fabric-api method: a default on fabric-renderer-api's FabricBlockStateModel interface, injected into vanilla
+BlockStateModel by fabric-renderer-api-v1's BlockStateModelMixin. Applying that module resolves it. Doing so pulled
+in the section-batching redirect (needs a registered Renderer), fixed by a new packer feature: when a dependency
+module's mixins are applied, its client entrypoint is invoked too (best-effort, separate payload.entrypoints.depClient)
+— so indigo registers the active renderer. With lifecycle+xaerolib+renderer applied, indigo registered, the
+"rendering plug-in" + particleMaterial errors are gone and "New Xaero hud session initialized!" runs in-world.
+Remaining blocker: ClassCastException ClientLevel -> net.fabricmc.fabric.impl.event.lifecycle.LoadedChunksCache — a
+duck interface fabric-api's lifecycle mixin adds to (already-loaded, dropped) ClientLevel, cast by fabric-api's OWN
+runtime, which is not caller-rewritten (only the payload + bundled libraries are). Fixing it = caller-rewrite
+fabric-api's own classes (index the resolved fabric-api dep jar into the caller-rewrite set) = the review's Option 3a,
+the open-ended "port fabric-api's load-time contract to late-attach" effort, likely with further per-module cascades
+(each module's runtime casts + AW needs). Not pursued yet.
