@@ -78,7 +78,8 @@ jobs:
           if-no-files-found: error
 
   # Build jattach.exe with MSVC (cl) in an ISOLATED job — msvc-dev-cmd reorders PATH so Git's link.exe shadows the MSVC
-  # linker, which breaks Rust builds; keeping it out of the Rust job avoids that. (JATTACH_VERSION is optional — #ifdef.)
+  # linker, which breaks Rust builds; keeping it out of the Rust job avoids that. JATTACH_VERSION IS required (main() is
+  # inside #ifdef JATTACH_VERSION); the \"..\" quoting matches jattach's Makefile — cmd passes \" through, cl unescapes it.
   jattach-windows:
     name: Build jattach.exe
     runs-on: windows-latest
@@ -89,7 +90,7 @@ jobs:
         run: |
           git clone --branch v2.2 --depth 1 https://github.com/jattach/jattach jattach
           cd jattach
-          cl /O2 /D_CRT_SECURE_NO_WARNINGS /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
+          cl /O2 /D_CRT_SECURE_NO_WARNINGS /DJATTACH_VERSION=\"2.2\" /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
       - uses: actions/upload-artifact@v4
         with:
           name: jattach-windows
