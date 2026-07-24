@@ -5,6 +5,7 @@
 
 mod attach;
 mod build;
+mod config;
 mod gui;
 mod modinfo;
 mod procs;

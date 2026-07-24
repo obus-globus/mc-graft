@@ -2,7 +2,7 @@
 //! payload, and inject it into a running Minecraft — with a live log. Long operations run on background threads and
 //! stream lines back through a channel so the window never blocks.
 
-use crate::{attach, build, modinfo, procs};
+use crate::{attach, build, config, modinfo, procs};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -43,9 +43,10 @@ struct App {
     payload: String,
     payload_info: Option<Result<modinfo::ModInfo, String>>,
     info_for: String,
-    config: String,
+    cfg: config::AgentConfig,
+    presets: Vec<config::Preset>,
+    preset: String,
     agent_name: String,
-    deps: String,
     // inject inputs
     agent_jar: String,
     game_dir: GameDir,
@@ -63,6 +64,7 @@ impl App {
     fn new() -> Self {
         let (tx, rx) = channel();
         let repo = build::find_repo_root(None).ok();
+        let presets = repo.as_ref().map(|r| config::discover_presets(r)).unwrap_or_default();
         let mut app = App {
             jvms: Vec::new(),
             selected: None,
@@ -71,9 +73,10 @@ impl App {
             payload: String::new(),
             payload_info: None,
             info_for: String::new(),
-            config: String::new(),
+            cfg: config::AgentConfig::default(),
+            presets,
+            preset: "None".into(),
             agent_name: "mc-graft-agent.jar".into(),
-            deps: String::new(),
             agent_jar: String::new(),
             game_dir: GameDir::ClientDir,
             custom_dir: String::new(),
@@ -107,16 +110,16 @@ impl App {
                 if !m.id.is_empty() {
                     self.agent_name = format!("{}-agent.jar", m.id);
                 }
-                // A mod with no entrypoints needs a bootstrap override; use a bundled example if one matches its id.
-                if m.needs_bootstrap_config() && self.config.trim().is_empty() {
-                    if let Some(repo) = &self.repo {
-                        let ex = repo.join(format!("examples/{}/bootstrap.properties", m.id));
-                        if ex.is_file() {
-                            self.config = ex.display().to_string();
-                            self.log_line(format!("[info] {} has no entrypoint — using bundled config {}", m.id, ex.display()));
-                        } else {
-                            self.log_line(format!("[warn] {} has no fabric entrypoint; it likely needs a bootstrap config (none bundled for this id)", m.id));
+                // A mod with no entrypoints needs a bootstrap override; auto-apply a bundled preset if one matches its id.
+                if m.needs_bootstrap_config() && self.cfg.is_empty() {
+                    if let Some(p) = self.presets.iter().find(|p| p.name == m.id) {
+                        if let Ok(text) = std::fs::read_to_string(&p.path) {
+                            self.cfg = config::AgentConfig::from_properties(&text);
+                            self.preset = p.name.clone();
+                            self.log_line(format!("[info] {} has no entrypoint — applied bundled preset '{}'", m.id, p.name));
                         }
+                    } else {
+                        self.log_line(format!("[warn] {} has no fabric entrypoint; set the event bootstrap under Advanced (no bundled preset for this id)", m.id));
                     }
                 }
             }
@@ -175,11 +178,24 @@ impl App {
         self.busy = true;
         self.status = "Building agent…".into();
         self.log_line("---- build ----");
+        // Serialize the structured config to a temp .properties the build consumes (skip if nothing is set).
+        let bootstrap_config = if self.cfg.is_empty() {
+            None
+        } else {
+            let p = std::env::temp_dir().join("mcgraft-bootstrap.properties");
+            match std::fs::write(&p, self.cfg.to_properties()) {
+                Ok(()) => Some(p),
+                Err(e) => {
+                    self.log_line(format!("[warn] could not write temp config: {e}"));
+                    None
+                }
+            }
+        };
         let req = build::BuildRequest {
             payload: PathBuf::from(self.payload.trim()),
-            bootstrap_config: opt_path(&self.config),
+            bootstrap_config,
             mixin_targets: None,
-            payload_deps: opt_str(&self.deps),
+            payload_deps: None,
             agent_name: opt_str(&self.agent_name),
         };
         let tx = self.tx.clone();
@@ -357,14 +373,42 @@ impl eframe::App for App {
                         }
                     }
                 }
-                path_row(ui, "Bootstrap config (optional)", &mut self.config, &["properties"]);
                 ui.horizontal(|ui| {
                     ui.label("Agent name");
                     ui.text_edit_singleline(&mut self.agent_name);
                 });
+                // Config preset (bundled examples/* + load-from-file) — pre-fills the Advanced fields below.
                 ui.horizontal(|ui| {
-                    ui.label("Extra deps (maven coords, optional)");
-                    ui.text_edit_singleline(&mut self.deps);
+                    ui.label("Config preset");
+                    let cur = self.preset.clone();
+                    let mut load: Option<(String, config::AgentConfig)> = None;
+                    egui::ComboBox::from_id_source("preset").selected_text(&cur).show_ui(ui, |ui| {
+                        if ui.selectable_label(cur == "None", "None").clicked() {
+                            load = Some(("None".into(), config::AgentConfig::default()));
+                        }
+                        for p in &self.presets {
+                            if ui.selectable_label(cur == p.name, &p.name).clicked() {
+                                if let Ok(t) = std::fs::read_to_string(&p.path) {
+                                    load = Some((p.name.clone(), config::AgentConfig::from_properties(&t)));
+                                }
+                            }
+                        }
+                    });
+                    if ui.button("Load file…").clicked() {
+                        if let Some(f) = rfd::FileDialog::new().add_filter("properties", &["properties"]).pick_file() {
+                            if let Ok(t) = std::fs::read_to_string(&f) {
+                                let n = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+                                load = Some((n, config::AgentConfig::from_properties(&t)));
+                            }
+                        }
+                    }
+                    if let Some((n, c)) = load {
+                        self.preset = n;
+                        self.cfg = c;
+                    }
+                });
+                egui::CollapsingHeader::new("Advanced options (all config keys)").default_open(false).show(ui, |ui| {
+                    advanced_config(ui, &mut self.cfg);
                 });
                 ui.add_space(4.0);
                 if ui.add_enabled(!self.busy, egui::Button::new("Build agent")).clicked() {
@@ -458,10 +502,43 @@ fn tail_log(path: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::Context) {
     }
 }
 
-fn opt_path(s: &str) -> Option<PathBuf> {
-    let t = s.trim();
-    (!t.is_empty()).then(|| PathBuf::from(t))
+/// Render every agent config key as a labeled field, grouped. Mirrors the engine's graft.properties surface.
+fn advanced_config(ui: &mut egui::Ui, c: &mut config::AgentConfig) {
+    fn field(ui: &mut egui::Ui, label: &str, hint: &str, v: &mut String) {
+        ui.horizontal(|ui| {
+            ui.add_sized([220.0, 18.0], egui::Label::new(label).truncate());
+            ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY).hint_text(hint));
+        });
+    }
+    ui.label(egui::RichText::new("Dependencies & packaging").strong());
+    field(ui, "payload.dependencies", "maven coords, comma-separated", &mut c.deps);
+    field(ui, "payload.mixins.neoforge", "NeoForge mixin config set", &mut c.neoforge_mixins);
+    field(ui, "payload.packages", "internal-name prefixes (fat jars)", &mut c.packages);
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Registry / reload lifecycle").strong());
+    ui.checkbox(&mut c.reload_resources, "bootstrap.reloadResources (drive a resource reload on attach)");
+    field(ui, "bootstrap.thawRegistries", "e.g. minecraft:sound_event", &mut c.thaw_registries);
+    ui.checkbox(&mut c.register_mod_container, "bootstrap.registerModContainer (Fabric self-metadata)");
+    field(ui, "bootstrap.gameDirProperty", "e.g. vspike.gameDir", &mut c.game_dir_property);
+    field(ui, "bootstrap.joinGate.screen", "e.g. net/minecraft/.../ConnectScreen", &mut c.join_gate_screen);
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Event bootstrap (mods with no entrypoint)").strong());
+    field(ui, "bootstrap.event.manager", "EventManager class", &mut c.evt_manager);
+    field(ui, "bootstrap.event.managerInstance", "default INSTANCE", &mut c.evt_manager_instance);
+    field(ui, "bootstrap.event.base", "Event base type", &mut c.evt_base);
+    field(ui, "bootstrap.event.start", "client-start event class", &mut c.evt_start);
+    field(ui, "bootstrap.event.startInstance", "default INSTANCE", &mut c.evt_start_instance);
+    field(ui, "bootstrap.event.call", "default callEvent", &mut c.evt_call);
+
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Readiness probe (async init)").strong());
+    field(ui, "bootstrap.ready.class", "class exposing the ready flag", &mut c.ready_class);
+    field(ui, "bootstrap.ready.instance", "default INSTANCE", &mut c.ready_instance);
+    field(ui, "bootstrap.ready.method", "default isInitialized", &mut c.ready_method);
 }
+
 fn opt_str(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())

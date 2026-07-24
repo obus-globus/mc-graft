@@ -134,7 +134,6 @@ fn parse_return_code(line: &str) -> Option<i32> {
     }
     let tail = &low[low.find("return code").unwrap()..];
     tail.split(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .filter(|s| !s.is_empty() && *s != "-")
-        .next_back()
+        .rfind(|s| !s.is_empty() && *s != "-")
         .and_then(|s| s.parse::<i32>().ok())
 }
