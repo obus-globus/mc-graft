@@ -813,6 +813,8 @@ public class RetransformConverter {
                     String nd = eraseIfaceDesc(gStatic ? mi.desc : "(L" + ot + ";" + mi.desc.substring(1));
                     m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "h$" + mi.name, nd, false));
                     n++;
+                } else if (p instanceof MethodInsnNode mi && rewriteReflectSite(m, mi)) {
+                    n++;   // route a reflective added-field access (getDeclaredField + Field.get/set) to $State
                 }
             }
         }
@@ -831,6 +833,28 @@ public class RetransformConverter {
             if (m.localVariables != null) for (var lv : m.localVariables) { String d = eraseIfaceType(lv.desc); if (d != null && !d.equals(lv.desc)) { lv.desc = d; lv.signature = null; } }
         }
         return (n == 0 && e == 0) ? callerBytes : write(c, callerBytes);
+    }
+
+    /** Field.get/set accessor names routed through the $State reflection shim. */
+    private static final Set<String> REFLECT_FIELD_OPS = Set.of("get","set","getBoolean","setBoolean","getInt","setInt",
+        "getLong","setLong","getFloat","setFloat","getDouble","setDouble","getByte","setByte","getShort","setShort","getChar","setChar");
+
+    /** Route a payload's reflective added-field access to mcgraft.rt.StateReflect: {@code Class.getDeclaredField} and
+     *  {@code Field.get/set(...)} become static shim calls (Field prepended) so a relocated ($State) field resolves.
+     *  Non-relocated fields pass through the shim unchanged, so this is safe to apply to every such site. */
+    static boolean rewriteReflectSite(MethodNode m, MethodInsnNode mi) {
+        if (mi.getOpcode() != Opcodes.INVOKEVIRTUAL) return false;
+        if (mi.owner.equals("java/lang/Class") && mi.name.equals("getDeclaredField") && mi.desc.equals("(Ljava/lang/String;)Ljava/lang/reflect/Field;")) {
+            m.instructions.set(mi, new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/StateReflect", "declaredField",
+                "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;", false));
+            return true;
+        }
+        if (mi.owner.equals("java/lang/reflect/Field") && REFLECT_FIELD_OPS.contains(mi.name)) {
+            m.instructions.set(mi, new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/StateReflect", mi.name,
+                "(Ljava/lang/reflect/Field;" + mi.desc.substring(1), false));
+            return true;
+        }
+        return false;
     }
 
     /** Spill an interface invocation to fresh locals and call the generic dispatcher without adding a helper method. */

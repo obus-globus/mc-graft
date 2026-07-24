@@ -159,6 +159,17 @@ public class FullInjectAgent {
         InjectionLogger.info("ifaceMap keys: " + ifaceMap.keySet());
         for (var ie : ifaceMap.entrySet()) for (String[] impl : ie.getValue())
             mcgraft.rt.DuckDispatch.register(ie.getKey(), impl[0], impl[1]);
+        // Register relocated fields with the reflection shim so a mod that reflectively reads its OWN added field on an
+        // already-loaded target (which had to move to $State) resolves to the per-instance state. gfield here already
+        // excludes whole targets (whose fields stayed on the class).
+        int rf = 0;
+        for (var ge : gfield.entrySet()) {   // key = "owner name desc"; parse by owner length (names/descs are space-free)
+            String key = ge.getKey(); String[] v = ge.getValue();   // v = [owner, sidecar, S/I]
+            int sp = key.lastIndexOf(' '); if (sp <= v[0].length()) continue;
+            String name = key.substring(v[0].length() + 1, sp);
+            mcgraft.rt.StateReflect.register(v[0], name, v[1], v[1] + "$State"); rf++;
+        }
+        InjectionLogger.info("reflection shim: registered "+rf+" relocated field(s)");
 
         // Resolver: the payload access of a non-public member of an ALREADY-LOADED MC class must be reflection-routed (that
         // class could not be AW-widened, since retransform bans modifier changes). Future MC classes get the AW on-load.
