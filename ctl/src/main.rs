@@ -9,6 +9,7 @@ mod config;
 mod gui;
 mod modinfo;
 mod pack;
+mod patch;
 mod procs;
 mod store;
 
@@ -90,6 +91,13 @@ struct PackArgs {
     /// mc-graft repo root (used only to auto-detect the base jar; default: auto-detect from cwd/exe).
     #[arg(long, value_name = "DIR")]
     repo: Option<PathBuf>,
+    /// Patch(es) to apply to the payload jar before packing (repeatable, applied in order). Each is a `.mcpatch`
+    /// bundle (dir or zip with manifest.toml) or a bare `.jar`/`.zip` overlay.
+    #[arg(long = "patch", value_name = "PATH")]
+    patches: Vec<PathBuf>,
+    /// Ignore each patch's [target] base guard for this run (sha256/mod-id checks).
+    #[arg(long)]
+    no_verify_base: bool,
 }
 
 #[derive(clap::Args)]
@@ -175,7 +183,18 @@ fn cmd_pack(a: PackArgs) {
     if !a.payload.is_file() {
         die(&format!("payload jar not found: {}", a.payload.display()));
     }
-    let info = modinfo::read_jar(&a.payload).unwrap_or_else(|e| die(&e));
+
+    // Apply any user patches to the payload jar FIRST — a merge on fabric.mod.json must be visible to everything below
+    // (mod id, mixins, deps, entrypoints). The patched jar is a temp file we clean up after packing.
+    let patched = if a.patches.is_empty() {
+        None
+    } else {
+        let opts = patch::Options { no_verify_base: a.no_verify_base };
+        patch::apply_patches(&a.payload, &a.patches, &opts, |l| println!("{l}")).unwrap_or_else(|e| die(&e))
+    };
+    let payload: &Path = patched.as_deref().unwrap_or(&a.payload);
+
+    let info = modinfo::read_jar(payload).unwrap_or_else(|e| die(&e));
     eprintln!("Payload: {}", info.summary());
 
     // Locate the precompiled base jar.
@@ -199,7 +218,11 @@ fn cmd_pack(a: PackArgs) {
 
     let out = a.out.clone().unwrap_or_else(|| PathBuf::from(format!("{}-agent.jar", info.id)));
 
-    match pack::pack_agent(&base, &a.payload, &info, &cfg, &out, |l| println!("{l}")) {
+    let result = pack::pack_agent(&base, payload, &info, &cfg, &out, |l| println!("{l}"));
+    if let Some(tmp) = &patched {
+        let _ = std::fs::remove_file(tmp); // best-effort cleanup of the patched temp jar
+    }
+    match result {
         Ok(()) => println!("\nAgent packed (JDK-free): {}", out.display()),
         Err(e) => die(&e),
     }

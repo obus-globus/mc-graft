@@ -1,0 +1,4 @@
+{
+  "depends":     { "fabric-api": "*" },
+  "entrypoints": { "client": ["com.demo.ExtraInit"] }
+}

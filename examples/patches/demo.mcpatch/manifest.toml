@@ -1,0 +1,23 @@
+# Example mc-graft payload patch bundle.
+#   mcgraft pack --payload yourmod.jar --patch examples/patches/demo.mcpatch -o agent.jar
+# v1 supports: overlay/ (add or replace files), [[delete]], [[rename]], [[merge]] (RFC-7396 JSON merge).
+
+[bundle]
+name   = "demo-tweaks"
+format = 1
+
+[apply]
+on-conflict   = "error"        # error | overlay-wins | patch-wins
+verify-target = true           # honor the [target] base guard below
+
+[target]
+mod = "demomod"                # WARN if the payload's fabric.mod.json id differs
+# sha256 = "…"                 # if set: HARD FAIL unless the base jar hashes to this (override with --no-verify-base)
+
+[[delete]]
+path = "assets/demo/stale.txt"
+
+[[merge]]
+path = "fabric.mod.json"       # RFC-7396 merge: add a dependency + a client entrypoint; null values delete keys
+file = "meta/fabric.mod.merge.json"
+kind = "merge"
