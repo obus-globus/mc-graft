@@ -157,3 +157,19 @@ reflection finds them. This is a real converter change (per-target whole-vs-drop
 GADDED/GFIELD/GIFACE must exclude whole targets' members; the new guarded DuckDispatch already handles a
 whole target that genuinely implements a shared interface) with regression risk, plus likely further tail
 (the "Unknown custom packet payload" config-phase warnings observed alongside). Not yet done.
+
+### Xaero: ALL mc-graft late-attach barriers crossed — minimap renders in-world
+Continuing "no banking", every remaining mc-graft-side blocker was crossed and Xaero's minimap actively
+RENDERS map tiles in a live world:
+- Descriptor wall -> phantom + guarded dispatch for shared duck interfaces (committed).
+- serverData / freeze / IServerPlayer -> lifecycle + xaerolib dep-mixins + caller-rewrite (committed).
+- Reflective added-field (xaero_chunkClean on the already-loaded LevelChunk) -> two new generic mechanisms:
+  (a) FUTURE-loaded field-adding targets defined WHOLE (added members kept on the class); (b) for
+  ALREADY-loaded targets, a reflection shim (mcgraft.rt.StateReflect) routing payload
+  getDeclaredField/Field.get/set of a relocated field to the per-instance $State. Both committed, LB-safe.
+Result: "New Xaero hud session initialized!" + MinimapWriter.writeChunk/writeTile/calculateBlockColors run
+in-world. The client then crashes on a NoSuchMethodError — xaerolib calls
+BlockStateModel.particleMaterial(BlockAndTintGetter,BlockPos,BlockState) but the test client's 26.2 jar has
+the no-arg particleMaterial(); BlockStateModel is NOT a mixin target, so this is a genuine MC-snapshot API
+mismatch (Xaero fabric-26.2-26.4.2 built against a later 26.2 than the harness jar) — environmental, would
+crash the same way under normal Fabric. Not a mc-graft limitation.
