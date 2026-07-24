@@ -59,7 +59,8 @@ public class FullInjectAgent {
         // Also caller-rewrite the applied dependency (fabric-api) runtime: its own classes cast MC objects to duck
         // interfaces its mixins add. Match by prefix (they are not in the payload jar). Only when dep-mixins are applied.
         Set<String> crPrefixes = new HashSet<>(cfg.callerRewritePackages);
-        if (!cfg.depMixinConfigs.isEmpty()) crPrefixes.add("net/fabricmc/fabric");
+        if (!cfg.depCallerRewritePackages.isEmpty()) crPrefixes.addAll(cfg.depCallerRewritePackages);   // explicit override
+        else if (!cfg.depMixinConfigs.isEmpty()) crPrefixes.add("net/fabricmc/fabric");                 // default: fabric-api's namespace
         RetransformConverter.CALLER_REWRITE_PREFIXES = crPrefixes;
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate

@@ -11,6 +11,7 @@ pub struct AgentConfig {
     // packaging / dependencies
     pub deps: String,               // payload.dependencies (comma-separated Maven coords)
     pub apply_dep_mixins: String,   // bootstrap.applyDependencyMixins: "" off, "*" all, else config-name substring filter
+    pub dep_caller_rewrite_packages: String, // bootstrap.depCallerRewrite.packages: internal-name prefixes ("" = default fabric-api)
     pub neoforge_mixins: String,    // payload.mixins.neoforge
     pub packages: String,           // payload.packages
     // registry / reload lifecycle
@@ -52,6 +53,7 @@ impl AgentConfig {
             match k {
                 "payload.dependencies" => c.deps = v,
                 "bootstrap.applyDependencyMixins" => c.apply_dep_mixins = v,
+                "bootstrap.depCallerRewrite.packages" => c.dep_caller_rewrite_packages = v,
                 "payload.mixins.neoforge" => c.neoforge_mixins = v,
                 "payload.packages" => c.packages = v,
                 "bootstrap.reloadResources" => c.reload_resources = v.eq_ignore_ascii_case("true"),
@@ -88,6 +90,7 @@ impl AgentConfig {
         let mut o = String::new();
         kv(&mut o, "payload.dependencies", &self.deps);
         kv(&mut o, "bootstrap.applyDependencyMixins", &self.apply_dep_mixins);
+        kv(&mut o, "bootstrap.depCallerRewrite.packages", &self.dep_caller_rewrite_packages);
         kv(&mut o, "payload.mixins.neoforge", &self.neoforge_mixins);
         kv(&mut o, "payload.packages", &self.packages);
         if self.reload_resources {

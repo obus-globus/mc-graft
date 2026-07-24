@@ -672,6 +672,7 @@ fn advanced_config(ui: &mut egui::Ui, c: &mut config::AgentConfig) {
     ui.label(egui::RichText::new("Dependencies & packaging").strong());
     field(ui, "payload.dependencies", "maven coords, comma-separated", &mut c.deps);
     field(ui, "bootstrap.applyDependencyMixins", "\"\" off · \"*\" all · else config-name filter e.g. networking", &mut c.apply_dep_mixins);
+    field(ui, "bootstrap.depCallerRewrite.packages", "internal-name prefixes to caller-rewrite (default net/fabricmc/fabric)", &mut c.dep_caller_rewrite_packages);
     field(ui, "payload.mixins.neoforge", "NeoForge mixin config set", &mut c.neoforge_mixins);
     field(ui, "payload.packages", "internal-name prefixes (fat jars)", &mut c.packages);
 

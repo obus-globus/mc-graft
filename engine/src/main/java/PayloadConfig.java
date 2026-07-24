@@ -52,6 +52,10 @@ public final class PayloadConfig {
     // Internal-name prefixes of bundled library mods (e.g. xaero/lib) whose OWN runtime casts to duck interfaces their
     // mixins add to MC classes; those library classes must be caller-rewritten too (payload.callerRewrite.packages).
     public final List<String> callerRewritePackages;
+    // Internal-name prefixes of the DEPENDENCY runtime (e.g. net/fabricmc/fabric) to caller-rewrite when dependency
+    // mixins are applied — their own code casts MC objects to the duck interfaces those mixins add. Empty -> when
+    // dependency mixins are applied, defaults to fabric-api's namespace. (bootstrap.depCallerRewrite.packages)
+    public final List<String> depCallerRewritePackages;
     // a system property the payload reads to locate its data/game directory (e.g. a mod that reads "vspike.gameDir").
     // null -> the injector does not set any such property. (bootstrap.gameDirProperty=...)
     public final String gameDirProperty;
@@ -96,6 +100,7 @@ public final class PayloadConfig {
         thawRegistries = csv(p.getProperty("bootstrap.thawRegistries", ""));
         payloadPackages = csv(p.getProperty("payload.packages", ""));
         callerRewritePackages = csv(p.getProperty("payload.callerRewrite.packages", ""));
+        depCallerRewritePackages = csv(p.getProperty("bootstrap.depCallerRewrite.packages", ""));
         gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
         registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());
