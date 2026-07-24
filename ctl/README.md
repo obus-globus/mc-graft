@@ -71,13 +71,20 @@ or `~/.config/mcgraft/`, so a standalone install (binary + base jar, no JDK, no 
 mcgraft pack -p yourmod.jar --patch tweaks.mcpatch --patch overlay.zip -o agent.jar
 ```
 
-Each `--patch` is a `.mcpatch` bundle (a directory or zip with a `manifest.toml`) or a bare `.jar`/`.zip` overlay. v1
-(JDK-free) supports **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** (RFC-7396
-JSON merge, e.g. editing `fabric.mod.json`). Patches apply before mod-info derivation, so a merge on `fabric.mod.json`
-correctly changes the derived id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on
-`sha256` mismatch (override with `--no-verify-base`). See [`../docs/patches.md`](../docs/patches.md) for the full format
-and the deferred phase-2 features (bytecode `[[patch]]` via Krakatau, `new/` assembled classes, RFC-6902 `jsonpatch`).
-Example bundle: [`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
+Each `--patch` is a `.mcpatch` bundle (a directory or zip with a `manifest.toml`), a bare `.jar`/`.zip` overlay, or a
+bare Krakatau `.j` file. Supported (all JDK-free):
+
+- **overlay** (add/replace entries), **`[[delete]]`**, **`[[rename]]`**, and **`[[merge]]`** (RFC-7396 JSON merge, e.g.
+  editing `fabric.mod.json`) — no external tools.
+- **Whole-class Krakatau assembly** — a bare `.j` file, or a bundle `new/` directory of `.j` files, assembled and
+  added/replaced by declared class name. Needs the `krak2` binary on `PATH` or via `MCGRAFT_KRAK2` (only when a patch
+  actually contains `.j`).
+
+Patches apply before mod-info derivation, so a merge on `fabric.mod.json` correctly changes the derived
+id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on `sha256` mismatch (override
+with `--no-verify-base`). Deferred to phase 2: in-place bytecode `[[patch]]` (Krakatau *diff*) and RFC-6902 `jsonpatch`
+(both rejected with a message for now). See [`../docs/patches.md`](../docs/patches.md) for the full format; example
+bundle at [`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
 
 ## How attach works
 

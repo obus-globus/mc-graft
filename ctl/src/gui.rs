@@ -494,9 +494,9 @@ impl eframe::App for App {
                         .default_open(!self.patches.is_empty())
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if ui.button("Add bundle/zip…").clicked() {
+                                if ui.button("Add bundle/zip/.j…").clicked() {
                                     if let Some(f) = rfd::FileDialog::new()
-                                        .add_filter("patch", &["mcpatch", "zip", "jar"]).pick_file()
+                                        .add_filter("patch", &["mcpatch", "zip", "jar", "j"]).pick_file()
                                     {
                                         self.patches.push(f.display().to_string());
                                     }

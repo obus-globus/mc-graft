@@ -12,15 +12,20 @@ first limitation users hit, so it's stated up front.
 
 ## Status
 
-**Shipped (v1, `mcgraft pack --patch`):** file **overlay** (add/replace), **delete**, **rename**, and JSON **merge**
-(RFC 7396) — the JVM-free layer, built on the `zip` crate + inline merge (no bytecode tooling). Covers metadata edits,
-resource swaps, config tweaks, file removal — the bulk of real demand — with near-zero fragility.
+**Shipped — JVM-free layer (`zip` crate + inline merge, no external tools):** file **overlay** (add/replace),
+**delete**, **rename**, and JSON **merge** (RFC 7396). Covers metadata edits, resource swaps, config tweaks, file
+removal — the bulk of real demand — with near-zero fragility.
 
-**Deferred to phase 2 (needs the Krakatau toolchain):** assembled `new/` classes, in-place bytecode `[[patch]]`
-(`krakatau-diff`), and RFC-6902 `jsonpatch`. The packer parses these in a manifest and **rejects them with a clear
-message** rather than silently ignoring. The rest of this doc describes the full target design; sections that are
-phase-2-only are marked. See "Phase 2 risks" at the end — the bytecode-diff approach has a real base-fragility problem
-that must be solved before it ships.
+**Shipped — whole-class Krakatau assembly (needs `krak2`):** a **bare `.j`** file and a bundle **`new/`** directory of
+`.j` files are assembled (via `krak2 asm`) and added/replaced by their declared class name. This is robust: you author a
+*complete* class in Krakatau assembly and it's compiled outright — there is **no diff and no round-trip dependency**, so
+the fragility below does not apply. `krak2` is located via `MCGRAFT_KRAK2` or `PATH`, and is only invoked when a patch
+actually contains `.j` — overlay/JSON-only patches never need it.
+
+**Deferred to phase 2:** in-place bytecode `[[patch]]` (`krakatau-diff`, the base-fragile *diff*-of-disassembly path) and
+RFC-6902 `jsonpatch`. The packer parses these in a manifest and **rejects them with a clear message** rather than
+silently ignoring. See "Phase 2 risks" at the end — the bytecode-*diff* approach has a real base-fragility problem
+(distinct from whole-class assembly, which ships now) that must be solved before it ships.
 
 ## Input modes
 
@@ -185,11 +190,13 @@ phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *prim
 
 ## Implementation phases
 
-1. ✅ `--patch` plumbing + input-mode detection (bundle dir/zip, bare overlay zip) + manifest parser.
+1. ✅ `--patch` plumbing + input-mode detection (bundle dir/zip, bare overlay zip, bare `.j`) + manifest parser.
 2. ✅ File ops: overlay, delete, rename, JSON merge (RFC 7396) + base guard + tests + wire into the pack pipeline.
-3. ⏳ `krak2` (PATH-first, optional embed) wrapper; `new/` assemble; `krakatau-diff` apply with `--roundtrip` + version guard.
-4. ⏳ `ristretto_classfile` post-verify for bytecode patches; RFC-6902 `jsonpatch`.
-5. ⏳ GUI "Patches" list.
+3. ✅ GUI "Patches" list (Quick-pack mode).
+4. ✅ `krak2` (PATH / `MCGRAFT_KRAK2`) wrapper; whole-class assembly — bare `.j` + bundle `new/`.
+5. ⏳ In-place bytecode `[[patch]]`: either `krakatau-diff` with `--roundtrip` + version guard, or the `ristretto` `ops`
+      DSL (preferred — see risks). Plus `ristretto_classfile` post-verify and RFC-6902 `jsonpatch`.
+6. ⏳ Ship `krak2` self-contained (embed via `include_bytes!` behind a feature) instead of requiring it on `PATH`.
 
 ## Open questions (phase 2)
 

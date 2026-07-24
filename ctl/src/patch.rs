@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ----------------------------------------------------------------------------------------------- manifest schema
 
@@ -258,6 +260,12 @@ pub fn apply_patches<F: FnMut(&str)>(
     for p in patches {
         let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
         log(&format!("applying patch: {name}"));
+        // Bare Krakatau: a single .j file assembles straight into the jar (add/replace by declared class name).
+        if p.is_file() && is_j_file(p) {
+            let jb = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            apply_assembled(&mut jar, &jb, &name, OnConflict::Error, &mut written, &mut log)?;
+            continue;
+        }
         let src = open_source(p)?;
         apply_one(&mut jar, &src, &name, &base_sha, base_mod_id.as_deref(), opts, &mut written, &mut log)?;
     }
@@ -343,11 +351,7 @@ fn apply_one<F: FnMut(&str)>(
         }
     }
 
-    // Ordered pipeline: delete -> rename -> overlay -> merge. (new/ + patch are deferred.)
-    if src.read("new").is_some() || !src.list_under("new").is_empty() {
-        log(&format!("  note: patch {patch_name} has a new/ directory — assembling classes is deferred to a later phase; ignoring"));
-    }
-
+    // Ordered pipeline: delete -> rename -> overlay -> new (assemble) -> merge.
     for d in &man.delete {
         if jar.remove(&d.path) {
             log(&format!("  delete {}", d.path));
@@ -380,18 +384,45 @@ fn apply_one<F: FnMut(&str)>(
         jar.put(&rel, bytes);
         log(&format!("  overlay {verb} {rel}"));
     }
-    // A bare overlay (no manifest): overlay ALL entries of the zip.
+    // A bare overlay (no manifest): overlay ALL entries. For a zip, entries go in verbatim; for a directory, a loose
+    // `.j` file is assembled (bare Krakatau) and everything else is overlaid.
     if manifest_bytes.is_none() {
-        if let Source::Zip(m) = src {
-            let mut keys: Vec<&String> = m.keys().collect();
-            keys.sort();
-            for k in keys {
-                claim(written, k, patch_name, man.apply.on_conflict, log)?;
-                let verb = if jar.file(k).is_some() { "replace" } else { "add" };
-                jar.put(k, m[k].clone());
-                log(&format!("  overlay {verb} {k}"));
+        match src {
+            Source::Zip(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                for k in keys {
+                    claim(written, k, patch_name, man.apply.on_conflict, log)?;
+                    let verb = if jar.file(k).is_some() { "replace" } else { "add" };
+                    jar.put(k, m[k].clone());
+                    log(&format!("  overlay {verb} {k}"));
+                }
+            }
+            Source::Dir(_) => {
+                for rel in src.list_under("") {
+                    let bytes = src.read(&rel).unwrap_or_default();
+                    if rel.ends_with(".j") {
+                        apply_assembled(jar, &bytes, patch_name, man.apply.on_conflict, written, log)?;
+                    } else {
+                        claim(written, &rel, patch_name, man.apply.on_conflict, log)?;
+                        let verb = if jar.file(&rel).is_some() { "replace" } else { "add" };
+                        jar.put(&rel, bytes);
+                        log(&format!("  overlay {verb} {rel}"));
+                    }
+                }
             }
         }
+    }
+
+    // new/: assemble each Krakatau .j into its declared class(es) and add/replace them.
+    for rel in src.list_under("new") {
+        if !rel.ends_with(".j") {
+            continue;
+        }
+        let jb = src
+            .read(&format!("new/{rel}"))
+            .ok_or_else(|| format!("patch {patch_name}: cannot read new/{rel}"))?;
+        apply_assembled(jar, &jb, patch_name, man.apply.on_conflict, written, log)?;
     }
 
     for mg in &man.merge {
@@ -465,6 +496,86 @@ fn json_merge(target: &mut Value, patch: &Value) {
         }
         _ => *target = patch.clone(),
     }
+}
+
+// ----------------------------------------------------------------------------------------------- Krakatau assembly
+
+static KRAK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Locate the `krak2` binary: `MCGRAFT_KRAK2` env override, else `krak2` on `PATH`. Only called when a patch actually
+/// contains Krakatau assembly, so overlay/JSON-only patches never need it.
+fn krak2_bin() -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os("MCGRAFT_KRAK2") {
+        let p = PathBuf::from(p);
+        return if p.is_file() { Ok(p) } else { Err(format!("MCGRAFT_KRAK2 is not a file: {}", p.display())) };
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let c = dir.join("krak2");
+            if c.is_file() {
+                return Ok(c);
+            }
+        }
+    }
+    Err("krak2 not found — put it on PATH or set MCGRAFT_KRAK2 (required to assemble Krakatau .j patches)".into())
+}
+
+/// Assemble one Krakatau `.j` source into its class(es); returns `(internal-name, class-bytes)` per class. A `.j` may
+/// declare more than one class; each is placed by its declared name (the `.class` directive), not any filename.
+fn assemble_j(j_bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let bin = krak2_bin()?;
+    let seq = KRAK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stem = std::env::temp_dir().join(format!("mcgraft-krak-{}-{seq}", std::process::id()));
+    let in_j = stem.with_extension("j");
+    let out_jar = stem.with_extension("jar");
+    std::fs::write(&in_j, j_bytes).map_err(|e| format!("write temp .j: {e}"))?;
+    let run = Command::new(&bin).arg("asm").arg("--out").arg(&out_jar).arg(&in_j).output();
+    let _ = std::fs::remove_file(&in_j);
+    let run = run.map_err(|e| format!("run krak2: {e}"))?;
+    if !run.status.success() {
+        let _ = std::fs::remove_file(&out_jar);
+        return Err(format!("krak2 asm failed: {}", String::from_utf8_lossy(&run.stderr).trim()));
+    }
+    let jar_bytes = std::fs::read(&out_jar).map_err(|e| format!("read krak2 output: {e}"))?;
+    let _ = std::fs::remove_file(&out_jar);
+    let mut zip = zip::ZipArchive::new(Cursor::new(jar_bytes)).map_err(|e| format!("krak2 output not a jar: {e}"))?;
+    let mut classes = Vec::new();
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i).map_err(|e| format!("read krak2 output: {e}"))?;
+        let name = e.name().to_string();
+        if let Some(internal) = name.strip_suffix(".class") {
+            let mut b = Vec::new();
+            e.read_to_end(&mut b).map_err(|e| format!("read class: {e}"))?;
+            classes.push((internal.to_string(), b));
+        }
+    }
+    if classes.is_empty() {
+        return Err("krak2 produced no classes from the .j".into());
+    }
+    Ok(classes)
+}
+
+/// Assemble `j_bytes` and add/replace each declared class in the jar (add-or-replace by internal name).
+fn apply_assembled<F: FnMut(&str)>(
+    jar: &mut Jar,
+    j_bytes: &[u8],
+    patch_name: &str,
+    policy: OnConflict,
+    written: &mut HashMap<String, String>,
+    log: &mut F,
+) -> Result<(), String> {
+    for (internal, bytes) in assemble_j(j_bytes)? {
+        let path = format!("{internal}.class");
+        claim(written, &path, patch_name, policy, log)?;
+        let verb = if jar.file(&path).is_some() { "replace" } else { "add" };
+        jar.put(&path, bytes);
+        log(&format!("  assemble {verb} {path}"));
+    }
+    Ok(())
+}
+
+fn is_j_file(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("j"))
 }
 
 fn read_mod_id(jar_bytes: &[u8]) -> Option<String> {
@@ -581,6 +692,20 @@ mod tests {
         assert_eq!(jar.file("a.txt"), Some(&b"new"[..]), "overlay replace");
         assert_eq!(jar.file("c.txt"), Some(&b"c"[..]), "overlay add");
         assert_eq!(jar.file("b.txt"), Some(&b"b"[..]), "untouched");
+    }
+
+    // Requires krak2 (MCGRAFT_KRAK2 or on PATH); skips cleanly when the optional tool isn't present.
+    #[test]
+    fn krakatau_assemble() {
+        if krak2_bin().is_err() {
+            return; // krak2 not available in this environment — skip
+        }
+        let j = b".class public com/demo/Demo\n.super java/lang/Object\n\
+                  .method public static answer : ()I\n.code stack 1 locals 0\nbipush 42\nireturn\n.end code\n.end method\n";
+        let classes = assemble_j(j).unwrap();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].0, "com/demo/Demo");
+        assert_eq!(&classes[0].1[0..4], &[0xCA, 0xFE, 0xBA, 0xBE], "valid class magic");
     }
 
     #[test]
