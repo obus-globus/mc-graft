@@ -135,3 +135,25 @@ world; full singleplayer in-world rendering is blocked by xaerolib's render-laye
 use, which is the Meteor-class limit. New generic, opt-in machinery landed along the way (bridgePayloadCodecs,
 applyDependencyMixins, payload.callerRewrite.packages) that helps fabric-api/bundled-library mods that do NOT
 hit the descriptor blocker.
+
+### Descriptor wall CROSSED (phantom + guarded dispatch); next Xaero blocker = reflective added-field
+The DROPPED_INTERFACE_DESCRIPTOR limit (documented above as the architectural ceiling, hit by both Meteor
+and Xaero) is crossed for the common SHARED-interface case. Insight (from a Fable design review): a
+descriptor mentioning a dropped duck interface is actually LEGAL per JVMS 4.10.1.2 (interface refs verify
+like Object); only the checked sites (checkcast/instanceof/invokeinterface/aastore) need rewriting. So a
+mixin-added interface that a REAL bundle class ALSO implements ("shared", e.g. xaerolib's ITextureBinding)
+is kept in descriptors (phantom) and its sites route through DuckDispatch, which now discriminates per
+receiver (genuine implementor -> real interface method; de-implemented duck target -> sidecar). Classified
+by scanning the bundle for genuine (non-@Mixin) implementors. Committed; LB unaffected; Xaero passes the
+gate (preflight 0 failed) and logs into a world.
+
+Remaining Xaero in-world blocker (orthogonal): xaero.common.core.XaeroMinimapCore.ensureField does
+`LevelChunk.class.getDeclaredField("xaero_chunkClean")` + Field.set — a REFLECTIVE get/set of a @Unique
+field its mixin adds to LevelChunk, which mc-graft relocates to the $State sidecar -> NoSuchFieldException
+-> disconnect. It is a SINGLE field, on a FUTURE-loaded (not loaded at attach), interface-free target
+(MixinWorldChunk adds only `boolean xaero_chunkClean`). The clean fix is "define future-loaded targets
+whole" (review Option 2): a not-yet-loaded target can legally keep its added members at define-time, so
+reflection finds them. This is a real converter change (per-target whole-vs-dropped model; global
+GADDED/GFIELD/GIFACE must exclude whole targets' members; the new guarded DuckDispatch already handles a
+whole target that genuinely implements a shared interface) with regression risk, plus likely further tail
+(the "Unknown custom packet payload" config-phase warnings observed alongside). Not yet done.
