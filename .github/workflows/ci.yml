@@ -32,12 +32,23 @@ jobs:
       - name: Build agent base
         run: ./gradlew agentBase --no-daemon --console=plain
 
+      - name: Lint (SpotBugs)
+        run: ./gradlew spotbugsEngine spotbugsMixinservice --no-daemon --console=plain
+
       - name: Upload base jar
         uses: actions/upload-artifact@v4
         with:
           name: mc-graft-base
           path: build/agent/mc-graft-base.jar
           if-no-files-found: error
+
+      - name: Upload SpotBugs report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spotbugs-report
+          path: build/reports/spotbugs/
+          if-no-files-found: ignore
 
   # Build, lint and test the Rust control app (CLI + GUI).
   ctl:

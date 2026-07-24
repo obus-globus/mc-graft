@@ -14,6 +14,13 @@ strip = true
 lto = true
 opt-level = "z"
 
+# Lint policy (the project's Rust linter). `cargo clippy` enforces this locally; CI additionally runs
+# `cargo clippy --all-targets -- -D warnings`. Kept in the manifest so the policy travels with the crate.
+[lints.rust]
+unsafe_code = "forbid"        # the control app needs no unsafe; forbid it outright
+[lints.clippy]
+all = { level = "deny", priority = -1 }   # deny the full default clippy set (correctness/suspicious/style/complexity/perf)
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }

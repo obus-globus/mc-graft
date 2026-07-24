@@ -82,7 +82,7 @@ public class FullInjectAgent {
         } catch(Throwable t){ InjectionLogger.warn("INACC compute failed -> "+rootMsg(t)); }
 
         List<String> targets = new ArrayList<>();
-        try (var r = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(PLATFORM.bundleResource("mixin-targets.txt"))))) { String l; while ((l=r.readLine())!=null) if(!l.isBlank()) targets.add(l.trim().replace('.','/')); }
+        try (var r = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(PLATFORM.bundleResource("mixin-targets.txt")), java.nio.charset.StandardCharsets.UTF_8))) { String l; while ((l=r.readLine())!=null) if(!l.isBlank()) targets.add(l.trim().replace('.','/')); }
         targetSet.addAll(targets);
         PLATFORM.prepareBaselines(targets);   // Fabric: capture the non-payload baseline before the payload's config is selected
 

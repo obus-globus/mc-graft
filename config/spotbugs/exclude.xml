@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SpotBugs exclusions for mc-graft. The engine is deliberately reflection/bytecode-heavy and uses patterns SpotBugs
+     flags but that are correct here. Each block documents WHY. High-value bug families (NP_*, IS2_*, etc.) are muted only
+     at specific verified false-positive sites, NOT project-wide, so they keep catching new bugs elsewhere. Keep this
+     list tight — prefer fixing a real finding over muting it. -->
+<FindBugsFilter>
+
+    <!-- ============================ scoped false positives (verified) ============================ -->
+
+    <!-- The sidecar <clinit> is created unconditionally by addSidecarClinit(S) (RetransformConverter:102) before any of
+         these methods look it up, so `clinit`/`sc` is never null here. SpotBugs can't prove the ordering. -->
+    <Match>
+        <Bug pattern="NP_NULL_ON_SOME_PATH"/>
+        <Or>
+            <Method name="addReflectInit"/>
+            <Method name="addReflectMethodInit"/>
+            <Method name="mergeIntoSidecarClinit"/>
+            <Method name="copyClinitDeltaToSidecar"/>
+        </Or>
+    </Match>
+
+    <!-- stageBundle/stageIfBundled return the bundled payload jar; the null case is guarded by an explicit throw before
+         return (see `if (payloadBundle == null) throw ...`). initMixin's reflective locals are throw-guarded likewise.
+         These are single-threaded startup paths over a jar WE built, so the "resource may be null" path can't occur. -->
+    <Match>
+        <Bug pattern="NP_NULL_ON_SOME_PATH,NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE"/>
+        <Or>
+            <Method name="stageBundle"/>
+            <Method name="stageIfBundled"/>
+            <Method name="initMixin"/>
+        </Or>
+    </Match>
+
+    <!-- Conv.sidecarName/stateName/whole are written on the attach thread BEFORE the Conv is published into the
+         convMap (a ConcurrentHashMap), which establishes happens-before to the CFT reader threads; the synchronized
+         block in define() only guards the idempotent define, not these effectively-final fields. Safe publication. -->
+    <Match>
+        <Class name="~.*\$Conv"/>
+        <Bug pattern="IS2_INCONSISTENT_SYNC"/>
+    </Match>
+
+    <!-- ============================ low-value / intentional categories ============================ -->
+
+    <!-- The engine passes byte[] class images and array references by design (bytecode in/out); defensive copies would
+         be pure overhead on a hot transform path. -->
+    <Match><Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2,EI_EXPOSE_STATIC_REP2"/></Match>
+
+    <!-- The GADDED/GFIELD/GIFACE/PAYLOAD_CLASSES tables are intentionally public static (read across packages by the
+         runtime dispatch + converter); PA_PUBLIC_PRIMITIVE_ATTRIBUTE / MS_PKGPROTECT are that design, not a leak. -->
+    <Match><Bug pattern="MS_PKGPROTECT,PA_PUBLIC_PRIMITIVE_ATTRIBUTE"/></Match>
+
+    <!-- The reflection shim's entire purpose is to setAccessible relocated members; the flag is inherent to the design. -->
+    <Match><Bug pattern="REFLF_REFLECTION_MAY_INCREASE_ACCESSIBILITY_OF_FIELD"/></Match>
+
+    <!-- Deliberately-ignored exceptions (best-effort reflection probes, optional feature arming) are pervasive and
+         intentional; the code comments mark each. Broad catch(Exception/Throwable) around reflection is by design too. -->
+    <Match><Bug pattern="DE_MIGHT_IGNORE,REC_CATCH_EXCEPTION"/></Match>
+
+    <!-- Platform staging writes RetransformConverter.SIDECAR_PKG once during single-threaded agentmain staging, before
+         the CFT is installed — not a cross-thread static write hazard. -->
+    <Match>
+        <Bug pattern="ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD"/>
+        <Method name="stageBundle"/>
+    </Match>
+
+    <!-- vspike.AccessWidener parses in its constructor and throws on a malformed header; there is no finalizer and the
+         class is never subclassed, so the finalizer-attack concern behind CT_CONSTRUCTOR_THROW does not apply. -->
+    <Match>
+        <Class name="vspike.AccessWidener"/>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+    </Match>
+
+</FindBugsFilter>

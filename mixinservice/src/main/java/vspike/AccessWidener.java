@@ -19,7 +19,7 @@ public class AccessWidener {
     private final Set<String> touchedClasses = new HashSet<>();
 
     public AccessWidener(InputStream in) throws IOException {
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(in))) {
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8))) {
             String line; boolean header=false;
             while ((line = r.readLine()) != null) {
                 line = line.replace("\t"," ").trim();

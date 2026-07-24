@@ -1,4 +1,7 @@
 import java.util.zip.ZipFile
+import com.github.spotbugs.snom.Confidence
+import com.github.spotbugs.snom.Effort
+import com.github.spotbugs.snom.SpotBugsTask
 
 buildscript {
     repositories { mavenCentral() }
@@ -9,7 +12,10 @@ buildscript {
     }
 }
 
-plugins { java }
+plugins {
+    java
+    id("com.github.spotbugs") version "6.1.7"   // the project's Java linter (bytecode static analysis; see config/spotbugs/)
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // mc-graft — late-attach injection engine.
@@ -61,6 +67,29 @@ sourceSets {
 // Sponge-Mixin derives its CompatibilityLevel from the class-file version it sees — targeting an older release makes
 // MixinExtras' @Local LVT generation fail on already-loaded targets. Build with a Java 25 JDK (JAVA_HOME=graalvm-25).
 tasks.withType<JavaCompile>().configureEach { options.release.set(25) }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SpotBugs — the project's Java linter. Bytecode static analysis over the engine + mixin-service classes (bug patterns:
+// null derefs, ignored return values, bad casts, concurrency mistakes). Chosen over a style checker because the code is
+// intentionally dense; SpotBugs flags likely BUGS, not formatting. Run `./gradlew spotbugsEngine spotbugsMixinservice`
+// (or just `check`); the HTML report lands in build/reports/spotbugs/. Tool ASM 9.8 reads Java 25 (class v69) bytecode.
+// ---------------------------------------------------------------------------------------------------------------------
+spotbugs {
+    toolVersion.set("4.9.3")
+    effort.set(Effort.MAX)              // deepest analysis
+    reportLevel.set(Confidence.MEDIUM)  // report medium+ confidence (drop the low-confidence noise)
+    excludeFilter.set(file("config/spotbugs/exclude.xml"))
+    ignoreFailures.set(false)           // a reported bug fails the build / CI
+}
+tasks.withType<SpotBugsTask>().configureEach {
+    reports.create("html") { required.set(true) }
+    reports.create("xml") { required.set(false) }
+}
+// SpotBugs 4.9.x bundles an ASM that rejects class-file major version 69 (Java 25). Force ASM 9.8 (the first release that
+// reads v69) onto the spotbugs tool classpath so it can analyze this engine's Java 25 bytecode.
+configurations.matching { it.name == "spotbugs" }.configureEach {
+    resolutionStrategy.eachDependency { if (requested.group == "org.ow2.asm") useVersion("9.8") }
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // agentJar — assemble the self-contained injection agent for a given payload.
