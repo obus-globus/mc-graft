@@ -538,7 +538,22 @@ fn parse_ops(specs: &[OpSpec], patch_name: &str) -> Result<Vec<crate::bytecode::
                 let (o2, n2) = split_owner_name(to).ok_or_else(|| format!("patch {patch_name}: bad redirect_invoke `to` '{to}'"))?;
                 OpKind::RedirectInvoke { from: (o, n, d), to: (o2, n2) }
             }
-            other => return Err(format!("patch {patch_name}: unknown op action '{other}' (expected replace_const | redirect_invoke)")),
+            "set_return" => {
+                if in_method.is_none() {
+                    return Err(format!("patch {patch_name}: set_return requires `in` (the method whose body to replace)"));
+                }
+                let value = match &s.to {
+                    None => None,
+                    Some(toml::Value::Integer(i)) => Some(crate::bytecode::RetVal::Int(*i)),
+                    Some(toml::Value::Float(f)) => Some(crate::bytecode::RetVal::Float(*f)),
+                    Some(toml::Value::Boolean(b)) => Some(crate::bytecode::RetVal::Int(i64::from(*b))),
+                    Some(toml::Value::String(s)) if s == "null" => Some(crate::bytecode::RetVal::Null),
+                    Some(toml::Value::String(s)) => Some(crate::bytecode::RetVal::Str(s.clone())),
+                    Some(_) => return Err(format!("patch {patch_name}: set_return `to` must be int/float/bool/string/\"null\"")),
+                };
+                OpKind::SetReturn { value }
+            }
+            other => return Err(format!("patch {patch_name}: unknown op action '{other}' (expected replace_const | redirect_invoke | set_return)")),
         };
         out.push(Op { in_method, kind });
     }
@@ -963,6 +978,27 @@ mod tests {
         assert!(ristretto_classfile::ClassFile::from_bytes(&patched).is_ok());
         assert!(apply_ops(&patched, &[op("old", "x")]).is_err(), "'old' gone");
         assert!(apply_ops(&patched, &[op("new", "x")]).is_ok(), "'new' present");
+    }
+
+    #[test]
+    fn ops_set_return() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind, RetVal};
+        let j = b".class public com/demo/R\n.super java/lang/Object\n\
+                  .method public static getMax : ()I\n.code stack 1 locals 0\nbipush 64\nireturn\n.end code\n.end method\n";
+        let cls = assemble_j(j).unwrap().remove(0).1;
+        let op = Op {
+            in_method: Some(("getMax".into(), "()I".into())),
+            kind: OpKind::SetReturn { value: Some(RetVal::Int(999)) },
+        };
+        let patched = apply_ops(&cls, std::slice::from_ref(&op)).unwrap();
+        assert!(ristretto_classfile::ClassFile::from_bytes(&patched).is_ok(), "re-parses");
+        // the whole body was replaced, so the old constant 64 is gone
+        assert!(apply_ops(&patched, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 64, to: 1 } }]).is_err());
+        // but the new body returns 999
+        assert!(apply_ops(&patched, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 999, to: 1 } }]).is_ok());
     }
 
     // M2 regression: an op that matches nothing errors even when another op in the same patch matched.

@@ -35,3 +35,7 @@ format = "ops"
   action = "redirect_invoke"    # retarget a call (descriptor preserved)
   from   = "java/lang/System.currentTimeMillis()J"
   to     = "com/demo/FakeClock.now"
+  [[patch.op]]
+  action = "set_return"         # force a method to a constant (e.g. disable a check -> return false)
+  in     = "isPremium()Z"
+  to     = false

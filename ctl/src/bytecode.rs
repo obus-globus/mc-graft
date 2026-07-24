@@ -25,6 +25,17 @@ pub enum OpKind {
     ReplaceConstStr { from: String, to: String },
     /// `(owner, name, desc)` call site retargeted to `(owner, name)` — descriptor is preserved for stack safety.
     RedirectInvoke { from: (String, String, String), to: (String, String) },
+    /// Replace the target method's whole body with `return <value>` (value typed to the method's return descriptor).
+    /// `None` = the type's zero/null. Requires `in_method`. Straight-line body -> no stack-map frames needed.
+    SetReturn { value: Option<RetVal> },
+}
+
+/// A literal for `set_return`, interpreted against the method's return type.
+pub enum RetVal {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Null,
 }
 
 /// Apply `ops` to a class image, returning the rewritten bytes. Errors if a class won't parse, or if no op matched any
@@ -36,15 +47,35 @@ pub fn apply_ops(class_bytes: &[u8], ops: &[Op]) -> Result<Vec<u8>, String> {
     for m in &mut cf.methods {
         let mname = cp.try_get_utf8(m.name_index).map_err(|e| e.to_string())?.to_string();
         let mdesc = cp.try_get_utf8(m.descriptor_index).map_err(|e| e.to_string())?.to_string();
+        let ret = return_type(&mdesc);
         for attr in &mut m.attributes {
-            let Attribute::Code { code, .. } = attr else { continue };
+            let Attribute::Code { code, max_stack, exception_table, attributes, .. } = attr else { continue };
             for (oi, op) in ops.iter().enumerate() {
                 if let Some((n, d)) = &op.in_method {
                     if *n != mname || *d != mdesc {
                         continue;
                     }
                 }
-                hits[oi] += apply_op(code, &op.kind, cp)?;
+                match &op.kind {
+                    OpKind::SetReturn { value } => {
+                        let (body, ms) = return_body(ret, value, cp)?;
+                        *code = body;
+                        *max_stack = ms;
+                        exception_table.clear();
+                        // Offsets in these attributes point into the old body; drop them (the new body needs none).
+                        attributes.retain(|a| {
+                            !matches!(
+                                a,
+                                Attribute::StackMapTable { .. }
+                                    | Attribute::LineNumberTable { .. }
+                                    | Attribute::LocalVariableTable { .. }
+                                    | Attribute::LocalVariableTypeTable { .. }
+                            )
+                        });
+                        hits[oi] += 1;
+                    }
+                    kind => hits[oi] += apply_op(code, kind, cp)?,
+                }
             }
         }
     }
@@ -109,6 +140,7 @@ fn apply_op(code: &mut [Instruction], kind: &OpKind, cp: &mut ConstantPool) -> R
                 }
             }
         }
+        OpKind::SetReturn { .. } => unreachable!("set_return is applied in apply_ops, not apply_op"),
     }
     Ok(n)
 }
@@ -162,4 +194,95 @@ fn resolve_ref(cp: &ConstantPool, index: u16) -> Option<(bool, String, String, S
     let name = cp.try_get_utf8(*name_index).ok()?.to_string();
     let desc = cp.try_get_utf8(*desc_index).ok()?.to_string();
     Some((iface, owner, name, desc))
+}
+
+/// The return-type descriptor of a method descriptor (`(...)Ret` -> `Ret`).
+fn return_type(method_desc: &str) -> &str {
+    method_desc.rfind(')').map_or("V", |i| &method_desc[i + 1..])
+}
+
+/// Build a straight-line `return <value>` body for a method whose return descriptor is `ret`, plus its max_stack.
+fn return_body(ret: &str, value: &Option<RetVal>, cp: &mut ConstantPool) -> Result<(Vec<Instruction>, u16), String> {
+    let mut b = Vec::new();
+    let ms = match ret.chars().next() {
+        Some('V') => {
+            if value.is_some() {
+                return Err("set_return: a void method takes no value".into());
+            }
+            b.push(Instruction::Return);
+            0
+        }
+        Some('I' | 'Z' | 'B' | 'S' | 'C') => {
+            b.push(int_push(ret_int(value)?, cp)?);
+            b.push(Instruction::Ireturn);
+            1
+        }
+        Some('J') => {
+            let idx = cp.add_long(ret_long(value)?).map_err(|e| e.to_string())?;
+            b.push(Instruction::Ldc2_w(idx));
+            b.push(Instruction::Lreturn);
+            2
+        }
+        Some('F') => {
+            let idx = cp.add_float(ret_num(value)? as f32).map_err(|e| e.to_string())?;
+            b.push(ldc(idx));
+            b.push(Instruction::Freturn);
+            1
+        }
+        Some('D') => {
+            let idx = cp.add_double(ret_num(value)?).map_err(|e| e.to_string())?;
+            b.push(Instruction::Ldc2_w(idx));
+            b.push(Instruction::Dreturn);
+            2
+        }
+        Some('L' | '[') => match value {
+            None | Some(RetVal::Null) => {
+                b.push(Instruction::Aconst_null);
+                b.push(Instruction::Areturn);
+                1
+            }
+            Some(RetVal::Str(s)) => {
+                if ret != "Ljava/lang/String;" {
+                    return Err(format!("set_return: a string value can only be returned as String, not '{ret}'"));
+                }
+                let idx = cp.add_string(s).map_err(|e| e.to_string())?;
+                b.push(ldc(idx));
+                b.push(Instruction::Areturn);
+                1
+            }
+            Some(_) => return Err(format!("set_return: a numeric value can't be returned as '{ret}'")),
+        },
+        _ => return Err(format!("set_return: unsupported return type '{ret}'")),
+    };
+    Ok((b, ms))
+}
+
+fn ret_int(v: &Option<RetVal>) -> Result<i32, String> {
+    match v {
+        None => Ok(0),
+        Some(RetVal::Int(i)) => i32::try_from(*i).map_err(|_| "set_return: int value out of range".to_string()),
+        Some(_) => Err("set_return: this return type needs an integer value".into()),
+    }
+}
+fn ret_long(v: &Option<RetVal>) -> Result<i64, String> {
+    match v {
+        None => Ok(0),
+        Some(RetVal::Int(i)) => Ok(*i),
+        Some(_) => Err("set_return: a long return needs an integer value".into()),
+    }
+}
+fn ret_num(v: &Option<RetVal>) -> Result<f64, String> {
+    match v {
+        None => Ok(0.0),
+        Some(RetVal::Int(i)) => Ok(*i as f64),
+        Some(RetVal::Float(f)) => Ok(*f),
+        Some(_) => Err("set_return: this return type needs a numeric value".into()),
+    }
+}
+fn ldc(idx: u16) -> Instruction {
+    if idx <= u16::from(u8::MAX) {
+        Instruction::Ldc(idx as u8)
+    } else {
+        Instruction::Ldc_w(idx)
+    }
 }

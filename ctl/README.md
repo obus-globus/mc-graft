@@ -81,8 +81,8 @@ bare Krakatau `.j` file. Supported (all JDK-free):
   `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2`); otherwise it's found via `MCGRAFT_KRAK2` or `PATH`. Only needed when a patch
   actually contains `.j`.
 - **In-place bytecode `[[patch]] format = "ops"`** — structured edits to an existing class via `ristretto_classfile`:
-  `replace_const` (swap an int/String constant) and `redirect_invoke` (retarget a call). Base-robust (1→1 instruction
-  replacement; offsets + stack-map frames recomputed on write), no `krak2` needed.
+  `replace_const` (swap an int/String constant), `redirect_invoke` (retarget a call), and `set_return` (force a method
+  to return a constant/null). Base-robust (offsets + stack-map frames recomputed on write), no `krak2` needed.
 
 Patches apply before mod-info derivation, so a merge on `fabric.mod.json` correctly changes the derived
 id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on `sha256` mismatch (override

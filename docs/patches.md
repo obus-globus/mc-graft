@@ -23,11 +23,17 @@ the fragility below does not apply. `krak2` is located via `MCGRAFT_KRAK2` or `P
 actually contains `.j` — overlay/JSON-only patches never need it.
 
 **Shipped — in-place bytecode `[[patch]]` via the `ops` DSL (`ristretto_classfile`):** structured, base-robust edits to
-an existing class — `replace_const` (swap an int/String constant) and `redirect_invoke` (retarget a call, descriptor
-preserved). Each op is a 1→1 instruction replacement; ristretto stores branch/exception/line/StackMapTable offsets as
-*logical instruction offsets* and recomputes all byte offsets + frame deltas on write, so replacements are safe at any
-size — no round-trip fragility. (Verified end-to-end: an `ops` patch that changed a constant produced a class that loads
-under `-Xverify:all` and returns the new value.) No `krak2` needed for `ops`.
+an existing class:
+- `replace_const` — swap an int/String constant load for another.
+- `redirect_invoke` — retarget a call to a different owner/name (descriptor preserved for stack safety; resolves both
+  Methodref and InterfaceMethodref).
+- `set_return` — replace a method's whole body with `return <value>` (typed to its return descriptor: int/long/float/
+  double/boolean/String/null/void). Requires `in`. Great for pinning a getter or disabling a boolean check.
+
+`replace_const`/`redirect_invoke` are 1→1 instruction replacements; ristretto stores branch/exception/line/StackMapTable
+offsets as *logical instruction offsets* and recomputes byte offsets + frame deltas on write, so replacements are safe
+at any size. `set_return` writes a straight-line body (no frames needed) and drops the old StackMapTable. (All three
+verified end-to-end: patched classes load under `-Xverify:all` and return the new values.) No `krak2` needed for `ops`.
 
 **Deferred to phase 2:** the `krakatau-diff` `[[patch]]` format (the base-fragile *diff*-of-disassembly path — `ops`
 supersedes it for most needs) and RFC-6902 `jsonpatch`. Both are parsed and **rejected with a clear message** rather than
@@ -203,7 +209,8 @@ phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *prim
 5. ✅ In-place bytecode `[[patch]] format = "ops"` on `ristretto_classfile` — `replace_const`, `redirect_invoke`.
 6. ✅ Ship `krak2` self-contained — `build.rs` embeds it via `include_bytes!` when built with
       `MCGRAFT_BUNDLE_KRAK2=/path/to/krak2` (else runtime falls back to `MCGRAFT_KRAK2` / `PATH`). Release CI bundles it.
-7. ⏳ More `ops` (`insert_before`/`remove_call`/`set_return` — need frame-index adjustment); `ristretto` post-verify of
+7. ✅ `set_return` op (whole-body replacement; no frame-index adjustment needed).
+8. ⏳ Stack-changing ops (`insert_before`/`remove_call` — need frame-index adjustment); `ristretto` post-verify of
       patched classes; RFC-6902 `jsonpatch`; the `krakatau-diff` `[[patch]]` format.
 
 ## Open questions (phase 2)
