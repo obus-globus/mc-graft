@@ -36,7 +36,11 @@ enum Cmd {
     /// Open the graphical UI (also the default when run with no subcommand).
     Ui,
     /// List running (attachable) JVMs; Minecraft instances are marked.
-    List,
+    List {
+        /// Print full details per JVM: loader version, game dir, java binary and the whole command line.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Build the mc-graft agent jar for a payload mod (drives Gradle's agentJar task).
     Build(BuildCliArgs),
     /// Assemble an agent jar WITHOUT a JDK/Gradle, splicing a payload into the precompiled base jar.
@@ -132,7 +136,7 @@ fn main() {
                 die(&e);
             }
         }
-        Some(Cmd::List) => cmd_list(),
+        Some(Cmd::List { verbose }) => cmd_list(verbose),
         Some(Cmd::Build(a)) => cmd_build(a),
         Some(Cmd::Pack(a)) => cmd_pack(a),
         Some(Cmd::Inject(a)) => cmd_inject(a),
@@ -144,19 +148,43 @@ fn main() {
     }
 }
 
-fn cmd_list() {
+fn cmd_list(verbose: bool) {
     let jvms = procs::list_jvms();
     if jvms.is_empty() {
         println!("No attachable JVMs found.");
         return;
     }
-    println!("{:>8}  {:<3}  {:<12}  MAIN / COMMAND", "PID", "MC", "MC VER");
+    if verbose {
+        for j in &jvms {
+            let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "—".into());
+            let loader = match &j.loader_version {
+                Some(v) => format!("{} {v}", j.loader.label()),
+                None => j.loader.label().to_string(),
+            };
+            println!("PID {}", j.pid);
+            println!("  minecraft   {}", if j.is_minecraft { "yes" } else { "not detected" });
+            println!("  mc version  {}", dash(&j.mc_version));
+            // Only warn about loader support for something we actually think is Minecraft; on an unrelated JVM
+            // "unknown loader" is just noise.
+            let unsupported = j.is_minecraft && !j.loader.supported();
+            println!("  loader      {}{}", loader, if unsupported { "   (UNSUPPORTED by mc-graft)" } else { "" });
+            println!("  main class  {}", j.main);
+            println!("  game dir    {}", dash(&j.game_dir));
+            println!("  java        {}", dash(&j.java_exe));
+            println!("  cmdline     {}", j.cmdline);
+            println!();
+        }
+        return;
+    }
+    println!("{:>8}  {:<3}  {:<12}  {:<10}  MAIN / COMMAND", "PID", "MC", "MC VER", "LOADER");
     for j in &jvms {
         let mark = if j.is_minecraft { "yes" } else { "" };
         let ver = j.mc_version.clone().unwrap_or_default();
-        let label = if j.main == "?" { truncate(&j.cmdline, 90) } else { j.main.clone() };
-        println!("{:>8}  {:<3}  {:<12}  {}", j.pid, mark, ver, label);
+        let label = if j.main == "?" { truncate(&j.cmdline, 80) } else { j.main.clone() };
+        let loader = if j.is_minecraft { j.loader.label() } else { "" };
+        println!("{:>8}  {:<3}  {:<12}  {:<10}  {}", j.pid, mark, ver, loader, label);
     }
+    println!("\n(use `mcgraft list --verbose` for game dir, loader version and the full command line)");
 }
 
 fn cmd_build(a: BuildCliArgs) {

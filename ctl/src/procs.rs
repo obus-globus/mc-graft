@@ -11,6 +11,41 @@ pub struct Jvm {
     /// Parsed Minecraft `--version <x>` if present.
     pub mc_version: Option<String>,
     pub is_minecraft: bool,
+    /// Which mod loader this client is running, inferred from the command line.
+    pub loader: Loader,
+    /// Loader version, when a versioned loader jar is identifiable on the classpath.
+    pub loader_version: Option<String>,
+    /// `--gameDir`, i.e. where the payload's config/data will land.
+    pub game_dir: Option<String>,
+    /// The `java`/`javaw` binary that launched it — useful when several JDKs are installed.
+    pub java_exe: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Loader {
+    Vanilla,
+    Fabric,
+    Quilt,
+    NeoForge,
+    Forge,
+    Unknown,
+}
+
+impl Loader {
+    pub fn label(self) -> &'static str {
+        match self {
+            Loader::Vanilla => "Vanilla",
+            Loader::Fabric => "Fabric",
+            Loader::Quilt => "Quilt",
+            Loader::NeoForge => "NeoForge",
+            Loader::Forge => "Forge",
+            Loader::Unknown => "unknown",
+        }
+    }
+    /// Whether mc-graft has a platform implementation for this loader.
+    pub fn supported(self) -> bool {
+        matches!(self, Loader::Vanilla | Loader::Fabric | Loader::NeoForge)
+    }
 }
 
 /// All attachable JVMs, Minecraft ones first, then by pid.
@@ -50,7 +85,53 @@ fn classify(pid: i32, args: &[String]) -> Jvm {
         || (joined.contains("minecraft") && joined.contains("-cp"));
     let main = mainish(args);
     let mc_version = flag_value(args, "--version");
-    Jvm { pid, cmdline, main, mc_version, is_minecraft }
+    let (loader, loader_version) = detect_loader(joined);
+    Jvm {
+        pid,
+        main,
+        mc_version,
+        is_minecraft,
+        loader,
+        loader_version,
+        game_dir: flag_value(args, "--gameDir"),
+        java_exe: args.first().cloned(),
+        cmdline,
+    }
+}
+
+/// Infer the mod loader (and its version, when a versioned loader jar is on the classpath) from the command line.
+///
+/// Order matters: a NeoForge/Forge launch also mentions `minecraft`, and Quilt ships a Fabric compatibility layer whose
+/// jars mention `fabric`, so the more specific markers are tested first.
+fn detect_loader(joined: &str) -> (Loader, Option<String>) {
+    let low = joined.to_ascii_lowercase();
+    let loader = if low.contains("org.quiltmc.loader") || low.contains("quilt-loader") {
+        Loader::Quilt
+    } else if low.contains("net.neoforged") || low.contains("neoforge") {
+        Loader::NeoForge
+    } else if low.contains("net.minecraftforge") || low.contains("forgewrapper") || low.contains("minecraftforge") {
+        Loader::Forge
+    } else if low.contains("net.fabricmc.loader") || low.contains("knot.knotclient") || low.contains("fabric-loader") {
+        Loader::Fabric
+    } else if low.contains("net.minecraft.client.main.main") {
+        Loader::Vanilla
+    } else {
+        Loader::Unknown
+    };
+    let stem = match loader {
+        Loader::Fabric => "fabric-loader-",
+        Loader::Quilt => "quilt-loader-",
+        Loader::NeoForge => "neoforge-",
+        Loader::Forge => "forge-",
+        _ => return (loader, None),
+    };
+    // e.g. ".../fabric-loader-0.18.3.jar" -> "0.18.3"
+    let version = low.find(stem).map(|i| &joined[i + stem.len()..]).and_then(|rest| {
+        let end = rest.find(".jar").unwrap_or(rest.len());
+        let v = rest[..end].trim();
+        (!v.is_empty() && v.starts_with(|c: char| c.is_ascii_digit())).then(|| v.to_string())
+    });
+    (loader, version)
 }
 
 /// The launched entry point: `-jar X` target, else the main class (first non-`-flag`, non-`java` arg after options).
@@ -75,11 +156,11 @@ const VALUE_FLAGS: &[&str] = &[
     "--source",
 ];
 
-/// Whether `s` looks like a fully-qualified Java class name (`a.b.C`), as opposed to a module directive, a path, or a
-/// `key=value`. This is the backstop that keeps a stray option value out of the "main class" column.
+/// Whether `s` looks like a Java class name, as opposed to a module directive, a path, or a `key=value`. Dots are
+/// optional so a default-package main class (`Idle`) still resolves; what this rejects is `=`, `/` and `\`, which
+/// between them cover option values (`java.base/java.lang=ALL-UNNAMED`) and bare paths.
 fn looks_like_class_name(s: &str) -> bool {
     !s.is_empty()
-        && s.contains('.')
         && !s.contains('=')
         && !s.contains('/')
         && !s.contains('\\')

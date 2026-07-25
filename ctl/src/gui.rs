@@ -39,6 +39,8 @@ struct App {
     // discovery
     jvms: Vec<procs::Jvm>,
     selected: Option<i32>,
+    /// Whether the selected JVM's detail window is open.
+    show_details: bool,
     last_refresh: Instant,
     // build inputs
     repo: Option<PathBuf>,
@@ -86,6 +88,7 @@ impl App {
         let mut app = App {
             jvms: Vec::new(),
             selected: None,
+            show_details: false,
             last_refresh: Instant::now() - Duration::from_secs(10),
             repo,
             payload: String::new(),
@@ -376,6 +379,77 @@ impl App {
     }
 }
 
+impl App {
+    /// Detail window for the selected JVM: what it is, whether mc-graft can inject into it, and the raw command line
+    /// the identification was derived from (so a wrong guess is diagnosable rather than just wrong).
+    fn details_window(&mut self, ctx: &egui::Context) {
+        if !self.show_details {
+            return;
+        }
+        let Some(jvm) = self.selected.and_then(|pid| self.jvms.iter().find(|j| j.pid == pid).cloned()) else {
+            self.show_details = false; // selection went away (process exited between refreshes)
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("JVM {} details", jvm.pid))
+            .open(&mut open)
+            .default_width(560.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let row = |ui: &mut egui::Ui, k: &str, v: &str| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([120.0, 18.0], egui::Label::new(egui::RichText::new(k).strong()));
+                        ui.label(v);
+                    });
+                };
+                let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "—".into());
+
+                row(ui, "Minecraft", if jvm.is_minecraft { "yes" } else { "not detected" });
+                row(ui, "MC version", &dash(&jvm.mc_version));
+                let loader = match &jvm.loader_version {
+                    Some(v) => format!("{} {v}", jvm.loader.label()),
+                    None => jvm.loader.label().to_string(),
+                };
+                row(ui, "Mod loader", &loader);
+                row(ui, "Main class", &jvm.main);
+                row(ui, "Game dir", &dash(&jvm.game_dir));
+                row(ui, "Java binary", &dash(&jvm.java_exe));
+
+                ui.add_space(6.0);
+                if !jvm.is_minecraft {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xd0, 0x90, 0x30),
+                        "This doesn't look like Minecraft. Injecting is still allowed, but the agent expects a client.",
+                    );
+                } else if !jvm.loader.supported() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xd0, 0x90, 0x30),
+                        format!(
+                            "mc-graft has no platform for {} — supported loaders are Vanilla, Fabric and NeoForge.",
+                            jvm.loader.label()
+                        ),
+                    );
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(0x40, 0xa0, 0x40), "Supported target.");
+                }
+
+                ui.add_space(6.0);
+                ui.collapsing("Full command line", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = jvm.cmdline.clone());
+                        }
+                        ui.weak("everything above is derived from this");
+                    });
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&jvm.cmdline).monospace()).wrap());
+                    });
+                });
+            });
+        self.show_details = open;
+    }
+}
+
 /// Spawn a GUI worker that ALWAYS delivers a terminal result, even if its body panics.
 ///
 /// `busy` is cleared only when a `BuildDone`/`InjectDone` arrives, and `App` holds its own clone of the sender, so a
@@ -438,6 +512,15 @@ impl eframe::App for App {
                 if ui.button("Refresh").on_hover_text("Refresh now").clicked() {
                     self.refresh();
                 }
+                let has_sel = self.selected.is_some();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Details"))
+                    .on_hover_text("Minecraft version, mod loader, game directory and full command line")
+                    .on_disabled_hover_text("select a JVM first")
+                    .clicked()
+                {
+                    self.show_details = true;
+                }
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -459,6 +542,8 @@ impl eframe::App for App {
                 }
             });
         });
+
+        self.details_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::CollapsingHeader::new("① Build agent").default_open(true).show(ui, |ui| {
