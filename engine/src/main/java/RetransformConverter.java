@@ -186,11 +186,17 @@ public class RetransformConverter {
         for (String sig : EMITTED_RT_CALLS) {
             int a = sig.indexOf('|'), b = sig.indexOf('|', a + 1);
             String owner = sig.substring(0, a), name = sig.substring(a + 1, b), desc = sig.substring(b + 1);
+            // <clinit> is never the target of an emitted call site; it runs on class init.
+            if (name.equals("<clinit>")) continue;
             try {
                 Class<?> c = Class.forName(owner.replace('/', '.'), false, loader);
                 Type[] at = Type.getArgumentTypes(desc);
                 Class<?>[] ps = new Class<?>[at.length];
                 for (int i = 0; i < at.length; i++) ps[i] = classForType(at[i], loader);
+                // A constructor is INVOKESPECIAL <init>, not a method — getMethod can never find one, so looking it up
+                // that way reports a false break on every injection (the sidecar <clinit> does
+                // `NEW WeakIdentityHashMap; INVOKESPECIAL <init>()V`). Resolve it as a constructor instead.
+                if (name.equals("<init>")) { c.getConstructor(ps); continue; }
                 java.lang.reflect.Method m = c.getMethod(name, ps);
                 Class<?> want = classForType(Type.getReturnType(desc), loader);
                 if (!m.getReturnType().equals(want))
