@@ -125,34 +125,9 @@ struct InjectArgs {
     no_follow: bool,
 }
 
-/// Detach from the console before showing the GUI (Windows only).
-///
-/// This binary is a *console-subsystem* executable, which is what a primarily-CLI tool should be: the alternative,
-/// `#![windows_subsystem = "windows"]`, is a compile-time choice that would silently discard all CLI output. The
-/// cost is that Windows allocates a console window for any console-subsystem process that wasn't launched from one —
-/// so double-clicking the exe to get the GUI also pops an empty black window.
-///
-/// `FreeConsole` detaches us from whichever console we're attached to. Double-clicked, we were that console's only
-/// process, so it closes. Launched from an existing shell, the console belongs to the shell and merely loses us as a
-/// client — the window stays and the prompt is unaffected. Either way we're entering GUI mode and want no stdio.
-#[cfg(windows)]
-#[allow(unsafe_code)] // the crate's ONE exception — see the unsafe_code note in Cargo.toml
-fn detach_console() {
-    // Declared inline rather than pulling in windows-sys for a single call.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn FreeConsole() -> i32;
-    }
-    unsafe {
-        FreeConsole();
-    }
-}
-
 fn main() {
     match Cli::parse().cmd {
         None | Some(Cmd::Ui) => {
-            #[cfg(windows)]
-            detach_console();
             if let Err(e) = gui::run() {
                 die(&e);
             }

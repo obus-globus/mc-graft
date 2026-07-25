@@ -17,10 +17,7 @@ opt-level = "z"
 # Lint policy (the project's Rust linter). `cargo clippy` enforces this locally; CI additionally runs
 # `cargo clippy --all-targets -- -D warnings`. Kept in the manifest so the policy travels with the crate.
 [lints.rust]
-# "deny", not "forbid", for exactly one reason: main::detach_console needs a single FFI call to FreeConsole so the GUI
-# doesn't leave an orphan console window on Windows. That one call carries an explicit #[allow(unsafe_code)]; every
-# other unsafe block in the crate is still a hard error, so the exception stays visible and auditable.
-unsafe_code = "deny"
+unsafe_code = "forbid"        # the control app needs no unsafe; forbid it outright
 [lints.clippy]
 all = { level = "deny", priority = -1 }   # deny the full default clippy set (correctness/suspicious/style/complexity/perf)
 
