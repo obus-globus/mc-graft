@@ -54,38 +54,80 @@ fn classify(pid: i32, args: &[String]) -> Jvm {
 }
 
 /// The launched entry point: `-jar X` target, else the main class (first non-`-flag`, non-`java` arg after options).
-fn mainish(args: &[String]) -> String {
+/// JVM options that take their value as a SEPARATE following argument. Anything here must consume the next arg, or
+/// that value gets mistaken for the main class — `--add-opens java.base/java.lang=ALL-UNNAMED` is on essentially every
+/// modded launch, and it used to make the process list read `java.base/java.lang=ALL-UNNAMED`.
+const VALUE_FLAGS: &[&str] = &[
+    "-cp",
+    "-classpath",
+    "--class-path",
+    "-p",
+    "--module-path",
+    "--upgrade-module-path",
+    "--add-opens",
+    "--add-exports",
+    "--add-reads",
+    "--add-modules",
+    "--patch-module",
+    "--limit-modules",
+    "-m",
+    "--module",
+    "--source",
+];
+
+/// Whether `s` looks like a fully-qualified Java class name (`a.b.C`), as opposed to a module directive, a path, or a
+/// `key=value`. This is the backstop that keeps a stray option value out of the "main class" column.
+fn looks_like_class_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.contains('.')
+        && !s.contains('=')
+        && !s.contains('/')
+        && !s.contains('\\')
+        && s.split('.').all(|seg| {
+            !seg.is_empty()
+                && seg.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
+pub(crate) fn mainish(args: &[String]) -> String {
     if let Some(i) = args.iter().position(|a| a == "-jar") {
         if let Some(j) = args.get(i + 1) {
             return j.clone();
         }
     }
+    // Known entry points win outright — including the launcher wrappers, which otherwise fall through to the
+    // heuristic. Prism/MultiMC start their own EntryPoint and only reach the real client main class later.
     for known in [
         "net.fabricmc.loader.impl.launch.knot.KnotClient",
         "net.minecraft.client.main.Main",
         "cpw.mods.bootstraplauncher.BootstrapLauncher",
+        "org.prismlauncher.EntryPoint",
+        "org.multimc.EntryPoint",
+        "io.github.zekerzhayard.forgewrapper.installer.Main",
     ] {
         if args.iter().any(|a| a == known) {
             return known.to_string();
         }
     }
     let mut skip_next = false;
-    for (i, a) in args.iter().enumerate().skip(1) {
+    for a in args.iter().skip(1) {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if a == "-cp" || a == "-classpath" || a == "-p" || a == "--module-path" {
+        if VALUE_FLAGS.contains(&a.as_str()) {
             skip_next = true;
             continue;
         }
         if a.starts_with('-') {
             continue;
         }
-        if i == 0 {
-            continue;
+        // Only accept something that actually looks like a class name; an option value that slipped through (or a
+        // bare path) is not a main class, and reporting it is worse than reporting nothing.
+        if looks_like_class_name(a) {
+            return a.clone();
         }
-        return a.clone();
     }
     "?".into()
 }

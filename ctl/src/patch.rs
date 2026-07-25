@@ -1099,6 +1099,31 @@ mod tests {
         assert!(man.apply.verify_target, "unspecified verify-target must stay ON, not silently off");
     }
 
+    /// A modded launch command line must not report an option value as the main class.
+    #[test]
+    fn main_class_detection_survives_modded_cmdlines() {
+        use crate::procs::mainish;
+        let split = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+
+        // The reported case: --add-opens takes a separate value that doesn't start with '-'.
+        let prism = split(
+            "java -Xmx4G --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED \
+             -Djava.library.path=C:\\natives -cp C:\\libs\\fabric-loader.jar org.prismlauncher.EntryPoint",
+        );
+        assert_eq!(mainish(&prism), "org.prismlauncher.EntryPoint");
+
+        // Plain Fabric launch still resolves to the known entry point.
+        let fabric = split(
+            "java -Xmx2G -cp /libs/a.jar net.fabricmc.loader.impl.launch.knot.KnotClient --username Dev --version 26.2",
+        );
+        assert_eq!(mainish(&fabric), "net.fabricmc.loader.impl.launch.knot.KnotClient");
+
+        // An unknown main class is still found...
+        assert_eq!(mainish(&split("java -Xmx1G -cp /x.jar com.example.Main --flag")), "com.example.Main");
+        // ...but a stray option value is NOT reported as one.
+        assert_eq!(mainish(&split("java --add-modules java.se.ee -jar")), "?");
+    }
+
     /// P6 regression: delete and rename-source go through the ledger, and two bundles with the same FILE NAME are
     /// still distinct patches.
     #[test]
