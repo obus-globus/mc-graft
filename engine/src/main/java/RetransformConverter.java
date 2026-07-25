@@ -145,6 +145,7 @@ public class RetransformConverter {
         // and restore their original modifiers/structural attributes while retaining X's transformed method bodies and
         // supported class-file version (Mixin intentionally lifts older dependency classes to its compatibility level).
         restoreOriginalSchema(O, X);
+        recordRtCalls(X); recordRtCalls(S);
         r.target = write(X, original);
         // emit sidecar + state as one combined verify pass isn't needed; caller defines both
         r.sidecar = write(S, null);
@@ -155,6 +156,66 @@ public class RetransformConverter {
     }
     byte[] stateBytes;
     public byte[] stateBytes() { return stateBytes; }
+
+    /** Every {@code mcgraft/rt/*} call site the converter actually EMITTED, as {@code owner|name|desc}.
+     *
+     *  <p>These descriptors are hand-built by string concatenation at a dozen-odd emit sites, and the runtime helpers
+     *  they name are an implicit contract that nothing checks: a mismatch compiles fine, passes the verifier, and only
+     *  surfaces as NoSuchMethodError/IllegalAccessError when the game happens to execute that path — i.e. AFTER the
+     *  retransforms are published and the injection can no longer be rolled back. Two review criticals were exactly
+     *  this shape (an emitted call to a method that didn't exist; a trampoline emitted private but called cross-class).
+     *
+     *  <p>Recording what was emitted, rather than maintaining a hand-written list of what we THINK is emitted, is the
+     *  point: a list would drift from the emit sites, which is the failure mode being defended against. */
+    public static final Set<String> EMITTED_RT_CALLS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    static void recordRtCalls(ClassNode cn) {
+        for (MethodNode m : cn.methods) {
+            if (m.instructions == null) continue;
+            for (AbstractInsnNode p = m.instructions.getFirst(); p != null; p = p.getNext())
+                if (p instanceof MethodInsnNode mi && mi.owner.startsWith("mcgraft/rt/"))
+                    EMITTED_RT_CALLS.add(mi.owner + "|" + mi.name + "|" + mi.desc);
+        }
+    }
+
+    /** Resolve every recorded call against {@code loader}; returns a description of each one that does NOT resolve
+     *  (empty list = contract intact). Uses {@code getMethod}, i.e. PUBLIC only — which is what an INVOKESTATIC from a
+     *  different class actually requires, so this also catches a helper that exists but isn't reachable. */
+    public static List<String> unresolvedRtCalls(ClassLoader loader) {
+        List<String> bad = new ArrayList<>();
+        for (String sig : EMITTED_RT_CALLS) {
+            int a = sig.indexOf('|'), b = sig.indexOf('|', a + 1);
+            String owner = sig.substring(0, a), name = sig.substring(a + 1, b), desc = sig.substring(b + 1);
+            try {
+                Class<?> c = Class.forName(owner.replace('/', '.'), false, loader);
+                Type[] at = Type.getArgumentTypes(desc);
+                Class<?>[] ps = new Class<?>[at.length];
+                for (int i = 0; i < at.length; i++) ps[i] = classForType(at[i], loader);
+                java.lang.reflect.Method m = c.getMethod(name, ps);
+                Class<?> want = classForType(Type.getReturnType(desc), loader);
+                if (!m.getReturnType().equals(want))
+                    bad.add(sig + " -> resolves but returns " + m.getReturnType().getName() + ", expected " + want.getName());
+            } catch (Throwable t) {
+                bad.add(sig + " -> " + t.getClass().getSimpleName() + (t.getMessage() == null ? "" : ": " + t.getMessage()));
+            }
+        }
+        return bad;
+    }
+
+    private static Class<?> classForType(Type t, ClassLoader loader) throws ClassNotFoundException {
+        switch (t.getSort()) {
+            case Type.VOID:    return void.class;
+            case Type.BOOLEAN: return boolean.class;
+            case Type.CHAR:    return char.class;
+            case Type.BYTE:    return byte.class;
+            case Type.SHORT:   return short.class;
+            case Type.INT:     return int.class;
+            case Type.FLOAT:   return float.class;
+            case Type.LONG:    return long.class;
+            case Type.DOUBLE:  return double.class;
+            default:           return Class.forName(t.getInternalName().replace('/', '.'), false, loader);
+        }
+    }
     public String stateName() { return stateName; }
 
     static void restoreOriginalSchema(ClassNode O, ClassNode X) {

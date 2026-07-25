@@ -154,6 +154,13 @@ public class FullInjectAgent {
             }
             pendingConv.put(internal, cv); conv++;
         } catch (Throwable ex) { skipped.add(internal); LateAttachVerifier.error("CONVERSION_FAILURE",internal,"target",rootMsg(ex)); InjectionLogger.error("convert fail "+internal+" -> "+rootMsg(ex)); } }
+        // Every mcgraft.rt call the converter emitted must actually resolve, PUBLICLY, before anything is published.
+        // Nothing else checks this contract: the descriptors are hand-built strings, and a mismatch stays invisible
+        // until the game executes that path — long after this gate, when the injection can no longer be rolled back.
+        for (String bad : RetransformConverter.unresolvedRtCalls(mcgraft.rt.Platform.LOADER)) {
+            LateAttachVerifier.error("RT_CONTRACT_UNRESOLVED", bad, "runtime", "emitted call does not resolve");
+            InjectionLogger.error("runtime contract broken: " + bad);
+        }
         if(!phaseFailures.isEmpty()||!skipped.isEmpty()||LateAttachVerifier.hasErrors()){
             LateAttachVerifier.writeReport();
             throw new IllegalStateException("Late-attach conversion gate failed; no partial conversion was published");
