@@ -83,8 +83,12 @@ struct BundleMeta {
     format: u32,
 }
 
+// Container-level `default` (not just on Manifest::apply, which only fires when the whole table is absent) so a
+// PARTIAL [apply] table parses. Otherwise `[apply]\non-conflict = "patch-wins"` dies with "missing field
+// verify-target" — and the natural way out of that error is to write `verify-target = false`, i.e. the failure mode
+// nudges users into disabling the base guard.
 #[derive(Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 struct ApplyCfg {
     on_conflict: OnConflict,
     verify_target: bool,
@@ -156,14 +160,22 @@ impl Jar {
         for i in 0..zip.len() {
             let mut e = zip.by_index(i).map_err(|e| format!("read jar entry: {e}"))?;
             let name = e.name().to_string();
+            let duplicate = map.contains_key(&name); // O(1); scanning `order` would be quadratic on a real mod jar
             if e.is_dir() {
                 map.insert(name.clone(), Entry::Dir);
             } else {
-                let mut buf = Vec::with_capacity(e.size() as usize);
+                // with_capacity from the DECLARED uncompressed size would let a crafted jar claim 4 GiB and make us
+                // allocate it before reading a byte; cap the hint and let the Vec grow honestly if it's really that big.
+                let mut buf = Vec::with_capacity((e.size() as usize).min(1 << 22));
                 e.read_to_end(&mut buf).map_err(|e| format!("read jar entry: {e}"))?;
                 map.insert(name.clone(), Entry::File(buf));
             }
-            order.push(name);
+            // Duplicate entry names are legal ZIP and do occur in shaded/repacked mod jars. `map` keeps the last, but
+            // pushing the name twice would make Jar::write call start_file twice and fail with a bare "Duplicate
+            // filename" that names the entry and not the cause. Keep first-seen order, write once.
+            if !duplicate {
+                order.push(name);
+            }
         }
         Ok(Jar { order, map })
     }
@@ -221,6 +233,14 @@ enum Source {
 
 impl Source {
     fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        // Sanitise here rather than per-caller: most callers pass a fixed or list_under-derived path, but a few take a
+        // free-form string straight from the untrusted manifest (`[[merge]] file`). Path::join REPLACES the root when
+        // given an absolute component, so `file = "/home/you/.ssh/id_rsa"` would read that file and merge it into the
+        // shipped jar; `../..` would escape the bundle. Only the Dir arm can traverse (Zip is a HashMap lookup), but
+        // the check is cheap and belongs on every path.
+        if reject_unsafe_entry(rel).is_err() {
+            return None;
+        }
         match self {
             Source::Dir(root) => std::fs::read(root.join(rel)).ok(),
             Source::Zip(m) => m.get(rel).cloned(),
@@ -288,9 +308,13 @@ pub fn apply_patches<F: FnMut(&str)>(
     // is a conflict resolved per that bundle's on-conflict policy.
     let mut written: HashMap<String, String> = HashMap::new();
 
-    for p in patches {
-        let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
-        log(&format!("applying patch: {name}"));
+    for (i, p) in patches.iter().enumerate() {
+        // The ledger identifies a patch by this string, and `claim` only reports a conflict when it CHANGES. Using the
+        // bare file name meant `--patch a/fix.mcpatch --patch b/fix.mcpatch` compared equal, so two unrelated bundles
+        // could clobber each other with conflict detection effectively off. Prefix the index to keep it unique.
+        let label = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
+        let name = format!("#{} {}", i + 1, label);
+        log(&format!("applying patch: {label}"));
         // Bare Krakatau: a single .j file assembles straight into the jar (add/replace by declared class name).
         if p.is_file() && is_j_file(p) {
             let jb = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -383,6 +407,9 @@ fn apply_one<F: FnMut(&str)>(
 
     // Ordered pipeline: delete -> rename -> overlay -> new (assemble) -> merge.
     for d in &man.delete {
+        // Deleting an entry another patch wrote destroys its contribution just as surely as overwriting it, so it
+        // must go through the same ledger — otherwise "patch A overlays x.png, patch B deletes it" is silent.
+        claim(written, &d.path, patch_name, man.apply.on_conflict, log)?;
         if jar.remove(&d.path) {
             log(&format!("  delete {}", d.path));
         } else {
@@ -399,9 +426,12 @@ fn apply_one<F: FnMut(&str)>(
             }
             Some(b) => {
                 reject_unsafe_entry(&r.to)?;
+                // Claim BOTH ends: the source disappears (destroying any earlier patch's write to it) and the target
+                // appears. Claiming only the target let "A writes a.json, B renames a.json -> b.json" pass silently.
+                claim(written, &r.from, patch_name, man.apply.on_conflict, log)?;
+                claim(written, &r.to, patch_name, man.apply.on_conflict, log)?;
                 jar.remove(&r.from);
                 jar.put(&r.to, b);
-                claim(written, &r.to, patch_name, man.apply.on_conflict, log)?;
                 log(&format!("  rename {} -> {}", r.from, r.to));
             }
         }
@@ -424,6 +454,7 @@ fn apply_one<F: FnMut(&str)>(
                 let mut keys: Vec<&String> = m.keys().collect();
                 keys.sort();
                 for k in keys {
+                    reject_unsafe_entry(k)?;
                     claim(written, k, patch_name, man.apply.on_conflict, log)?;
                     let verb = if jar.file(k).is_some() { "replace" } else { "add" };
                     jar.put(k, m[k].clone());
@@ -433,6 +464,7 @@ fn apply_one<F: FnMut(&str)>(
             Source::Dir(_) => {
                 for rel in src.list_under("") {
                     let bytes = src.read(&rel).unwrap_or_default();
+                    reject_unsafe_entry(&rel)?;
                     if rel.ends_with(".j") {
                         apply_assembled(jar, &bytes, patch_name, man.apply.on_conflict, written, log)?;
                     } else {
@@ -665,15 +697,28 @@ fn krak2_bin() -> Result<PathBuf, String> {
 #[cfg(embed_krak2)]
 fn embedded_krak2() -> Result<PathBuf, String> {
     use std::sync::OnceLock;
-    // Keep a TempPath (not NamedTempFile): the file persists for the process (deleted on exit) but its writable fd is
-    // CLOSED — Linux refuses to exec a file that still has an open writable descriptor (ETXTBSY).
-    static EXTRACTED: OnceLock<Result<tempfile::TempPath, String>> = OnceLock::new();
+    // Content-addressed cache rather than a per-run temp file. A TempPath held in a `static` is NEVER deleted — Rust
+    // does not run destructors for statics at exit — so the old approach leaked another ~4 MB 0755 binary into /tmp on
+    // every run that assembled a .j. Keying the name by content hash means one file per krak2 build, reused across
+    // runs, and re-verified each time so a tampered or truncated cache entry is rewritten rather than executed.
+    static EXTRACTED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match EXTRACTED.get_or_init(|| {
         static BYTES: &[u8] = include_bytes!(env!("MCGRAFT_KRAK2_EMBEDDED"));
+        let want = Sha256::digest(BYTES);
+        let name = format!("krak2-{:x}{}", want, if cfg!(windows) { ".exe" } else { "" });
+        let dir = cache_dir().join("mcgraft");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir {}: {e}", dir.display()))?;
+        let dst = dir.join(&name);
+
+        // Reuse only if the cached bytes still hash to what we embed.
+        if std::fs::read(&dst).is_ok_and(|got| Sha256::digest(&got) == want) {
+            return Ok(dst);
+        }
+        // Write via a temp file in the SAME directory, then rename: rename is atomic, and it also closes the writable
+        // fd before anything execs the result (Linux returns ETXTBSY for a file with an open writable descriptor).
         let mut tmp = tempfile::Builder::new()
-            .prefix("mcgraft-krak2-")
-            .suffix(if cfg!(windows) { ".exe" } else { "" }) // Windows execs by extension
-            .tempfile()
+            .prefix(".krak2-")
+            .tempfile_in(&dir)
             .map_err(|e| format!("extract embedded krak2: {e}"))?;
         tmp.write_all(BYTES).map_err(|e| format!("extract embedded krak2: {e}"))?;
         tmp.flush().ok();
@@ -683,11 +728,29 @@ fn embedded_krak2() -> Result<PathBuf, String> {
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("chmod embedded krak2: {e}"))?;
         }
-        Ok(tmp.into_temp_path()) // closes the fd, keeps the file on disk
+        tmp.into_temp_path()
+            .persist(&dst)
+            .map_err(|e| format!("install embedded krak2 at {}: {e}", dst.display()))?;
+        Ok(dst)
     }) {
-        Ok(tp) => Ok(tp.to_path_buf()),
+        Ok(p) => Ok(p.clone()),
         Err(e) => Err(e.clone()),
     }
+}
+
+/// Per-user cache directory, honouring `MCGRAFT_CACHE_DIR` then the platform convention, falling back to the temp dir.
+#[cfg(embed_krak2)]
+fn cache_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("MCGRAFT_CACHE_DIR") {
+        return PathBuf::from(d);
+    }
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    base.unwrap_or_else(std::env::temp_dir)
 }
 
 /// Assemble one Krakatau `.j` source into its class(es); returns `(internal-name, class-bytes)` per class. A `.j` may
@@ -744,9 +807,23 @@ fn apply_assembled<F: FnMut(&str)>(
 
 /// Reject a jar entry name that is absolute or contains a `..`/backslash component. Entry names flow from patch content
 /// (overlay paths, rename targets, a `.j`'s declared class), so keep them well-formed jar paths defensively.
+/// Reject any entry name from an untrusted bundle that isn't a plain relative path.
+///
+/// Covers: absolute paths (unix and UNC), `\` (a Windows separator that `split('/')` would not see as a component),
+/// `..` traversal, `.` components, a Windows drive prefix like `C:foo` (relative to that drive's cwd, not ours), empty
+/// names, and NUL/control bytes (which truncate or corrupt paths in downstream C consumers).
 fn reject_unsafe_entry(name: &str) -> Result<(), String> {
-    if name.starts_with('/') || name.contains('\\') || name.split('/').any(|c| c == "..") {
-        return Err(format!("unsafe patch entry name '{name}' (absolute path or ..-traversal)"));
+    let bad = name.is_empty()
+        || name.starts_with('/')
+        || name.contains('\\')
+        || name.chars().any(|c| c.is_control())
+        || name.split('/').any(|c| c == ".." || c == ".")
+        || name.split('/').next().is_some_and(|c| c.len() >= 2 && c.as_bytes()[1] == b':');
+    if bad {
+        return Err(format!(
+            "unsafe patch entry name '{name}' (must be a plain relative path: no absolute/drive prefix, \
+             '..', '.', backslash or control characters)"
+        ));
     }
     Ok(())
 }
@@ -982,6 +1059,44 @@ mod tests {
         assert!(reject_unsafe_entry("/etc/passwd").is_err());
         assert!(reject_unsafe_entry("../../escape").is_err());
         assert!(reject_unsafe_entry("a/../../b").is_err());
+        // hardened set: these all reached the output jar (or the filesystem, via Source::Dir) before
+        assert!(reject_unsafe_entry("").is_err(), "empty name");
+        assert!(reject_unsafe_entry("C:/windows/x").is_err(), "drive-absolute");
+        assert!(reject_unsafe_entry("C:x").is_err(), "drive-relative");
+        assert!(reject_unsafe_entry("..\\..\\escape").is_err(), "windows separator");
+        assert!(reject_unsafe_entry("a\0b").is_err(), "NUL byte");
+        assert!(reject_unsafe_entry("./a").is_err(), "'.' component");
+    }
+
+    /// P2 regression: `Source::read` must not escape the bundle even when handed a free-form manifest path.
+    #[test]
+    fn source_read_refuses_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inside.json"), b"{}").unwrap();
+        let src = Source::Dir(dir.path().to_path_buf());
+        assert!(src.read("inside.json").is_some(), "ordinary relative read still works");
+        // Path::join REPLACES the root on an absolute component, so this used to read the real file.
+        assert!(src.read("/etc/hostname").is_none(), "absolute path must not escape");
+        assert!(src.read("../../../etc/hostname").is_none(), "..-traversal must not escape");
+    }
+
+    /// P3 regression: a PARTIAL [apply] table must parse, filling the rest from defaults.
+    #[test]
+    fn partial_apply_table_parses() {
+        let man: Manifest = toml::from_str("[apply]\non-conflict = \"patch-wins\"\n").expect("partial [apply] parses");
+        assert!(man.apply.on_conflict == OnConflict::PatchWins);
+        assert!(man.apply.verify_target, "unspecified verify-target must stay ON, not silently off");
+    }
+
+    /// P6 regression: delete and rename-source go through the ledger, and two bundles with the same FILE NAME are
+    /// still distinct patches.
+    #[test]
+    fn ledger_covers_delete_and_distinguishes_same_named_patches() {
+        let mut w = HashMap::new();
+        let mut log = |_: &str| {};
+        claim(&mut w, "assets/x.png", "#1 fix.mcpatch", OnConflict::Error, &mut log).unwrap();
+        // a delete by a DIFFERENT patch that happens to share a file name must still conflict
+        assert!(claim(&mut w, "assets/x.png", "#2 fix.mcpatch", OnConflict::Error, &mut log).is_err());
     }
 
     // --- ristretto ops (need krak2 to assemble the fixture class; skip cleanly otherwise) ---

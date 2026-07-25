@@ -230,7 +230,7 @@ impl App {
         };
         let tx = self.tx.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        spawn_worker(tx.clone(), ctx.clone(), Msg::BuildDone, move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
             let res = build::build_agent(&repo, &req, move |l| {
@@ -280,7 +280,7 @@ impl App {
         self.log_line("---- pack (no JDK) ----");
         let tx = self.tx.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        spawn_worker(tx.clone(), ctx.clone(), Msg::BuildDone, move || {
             let (tx_a, ctx_a) = (tx.clone(), ctx.clone());
             let (tx_b, ctx_b) = (tx.clone(), ctx.clone());
             let result: Result<PathBuf, String> = (|| {
@@ -340,7 +340,7 @@ impl App {
         self.log_line(format!("---- inject -> PID {pid} ----"));
         let tx = self.tx.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        spawn_worker(tx.clone(), ctx.clone(), Msg::InjectDone, move || {
             match attach::load_agent(pid, &agent, &agent_args) {
                 Ok(r) if r.jvm_status == 0 && r.agent_rc == 0 => {
                     let _ = tx.send(Msg::Line("agent delivered (Agent_OnAttach=0)".into()));
@@ -374,6 +374,25 @@ impl App {
             ctx.request_repaint();
         });
     }
+}
+
+/// Spawn a GUI worker that ALWAYS delivers a terminal result, even if its body panics.
+///
+/// `busy` is cleared only when a `BuildDone`/`InjectDone` arrives, and `App` holds its own clone of the sender, so a
+/// dead worker never disconnects the channel to signal the loss. Without this, a panic anywhere in a worker — including
+/// inside the third-party zip/class-file parsers, which run on user-supplied jars — leaves the UI spinning with every
+/// button disabled and no recovery short of killing the process.
+fn spawn_worker<F, T>(tx: std::sync::mpsc::Sender<Msg>, ctx: egui::Context, done: fn(Result<T, String>) -> Msg, body: F)
+where
+    F: FnOnce() + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+            let _ = tx.send(done(Err("internal error: the worker thread panicked (backtrace on stderr)".into())));
+            ctx.request_repaint();
+        }
+    });
 }
 
 impl eframe::App for App {

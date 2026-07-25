@@ -455,8 +455,19 @@ fn assemble(
 ) -> Result<(), String> {
     let base_file = std::fs::File::open(base).map_err(|e| format!("open base {}: {e}", base.display()))?;
     let mut zin = zip::ZipArchive::new(base_file).map_err(|e| format!("base not a jar: {e}"))?;
-    let out_file = std::fs::File::create(out).map_err(|e| format!("create {}: {e}", out.display()))?;
-    let mut zout = zip::ZipWriter::new(out_file);
+    // Build into a sibling temp file and rename at the end. File::create(out) truncated the destination BEFORE the
+    // work that can still fail (reading the payload, ENOSPC, a zip error), so a failed pack left a truncated jar where
+    // a previously-good agent had been — and the GUI's Inject button only tests is_file(), so the user could go on to
+    // inject the wreckage. Same directory, so the rename is atomic and never crosses a filesystem.
+    let out_dir = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let tmp_out = tempfile::Builder::new()
+        .prefix(".mcgraft-pack-")
+        .suffix(".jar")
+        .tempfile_in(out_dir)
+        .map_err(|e| format!("create temp output in {}: {e}", out_dir.display()))?;
+    let mut zout = zip::ZipWriter::new(
+        tmp_out.reopen().map_err(|e| format!("open temp output: {e}"))?,
+    );
     let opts: zip::write::SimpleFileOptions =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -485,5 +496,9 @@ fn assemble(
         add(&format!("agent-libs/{n}"), b)?;
     }
     zout.finish().map_err(|e| e.to_string())?;
+    // Only now does the destination change: everything above either succeeded or returned without touching `out`.
+    tmp_out
+        .persist(out)
+        .map_err(|e| format!("install packed agent at {}: {e}", out.display()))?;
     Ok(())
 }
