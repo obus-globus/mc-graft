@@ -217,6 +217,103 @@ final class FabricPlatform implements LoaderPlatform {
         Field fProc = transformer.getClass().getDeclaredField("processor"); fProc.setAccessible(true); processor = fProc.get(transformer);
         fTransformedCount = processor.getClass().getDeclaredField("transformedCount"); fTransformedCount.setAccessible(true);
         InjectionLogger.info("acquired live Knot transformer "+transformer.getClass().getName()+" (env="+env+")");
+
+        // 4) the AW in (1) widened FUTURE bytes only; Mixin's ClassInfo cache still holds the OLD access. Reconcile.
+        reconcileClassInfoWithAw(trLoader);
+    }
+
+    /** Re-sync Mixin's cached {@code ClassInfo} member access flags with the AccessWidener registered in step 1.
+     *
+     *  <p>Registering the payload's widener on the live Knot ClassTweaker changes what
+     *  {@code KnotClassDelegate.getPreMixinClassBytes} hands back from that moment on: a member the widener makes
+     *  accessible comes out {@code public} where it used to be {@code private}. Mixin's {@code ClassInfo} cache,
+     *  however, was populated at GAME STARTUP — before the payload existed — and nothing invalidates it, so it still
+     *  records the original {@code private}.
+     *
+     *  <p>That split is fatal because {@code Locals.getLocalsAt} (Mixin 0.8.7, Locals.java:510) searches with the
+     *  TARGET METHOD'S OWN ACCESS as the search flags:
+     *  <pre>classInfo.findMethod(method, method.access | ClassInfo.INCLUDE_INITIALISERS)</pre>
+     *  and {@code ClassInfo.Member.matchesFlags} only matches a cached PRIVATE member when the search flags carry
+     *  {@code ACC_PRIVATE} ({@code INCLUDE_PRIVATE == ACC_PRIVATE}). Post-widening the MethodNode we hand over is
+     *  {@code public}, so the {@code ACC_PRIVATE} bit is absent, the cached private member is skipped, {@code findMethod}
+     *  returns null and Mixin throws {@code LVTGeneratorError: Could not locate method metadata for <name>}. It only
+     *  bites where an injector actually needs a generated LVT — a MixinExtras {@code @Local} sugar (or {@code @ModifyVariable})
+     *  on a class carrying no LocalVariableTable, which is every Minecraft class. Concretely: another mod {@code @Local}s
+     *  into {@code Minecraft.startUseItem()V} while Wurst's widener makes that private method public.
+     *
+     *  <p>We MUTATE the cached members in place rather than EVICTING the cache entry and letting {@code forName} rebuild
+     *  it. Both fix the LVT error, but eviction silently drops state that lives only on that object and cannot be
+     *  reconstructed from bytes, because {@code forName} rebuilds from the PRE-mixin view and so cannot know anything
+     *  about mixins already applied. Measured A/B on one instance (fabric-api + a mod {@code @Local}ing startUseItem,
+     *  same payload): the surviving {@code ClassInfo} for {@code Minecraft} kept all 8 registered {@code MixinInfo}s
+     *  under mutation but only 1 of 8 under eviction — the 7 registered at game startup are gone, since
+     *  {@code MixinInfo.readTargetClasses -> ClassInfo.addMixin} runs once at config-prepare and never again. That set
+     *  feeds {@code findMethodInHierarchy(..., includeMixins)}, i.e. resolution of members another mixin declares, so
+     *  eviction trades a loud failure for a latent one that would only surface on some particular mod combination.
+     *  (Merged methods happen to come back — the baseline re-drive re-applies those mixins and re-adds them — but the
+     *  mixin registrations do not.) Access flags are the only thing that actually went stale, so they are the only
+     *  thing we touch.
+     *
+     *  <p>The widened bytes are the source of truth (not a re-derivation of the widener's rules), which keeps this
+     *  correct for {@code extendable}/{@code mutable} entries too. Members absent from those bytes — anything a mixin
+     *  injected — are left alone. */
+    private void reconcileClassInfoWithAw(ClassLoader trLoader) {
+        Object awObj;
+        try { awObj = accessWidener(); } catch (Throwable t) { InjectionLogger.warn("ClassInfo AW reconcile skipped (widener unparsable): "+causeChain(t)); return; }
+        if (awObj == null) return;                                                 // payload declares no access-widener
+        try {
+            Class<?> ciCls = Class.forName("org.spongepowered.asm.mixin.transformer.ClassInfo", false, trLoader);
+            Field cacheF = ciCls.getDeclaredField("cache"); cacheF.setAccessible(true);
+            @SuppressWarnings("unchecked") Map<String,Object> cache = (Map<String,Object>) cacheF.get(null);
+            Method isTarget = awObj.getClass().getMethod("isTarget", String.class);
+            // ClassInfo's member sets + the class-level access word, all private final on the cached instance.
+            Field fMethods = ciCls.getDeclaredField("methods");      fMethods.setAccessible(true);
+            Field fInits   = ciCls.getDeclaredField("initialisers"); fInits.setAccessible(true);
+            Field fFields  = ciCls.getDeclaredField("fields");       fFields.setAccessible(true);
+            Field fAccess  = ciCls.getDeclaredField("access");       fAccess.setAccessible(true);
+            Field fMods = null;                                                     // ClassInfo.Member.modifiers (private final int)
+            int classes = 0, members = 0, missing = 0;
+            for (String internal : new ArrayList<>(cache.keySet())) {
+                if (!(boolean) isTarget.invoke(awObj, internal)) continue;          // widener never touches this class
+                Object ci = cache.get(internal); if (ci == null) continue;
+                byte[] widened = getPreMixinClassBytes(internal);                   // Knot's ClassTweaker already applied the AW
+                if (widened == null) { missing++; continue; }                       // generated/synthetic class with no bytes -> nothing to compare
+                ClassNode cn = new ClassNode();
+                new ClassReader(widened).accept(cn, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                Map<String,Integer> acc = new HashMap<>();
+                for (MethodNode m : cn.methods) acc.put("m"+m.name+m.desc, m.access);
+                for (FieldNode f : cn.fields)   acc.put("f"+f.name+f.desc, f.access);
+                boolean touched = false;
+                if (fAccess.getInt(ci) != cn.access) { fAccess.setInt(ci, cn.access); touched = true; }   // `accessible class` widens the class itself
+                for (Object[] set : new Object[][]{ {fMethods.get(ci),"m"}, {fInits.get(ci),"m"}, {fFields.get(ci),"f"} }) {
+                    for (Object member : (Set<?>) set[0]) {
+                        if (fMods == null) {                                        // resolve once; declared on the abstract Member superclass
+                            for (Class<?> k = member.getClass(); k != null && fMods == null; k = k.getSuperclass())
+                                try { fMods = k.getDeclaredField("modifiers"); } catch (NoSuchFieldException ignored) {}
+                            if (fMods == null) throw new NoSuchFieldException("ClassInfo.Member.modifiers (Mixin API drift)");
+                            fMods.setAccessible(true);
+                        }
+                        // match on the ORIGINAL identity: a mixin may have renamed the member, the bytes have not.
+                        Integer want = acc.get(set[1] + str(member,"getOriginalName") + str(member,"getOriginalDesc"));
+                        if (want == null) want = acc.get(set[1] + str(member,"getName") + str(member,"getDesc"));
+                        if (want == null || want == fMods.getInt(member)) continue; // mixin-injected, or already in sync
+                        fMods.setInt(member, want); members++; touched = true;
+                    }
+                }
+                if (touched) classes++;
+            }
+            InjectionLogger.info("ClassInfo AW reconcile: "+members+" member access flag(s) re-synced across "+classes
+                +" already-cached class(es)"+(missing > 0 ? " ("+missing+" AW target(s) had no readable bytes)" : ""));
+        } catch (Throwable t) {
+            // Non-fatal by itself: it only matters when another mod needs a generated LVT at a widened member. Loud,
+            // because when it DOES matter the symptom (LVTGeneratorError deep inside MixinExtras) points nowhere near here.
+            InjectionLogger.warn("ClassInfo AW reconcile FAILED (a mod @Local/@ModifyVariable on an access-widened method may now fail with LVTGeneratorError): "+causeChain(t));
+        }
+    }
+
+    /** ClassInfo.Member's getters are public but declared on a non-public nested class, so they need setAccessible. */
+    private static String str(Object o, String getter) throws Exception {
+        Method m = o.getClass().getMethod(getter); m.setAccessible(true); return String.valueOf(m.invoke(o));
     }
 
     // ---- §1c: baselines (X_others) captured while the payload is UNVISITED, then the payload activated -------------------------------
