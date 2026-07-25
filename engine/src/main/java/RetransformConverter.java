@@ -681,9 +681,26 @@ public class RetransformConverter {
         m.tryCatchBlocks.add(new TryCatchBlockNode(s, e, h, "java/lang/Throwable"));
     }
     /** append FIELD lookups to the sidecar <clinit>. */
+    /** Where the reflective-handle initializers must go: immediately AFTER the STATE PUTSTATIC that addSidecarClinit
+     *  emits, which is before any merged mixin {@code <clinit>} body.
+     *
+     *  <p>Appending them before the trailing RETURN instead (as this used to) puts them after the merged body — but that
+     *  body is ref-rewritten with inSidecar=true, so it can contain refGet$/refSet$/rmi$ calls that read F$/RM$. Those
+     *  would still be null, giving an NPE inside Field.get/AwReflect.invokeResolved, wrapped into an
+     *  ExceptionInInitializerError on the sidecar, which fails Conv.define and silently loads the target with no hooks. */
+    AbstractInsnNode reflectInitPoint(MethodNode clinit) {
+        for (AbstractInsnNode p = clinit.instructions.getFirst(); p != null; p = p.getNext())
+            if (p instanceof FieldInsnNode fi && fi.getOpcode() == Opcodes.PUTSTATIC
+                    && fi.owner.equals(sidecar) && fi.name.equals("STATE")) return p.getNext();
+        AbstractInsnNode ret = clinit.instructions.getLast();   // no STATE field: fall back to the trailing RETURN
+        while (ret != null && ret.getOpcode() != Opcodes.RETURN) ret = ret.getPrevious();
+        return ret;
+    }
+
     void addReflectInit(ClassNode S) {
-        MethodNode clinit = null; for (MethodNode m : S.methods) if (m.name.equals("<clinit>")) { clinit = m; break; }
-        AbstractInsnNode ret = clinit.instructions.getLast(); while (ret != null && ret.getOpcode() != Opcodes.RETURN) ret = ret.getPrevious();
+        MethodNode clinit = findMethod(S, "<clinit>");
+        if (clinit == null) throw new IllegalStateException("sidecar has no <clinit>; addSidecarClinit must run first");
+        AbstractInsnNode ret = reflectInitPoint(clinit);
         InsnList add = new InsnList();
         for (String key : reflectFields) {
             String nm = key.substring(0, key.indexOf(' '));
@@ -746,8 +763,9 @@ public class RetransformConverter {
     }
     /** resolve each private target Method reflectively in the sidecar <clinit>. */
     void addReflectMethodInit(ClassNode S) {
-        MethodNode clinit = null; for (MethodNode m : S.methods) if (m.name.equals("<clinit>")) { clinit = m; break; }
-        AbstractInsnNode ret = clinit.instructions.getLast(); while (ret != null && ret.getOpcode() != Opcodes.RETURN) ret = ret.getPrevious();
+        MethodNode clinit = findMethod(S, "<clinit>");
+        if (clinit == null) throw new IllegalStateException("sidecar has no <clinit>; addSidecarClinit must run first");
+        AbstractInsnNode ret = reflectInitPoint(clinit);   // see reflectInitPoint: must precede any merged mixin <clinit>
         InsnList add = new InsnList();
         for (String key : reflectMethods) {
             String nm = key.substring(0, key.indexOf(' ')), dc = key.substring(key.indexOf(' ') + 1);

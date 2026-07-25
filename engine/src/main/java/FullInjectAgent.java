@@ -96,8 +96,13 @@ public class FullInjectAgent {
         Map<String,String[]> gadded = new HashMap<>(); Map<String,String[]> gfield = new HashMap<>(); Map<String,List<String[]>> giface = new HashMap<>();
         List<String> phaseFailures = new ArrayList<>();
         for (String internal : targets) { try {
-            byte[] O = PLATFORM.originalBytes(internal); if(O==null) continue;
-            byte[] X = PLATFORM.transform(internal.replace('/','.'), O); if (X==null) continue;
+            // A dropped target must NOT be a silent `continue`: it contributes nothing to GADDED/GFIELD/GIFACE, so
+            // payload callers keep direct refs to members the class never received -> NoSuchMethodError/ClassCastException
+            // at first use, with nothing in the log pointing at the cause. Record it so the transactional gate sees it.
+            byte[] O = PLATFORM.originalBytes(internal);
+            if (O == null) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TARGET_MISSING",internal,"target","no original bytes available"); InjectionLogger.error("target missing "+internal); continue; }
+            byte[] X = PLATFORM.transform(internal.replace('/','.'), O);
+            if (X == null) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TARGET_MISSING",internal,"target","mixin transformer returned null"); InjectionLogger.error("transform returned null for "+internal); continue; }
             txMap.put(internal, new byte[][]{O, X}); RetransformConverter.collectAdded(internal, O, X, gadded, gfield, giface);
         } catch (Throwable e) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TRANSFORM_FAILURE",internal,"target",rootMsg(e)); InjectionLogger.error("transform fail "+internal+" -> "+rootMsg(e)); } }
         RetransformConverter.GADDED = gadded; RetransformConverter.GFIELD = gfield; RetransformConverter.GIFACE = giface;
