@@ -830,6 +830,16 @@ impl eframe::App for App {
                 if ui.button("clear").clicked() {
                     self.log.clear();
                 }
+                // Reporting a failed injection means pasting the log somewhere, and selecting hundreds of lines out of
+                // a scroll area by hand is miserable — worse, it silently truncates, which makes a report unreadable.
+                if ui
+                    .add_enabled(!self.log.is_empty(), egui::Button::new("copy"))
+                    .on_hover_text("Copy the whole log to the clipboard")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(self.log.join("\n"));
+                    self.status = format!("Copied {} log lines to the clipboard.", self.log.len());
+                }
             });
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 for l in &self.log {
