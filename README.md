@@ -68,7 +68,7 @@ payload.packages           optional: internal-name prefixes the payload's own cl
                            preflight); empty falls back to the exact payload class set — needed only for fat jars
 ```
 
-Optional bootstrap keys (all default to off, so a plain entrypoint mod needs none):
+Optional bootstrap keys (all default to off except where noted, so a plain entrypoint mod needs none):
 
 ```
 bootstrap.reloadResources    trigger a resource reload on attach to drive a mod that defers init to a reload listener
@@ -77,7 +77,19 @@ bootstrap.thawRegistries     built-in registries the mod writes into during init
 bootstrap.gameDirProperty    system property the mod reads for its data dir (e.g. LiquidBounce reads vspike.gameDir)
 bootstrap.joinGate.screen    MC screen internal name whose multiplayer-connect is deferred until the mod reports ready
                              (e.g. net/minecraft/client/gui/screens/ConnectScreen); omit to disable the join gate
+bootstrap.reloadAfterActivation   DEFAULT TRUE, and inert unless reloadResources is also set. The bootstrap reload
+                             necessarily runs BEFORE the mod's mixins are published (they go live only once the mod
+                             reports ready), so it runs against the pristine game: the mod's own reload-listener hooks
+                             never fire for it, while MC's listeners still tear down what those hooks rebuild (e.g.
+                             ShaderManager#apply wipes the GPU pipeline cache and re-precompiles vanilla's pipelines
+                             only). This drives one more reload afterwards to repair that. Prefer switching
+                             reloadResources off entirely if the mod does not actually need it.
 ```
+
+**A resource reload is not free under late attach.** `bootstrap.reloadResources` exists for a mod that genuinely defers
+its init to a reload listener, and nothing else should turn it on: the reload it drives always precedes the payload's
+mixins, so it can only destroy state the payload's reload hooks would have rebuilt. LiquidBounce's example config
+turns it off for exactly that reason (see the comment there).
 
 The AccessWidener namespace is read from the AW file's own header, and the sidecar relocation package (NeoForge only)
 defaults to `mcgraft/sc/` (`-Dmcgraft.sidecarPackage=` to override) — neither is hardcoded to any mod.

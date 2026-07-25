@@ -348,6 +348,7 @@ public class FullInjectAgent {
                     closeThaw(thaw); thaw=null;                                   // synchronous: init is done, publish now
                     activateLoadedTargets(INST);
                     mcgraft.rt.JoinGate.cancelAndOpen();
+                    if (cfg.reloadResources && cfg.reloadAfterActivation) drivePostActivationReload(mcCls, mc);   // repair the bootstrap reload: its listeners ran before these hooks existed
                     InjectionLogger.info("payload injection complete");
                 }
             } catch (Throwable t) {
@@ -687,6 +688,24 @@ public class FullInjectAgent {
             mcgraft.rt.JoinGate.cancelAndOpen();
         }
     }
+    /** Repair the bootstrap reload. Only reached when bootstrap.reloadResources drove one: that reload necessarily ran
+     *  before the payload's mixins were published, so a mixin that hooks a reload listener never fired for it, while
+     *  MC's own listeners still tore down the state that hook was meant to rebuild (ShaderManager#apply wipes the GPU
+     *  pipeline cache and re-precompiles vanilla's pipelines only). Re-run it now that the hooks exist. Best-effort and
+     *  non-blocking: reloadResourcePacks() returns a future we deliberately do not await — the apply stage lands on
+     *  this same main thread a few ticks later. Opt out with -Dmcgraft.postActivationReload=false. */
+    static void drivePostActivationReload(Class<?> mcCls, Object mc) {
+        if (!Boolean.parseBoolean(System.getProperty("mcgraft.postActivationReload", "true"))) {
+            InjectionLogger.warn("post-activation resource reload disabled by system property"); return; }
+        try {
+            InjectionLogger.info("(MC main thread) reloadResourcePacks() again, now with the payload's mixins live "
+                + "(reload-listener hooks could not run during the bootstrap reload)");
+            mcCls.getMethod("reloadResourcePacks").invoke(mc);
+        } catch (Throwable t) {
+            InjectionLogger.warn("post-activation resource reload failed (payload reload-listener hooks may not have run): "+rootMsg(t));
+        }
+    }
+
     /** An async-bootstrap payload initializes after its start event. Poll the configured readiness probe, then publish
      *  the target retransforms. Restore on every outcome, including timeout/interruption. */
     static void restoreRegistriesAfterInitialization(Class<?> mcCls, Object mc, RegistryThawSession thaw, PayloadConfig cfg) {
@@ -715,10 +734,16 @@ public class FullInjectAgent {
             // CAS below; the loser only ensures registries are restored (thaw.close is idempotent). This removes the
             // race where both the waiter and a slow-but-live main thread drive the join gate.
             java.util.concurrent.atomic.AtomicBoolean finalized=new java.util.concurrent.atomic.AtomicBoolean();
-            Runnable restore=()->{try{
-                if(ready.get())try{activateLoadedTargets(INST);}
+            Runnable restore=()->{boolean activated=false;try{
+                if(ready.get())try{activateLoadedTargets(INST);activated=true;}
                 catch(Throwable t){ready.set(false);LateAttachVerifier.error("TARGET_ACTIVATION_FAILURE","targets","bootstrap",rootMsg(t));InjectionLogger.error("target activation failed -> "+rootMsg(t));}
                 if(finalized.compareAndSet(false,true))restoreAndOpen(thaw,ready.get());else closeThaw(thaw);
+                // A bootstrap reload (bootstrap.reloadResources) necessarily ran while the payload's mixins were still
+                // INACTIVE — they are published right here, after the readiness probe. So it ran against the pristine
+                // game: the payload's own reload-listener hooks never fired, while MC's listeners still tore down what
+                // those hooks rebuild. Repair it with one reload now that the hooks exist. Scoped to the reload WE
+                // drove: a payload that needs no bootstrap reload gets no extra one.
+                if(activated&&cfg.reloadResources&&cfg.reloadAfterActivation)drivePostActivationReload(mcCls,mc);
             }finally{done.complete(null);}};
             try {
                 mcCls.getMethod("execute", Runnable.class).invoke(mc, restore);

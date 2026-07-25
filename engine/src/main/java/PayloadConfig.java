@@ -83,6 +83,13 @@ public final class PayloadConfig {
     // registers a custom packet type (e.g. Xaero's xaerominimap:main) can encode/decode it under late-attach without
     // fabric-api's own networking mixins being applied. (bootstrap.bridgePayloadCodecs=true)
     public final boolean bridgePayloadCodecs;
+    // Only meaningful together with reloadResources. That bootstrap reload necessarily runs BEFORE the payload's
+    // mixins are published (they are published only once the payload reports ready), so it runs against the pristine
+    // game: a mixin that hooks a reload listener never fires for it, and worse, MC's own reload listeners tear down
+    // state the payload's hook was supposed to rebuild (ShaderManager#apply wipes the GPU pipeline cache and
+    // re-precompiles vanilla's pipelines only). Repair that by driving one more reload once the mixins ARE live.
+    // Default ON, but inert unless reloadResources is set. (bootstrap.reloadAfterActivation=false)
+    public final boolean reloadAfterActivation;
 
     private PayloadConfig(Properties p) {
         id = p.getProperty("payload.id", "payload").trim();
@@ -117,6 +124,7 @@ public final class PayloadConfig {
         reopenKeyBindingsOwner = blankToNull(p.getProperty("bootstrap.reopenKeyBindings.owner", ""));
         reopenKeyBindingsMethod = blankToNull(p.getProperty("bootstrap.reopenKeyBindings.method", ""));
         bridgePayloadCodecs = Boolean.parseBoolean(p.getProperty("bootstrap.bridgePayloadCodecs", "false").trim());
+        reloadAfterActivation = Boolean.parseBoolean(p.getProperty("bootstrap.reloadAfterActivation", "true").trim());
     }
 
     /** True when the payload owns a class under one of its declared package roots. Empty roots -> false (callers then
