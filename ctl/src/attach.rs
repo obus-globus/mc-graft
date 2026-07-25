@@ -57,8 +57,47 @@ fn classify_agent_rc(body: &str) -> i32 {
     -1
 }
 
+/// Parse the `properties` reply, which is a `java.util.Properties` store: `key=value` per line, `#` comments, and
+/// backslash escapes on the value (`\:` `\=` `\\` and `\uXXXX` — Windows paths come back as `C\:\\Users\\...`).
+fn parse_properties(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let Some(eq) = line.find('=') else { continue };
+        let key = line[..eq].trim().to_string();
+        let mut val = String::new();
+        let mut chars = line[eq + 1..].chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                val.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(u) => val.push(u),
+                        None => val.push_str(&hex),
+                    }
+                }
+                Some('n') => val.push('\n'),
+                Some('t') => val.push('\t'),
+                Some('r') => val.push('\r'),
+                Some(other) => val.push(other), // \: \= \\ and friends are just the literal character
+                None => {}
+            }
+        }
+        out.push((key, val));
+    }
+    out.sort();
+    out
+}
+
 #[cfg(unix)]
-pub use unix_impl::load_agent;
+pub use unix_impl::{load_agent, system_properties};
 
 #[cfg(unix)]
 mod unix_impl {
@@ -235,11 +274,11 @@ mod unix_impl {
         }
     }
 
-    /// Load `agent_jar` into the JVM `pid`, passing `agent_args` (the raw agent option string — already joined).
-    pub fn load_agent(pid: i32, agent_jar: &Path, agent_args: &str) -> Result<AttachResult, String> {
-        let jar = agent_jar
-            .canonicalize()
-            .map_err(|e| format!("agent jar {}: {e}", agent_jar.display()))?;
+    /// Run one attach-protocol command and return the JVM's raw reply.
+    ///
+    /// Framing: protocol version, then the command and exactly three argument slots, each NUL-terminated (HotSpot reads
+    /// a fixed field count, so unused slots are sent empty rather than omitted).
+    fn execute(pid: i32, cmd: &str, args: [&str; 3]) -> Result<String, String> {
         let sock = ensure_socket(pid)?;
         let mut stream = match UnixStream::connect(&sock) {
             Ok(s) => s,
@@ -255,24 +294,33 @@ mod unix_impl {
         };
         stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
 
-        // The instrument agent's option string is "<absolute jar path>[=<args>]".
-        let option = if agent_args.is_empty() {
-            jar.display().to_string()
-        } else {
-            format!("{}={}", jar.display(), agent_args)
-        };
-        // Request framing: version, then command + up to 3 args, each NUL-terminated.
         let mut req: Vec<u8> = Vec::new();
         req.extend_from_slice(b"1\0");
-        for part in ["load", "instrument", "false", option.as_str()] {
-            req.extend_from_slice(part.as_bytes());
+        req.extend_from_slice(cmd.as_bytes());
+        req.push(0);
+        for a in args {
+            req.extend_from_slice(a.as_bytes());
             req.push(0);
         }
         stream.write_all(&req).map_err(|e| format!("write attach request: {e}"))?;
 
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).map_err(|e| format!("read attach response: {e}"))?;
-        let output = String::from_utf8_lossy(&buf).into_owned();
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Load `agent_jar` into the JVM `pid`, passing `agent_args` (the raw agent option string — already joined).
+    pub fn load_agent(pid: i32, agent_jar: &Path, agent_args: &str) -> Result<AttachResult, String> {
+        let jar = agent_jar
+            .canonicalize()
+            .map_err(|e| format!("agent jar {}: {e}", agent_jar.display()))?;
+        // The instrument agent's option string is "<absolute jar path>[=<args>]".
+        let option = if agent_args.is_empty() {
+            jar.display().to_string()
+        } else {
+            format!("{}={}", jar.display(), agent_args)
+        };
+        let output = execute(pid, "load", ["instrument", "false", option.as_str()])?;
 
         // Line 1 is the command status; everything after it is the body the agent outcome is derived from.
         let mut lines = output.lines();
@@ -280,6 +328,17 @@ mod unix_impl {
         let agent_rc = super::classify_agent_rc(&lines.collect::<Vec<_>>().join("\n"));
 
         Ok(AttachResult { jvm_status, agent_rc, output })
+    }
+
+    /// Ask the JVM for its own system properties (the attach protocol's `properties` command).
+    pub fn system_properties(pid: i32) -> Result<Vec<(String, String)>, String> {
+        let out = execute(pid, "properties", ["", "", ""])?;
+        let mut lines = out.lines();
+        let status = lines.next().unwrap_or("").trim().parse::<i32>().unwrap_or(-1);
+        if status != 0 {
+            return Err(format!("JVM rejected the properties command (status {status})"));
+        }
+        Ok(super::parse_properties(&lines.collect::<Vec<_>>().join("\n")))
     }
 }
 
@@ -334,6 +393,33 @@ pub fn load_agent(pid: i32, agent_jar: &std::path::Path, agent_args: &str) -> Re
     Ok(AttachResult { jvm_status, agent_rc, output: combined })
 }
 
+/// Ask the JVM for its own system properties, via `jattach <pid> properties`.
+#[cfg(windows)]
+pub fn system_properties(pid: i32) -> Result<Vec<(String, String)>, String> {
+    let bin = jattach_bin()?;
+    let out = std::process::Command::new(&bin)
+        .arg(pid.to_string())
+        .arg("properties")
+        .output()
+        .map_err(|e| format!("run jattach: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "jattach properties failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // jattach mirrors the JVM's reply to stdout after its own "JVM response code = " banner; everything after that
+    // line is the properties store.
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    const MARKER: &str = "JVM response code = ";
+    let body = match stdout.find(MARKER) {
+        Some(i) => stdout[i + MARKER.len()..].lines().skip(1).collect::<Vec<_>>().join("\n"),
+        None => stdout,
+    };
+    Ok(parse_properties(&body))
+}
+
 /// Locate jattach: `MCGRAFT_JATTACH` override, else the embedded copy (if this build bundled one), else `jattach.exe`
 /// on `PATH`.
 #[cfg(windows)]
@@ -386,4 +472,9 @@ fn embedded_jattach() -> Result<std::path::PathBuf, String> {
 #[cfg(not(any(unix, windows)))]
 pub fn load_agent(_pid: i32, _agent_jar: &std::path::Path, _agent_args: &str) -> Result<AttachResult, String> {
     Err("inject is not supported on this platform".into())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn system_properties(_pid: i32) -> Result<Vec<(String, String)>, String> {
+    Err("attach is not supported on this platform".into())
 }

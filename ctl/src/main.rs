@@ -47,6 +47,17 @@ enum Cmd {
     Pack(PackArgs),
     /// Inject the mc-graft agent into a running Minecraft JVM.
     Inject(InjectArgs),
+    /// Ask a running JVM for its own system properties (authoritative loader/version info, straight from the process).
+    ///
+    /// This ATTACHES to the target — the same mechanism inject uses — so it is deliberately not part of `list`, which
+    /// would otherwise attach to every JVM on the machine just to draw a table.
+    Props {
+        /// Target JVM pid.
+        pid: String,
+        /// Print every property rather than the mc-graft-relevant subset.
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Follow an existing injection log file.
     Logs {
         /// Path to the injection log written by a previous inject.
@@ -140,6 +151,7 @@ fn main() {
         Some(Cmd::Build(a)) => cmd_build(a),
         Some(Cmd::Pack(a)) => cmd_pack(a),
         Some(Cmd::Inject(a)) => cmd_inject(a),
+        Some(Cmd::Props { pid, all }) => cmd_props(&pid, all),
         Some(Cmd::Logs { file, follow }) => {
             if let Err(e) = follow_log(&file, 0, follow, Instant::now() + Duration::from_secs(600)) {
                 die(&e);
@@ -185,6 +197,40 @@ fn cmd_list(verbose: bool) {
         println!("{:>8}  {:<3}  {:<12}  {:<10}  {}", j.pid, mark, ver, loader, label);
     }
     println!("\n(use `mcgraft list --verbose` for game dir, loader version and the full command line)");
+}
+
+/// The properties worth showing by default: what the JVM says about itself, rather than what its command line implies.
+/// `java.class.path` in particular carries the loader jar *with its version*, which no cmdline heuristic can match.
+const INTERESTING_PROPS: &[&str] = &[
+    "java.version",
+    "java.vendor",
+    "java.home",
+    "os.name",
+    "os.arch",
+    "user.dir",
+    "sun.java.command",
+    "java.class.path",
+    "minecraft.launcher.brand",
+    "minecraft.launcher.version",
+    "fabric.gameVersion",
+    "fabric.development",
+];
+
+fn cmd_props(pid: &str, all: bool) {
+    let pid = procs::resolve_target(Some(pid)).unwrap_or_else(|e| die(&e));
+    eprintln!("Attaching to PID {pid} to read its system properties…");
+    let props = attach::system_properties(pid).unwrap_or_else(|e| die(&format!("read properties: {e}")));
+    if props.is_empty() {
+        die("the JVM returned no properties");
+    }
+    for (k, v) in &props {
+        if all || INTERESTING_PROPS.contains(&k.as_str()) {
+            println!("{k} = {v}");
+        }
+    }
+    if !all {
+        println!("\n({} properties total — use `mcgraft props {pid} --all` for the rest)", props.len());
+    }
 }
 
 fn cmd_build(a: BuildCliArgs) {

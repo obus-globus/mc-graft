@@ -240,15 +240,19 @@ final class FabricPlatform implements LoaderPlatform {
                 // tolerateBaselineFailures=true, log a warning and skip just this target (its transform() then falls back
                 // to originalO) so one bad mod mixin doesn't kill the whole attach.
                 Throwable c = t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null ? t.getCause() : t;
-                String head = internal+" -> "+c.getClass().getSimpleName()+": "+String.valueOf(c.getMessage()).split("\n")[0];
+                String head = internal+" -> "+causeChain(c);
                 if (!FullInjectAgent.tolerateBaselineFailures) {
                     InjectionLogger.error("baseline capture FAILED for "+head+" — aborting injection (enable tolerateBaselineFailures / tick 'Tolerate other-mod mixin failures' to skip it and continue)");
+                    // Mixin wraps the real fault in MixinTransformerError ("An unexpected critical error was
+                    // encountered"), whose own message says nothing. Without the stack trace there is nothing to act on.
+                    InjectionLogger.error("baseline capture cause for "+internal, c);
                     if (t instanceof Error e) throw e; if (t instanceof Exception e) throw e; throw new RuntimeException(t);
                 }
                 InjectionLogger.warn("baseline capture skipped (tolerated) for "+head);
                 continue;
             }
             baseline.put(internal, xOthers == null ? pre : xOthers); n++;
+
         }
         InjectionLogger.info("captured "+n+" non-payload mod baselines (X_others)");
     }
@@ -488,4 +492,19 @@ final class FabricPlatform implements LoaderPlatform {
     private static Method declared(Class<?> k, String name){ try { return k.getDeclaredMethod(name, String.class); } catch(NoSuchMethodException e){ return null; } }
     private static RuntimeException rt(String where, Throwable t){ Throwable c = t instanceof InvocationTargetException && t.getCause()!=null ? t.getCause() : t;
         return new IllegalStateException("FabricPlatform."+where+" failed: "+c.getClass().getSimpleName()+": "+c.getMessage(), c); }
+
+    /** The whole cause chain, `A: msg <- B: msg <- ...`. Mixin reports failures as MixinTransformerError("An unexpected
+     *  critical error was encountered"), which identifies nothing on its own — the actionable detail (which mixin, which
+     *  injection point) is always in a nested cause, so logging only the outermost message is useless here. */
+    static String causeChain(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        for (Throwable c = t; c != null && sb.length() < 900; c = c.getCause()) {
+            if (sb.length() > 0) sb.append(" <- ");
+            String m = c.getMessage();
+            sb.append(c.getClass().getSimpleName());
+            if (m != null && !m.isBlank()) sb.append(": ").append(m.split("\n")[0]);
+            if (c.getCause() == c) break;
+        }
+        return sb.toString();
+    }
 }

@@ -41,6 +41,8 @@ struct App {
     selected: Option<i32>,
     /// Whether the selected JVM's detail window is open.
     show_details: bool,
+    /// Result of the on-demand "Ask the JVM" probe, shown in the detail window.
+    probe: Option<String>,
     last_refresh: Instant,
     // build inputs
     repo: Option<PathBuf>,
@@ -89,6 +91,7 @@ impl App {
             jvms: Vec::new(),
             selected: None,
             show_details: false,
+            probe: None,
             last_refresh: Instant::now() - Duration::from_secs(10),
             repo,
             payload: String::new(),
@@ -434,6 +437,35 @@ impl App {
                 }
 
                 ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Ask the JVM")
+                        .on_hover_text(
+                            "Attach to the process and read its own system properties — authoritative, and works even \
+                             when a launcher obscures the command line. Uses the same attach mechanism as inject.",
+                        )
+                        .clicked()
+                    {
+                        self.probe = Some(match attach::system_properties(jvm.pid) {
+                            Ok(p) => p
+                                .into_iter()
+                                .filter(|(k, _)| PROBE_KEYS.contains(&k.as_str()))
+                                .map(|(k, v)| format!("{k} = {v}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            Err(e) => format!("probe failed: {e}"),
+                        });
+                    }
+                    ui.weak("reads loader/version from the running process itself");
+                });
+                if let Some(text) = &self.probe {
+                    egui::ScrollArea::vertical().max_height(160.0).id_source("probe").show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
+                    });
+                }
+
+                ui.add_space(6.0);
                 ui.collapsing("Full command line", |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("Copy").clicked() {
@@ -446,6 +478,9 @@ impl App {
                     });
                 });
             });
+        if !open {
+            self.probe = None; // otherwise the next process's window would open showing this one's properties
+        }
         self.show_details = open;
     }
 }
@@ -906,3 +941,19 @@ fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String, exts: &[&str]) {
         }
     });
 }
+
+/// Properties worth surfacing from an "Ask the JVM" probe: what the process says about ITSELF, which beats any
+/// command-line heuristic — `java.class.path` alone pins the loader jar and its exact version.
+const PROBE_KEYS: &[&str] = &[
+    "java.version",
+    "java.home",
+    "os.name",
+    "os.arch",
+    "user.dir",
+    "sun.java.command",
+    "java.class.path",
+    "minecraft.launcher.brand",
+    "minecraft.launcher.version",
+    "fabric.gameVersion",
+    "fabric.development",
+];
