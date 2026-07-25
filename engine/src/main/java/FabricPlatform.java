@@ -447,6 +447,9 @@ final class FabricPlatform implements LoaderPlatform {
     // ---- §1b: schema baseline O. For a mixin target = X_others (loaded schema: all non-payload mods). For everything else
     //           (hierarchy metadata over arbitrary classes) = raw Knot bytes (no the payload mixin targets them, so X_others==raw). -
     public byte[] originalBytes(String internalName){ byte[] b = baseline.get(internalName); return b != null ? b : getRawClassBytes(internalName); }
+    /** Knot's raw plane: no ClassTweaker (so no AccessWidener, ours or any other mod's) and no mixins. Strictly no
+     *  wider than what an already-loaded class enforces, which is what the access decisions need. */
+    public byte[] rawBytes(String internalName){ return getRawClassBytes(internalName); }
 
     public byte[] bundleResource(String path){
         // agent-jar-root resources (lb-mixin-targets.txt) resolve on the system loader; payload-jar resources resolve on Knot.

@@ -230,7 +230,9 @@ final class NeoForgePlatform implements LoaderPlatform {
 
     // ---- §1b: schema baseline O. mixin target -> X_others (loaded schema minus LB); else raw TCL bytes -------------
     public byte[] originalBytes(String internalName){ byte[] b = baseline.get(internalName); return b != null ? b : rawBytes(internalName); }
-    private byte[] rawBytes(String internal){ try (InputStream in = tcl.getResourceAsStream(internal + ".class")) { return in==null?null:in.readAllBytes(); } catch(Throwable t){ return null; } }
+    /** Doubles as the LoaderPlatform.rawBytes seam: FML applies ATs on load, never to these classpath bytes, so they
+     *  are never wider than what an already-loaded class enforces. */
+    public byte[] rawBytes(String internal){ try (InputStream in = tcl.getResourceAsStream(internal + ".class")) { return in==null?null:in.readAllBytes(); } catch(Throwable t){ return null; } }
 
     public byte[] bundleResource(String path){
         try (InputStream in = agentLoader.getResourceAsStream(path)) { if (in != null) return in.readAllBytes(); } catch(Throwable t){}

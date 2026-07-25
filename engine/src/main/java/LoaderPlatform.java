@@ -49,6 +49,12 @@ interface LoaderPlatform {
     /** Coupling #5: ORIGINAL (schema-baseline) bytes of a class by internal name (no ".class"); null if unavailable. */
     byte[] originalBytes(String internalName);
 
+    /** Coupling #5: bytes as they were BEFORE the payload's AccessWidener was registered — the access flags an
+     *  ALREADY-LOADED class still enforces, since retransformClasses cannot change member modifiers. Only Fabric
+     *  differs from {@link #originalBytes}: Knot hands back pre-mixin bytes with the live ClassTweaker (hence our
+     *  widener) already applied. Vanilla/NeoForge widen from our own CFT, so their originalBytes are never widened. */
+    default byte[] rawBytes(String internalName){ return originalBytes(internalName); }
+
     /** Coupling #6: read an agent-bundle resource by path (e.g. lb-mixin-targets.txt); null if absent. */
     byte[] bundleResource(String path);
 

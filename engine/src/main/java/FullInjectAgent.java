@@ -61,6 +61,9 @@ public class FullInjectAgent {
             inst.redefineModule(tm, Set.of(), Map.of(), Map.of(target.getPackageName(), Set.of(sm)), Set.of(), Map.of());
         };
         RetransformConverter.CLASS_BYTES = PLATFORM::originalBytes;
+        RetransformConverter.RAW_CLASS_BYTES = PLATFORM::rawBytes;   // access flags an ALREADY-LOADED class still enforces: the payload's AW could not reach it
+        RetransformConverter.ALREADY_LOADED = preLoaded::contains;   // ...which is exactly this set. See RetransformConverter's "ENFORCED access" block
+        RetransformConverter.TYPE_INACCESSIBLE = INACC::contains;    // the class-level equivalent, computed just below
         InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
         File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         Path payloadBundle = PLATFORM.stageBundle(inst, self);
@@ -304,6 +307,7 @@ public class FullInjectAgent {
             else InjectionLogger.warn("keybinding registry class not modifiable; late keybinds may fail");
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 
+        verifyMemberAccessGate(inst);
         preflightLbClasses(payloadBundle,awRes,gadded,gfield,ifaceMap);
         if(LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();
@@ -526,7 +530,12 @@ public class FullInjectAgent {
     }
     /** define into the app loader with the given PD (matches signer of signed target packages); true on success or
      *  benign already-defined, false on a real ClassFormat/Verify defect. */
-    static boolean define(String dotted, byte[] b, ProtectionDomain pd){ return PLATFORM.defineClass(dotted, b, pd); }
+    static boolean define(String dotted, byte[] b, ProtectionDomain pd){
+        if (DUMP_DIR != null) try { Path d = Path.of(DUMP_DIR); Files.createDirectories(d); Files.write(d.resolve(dotted+".class"), b); } catch(Throwable ignored){}
+        return PLATFORM.defineClass(dotted, b, pd); }
+    /** -Dmcgraft.agent.dumpDir=<dir> on the TARGET jvm: write every class the agent defines (sidecar/state/synthetic)
+     *  to <dir> for offline inspection. Diagnostic only; unset by default. */
+    static final String DUMP_DIR = System.getProperty("mcgraft.agent.dumpDir");
     static synchronized boolean defineSynthetics(byte[] cb, ProtectionDomain pd){
         boolean ok=true;
         for(String in:scanSyn(cb)){
@@ -757,6 +766,45 @@ public class FullInjectAgent {
             }catch(Throwable t){failed++;LateAttachVerifier.error("CALLER_PREFLIGHT_FAILURE",n,"caller",rootMsg(t));}
         }}catch(Throwable t){LateAttachVerifier.error("CALLER_PREFLIGHT_IO_FAILURE",String.valueOf(lbJar),"caller",rootMsg(t));failed++;}
         InjectionLogger.info("LB caller preflight: "+total+" classes, "+changed+" rewritten, "+failed+" failed");
+    }
+    /** Pre-publish ACCESS gate — see {@link LateAttachVerifier#verifyMemberAccess}. Checks every member reference the
+     *  emitted SIDECAR bytes actually contain against the LIVE class, i.e. the modifiers the JVM will enforce, and
+     *  fails the injection before any target is retransformed.
+     *
+     *  <p>SIDECARS ONLY. target' is not scanned: it is the same class the JVM already accepted, with the same schema
+     *  and the same member references, minus the mixin-added members — rewriteRefs only ever redirects a reference to
+     *  a member of OUR sidecar, and those are public by construction. Nothing there can newly become inaccessible.
+     *  Scanning it as well was measured to cost +948 resolved classes on LiquidBounce (see below) and produced only
+     *  false positives (a record's super() into protected Record.&lt;init&gt;, a nested record reading its outer
+     *  class's private fields), because a target' that has not loaded yet has no live Class to read its nest or
+     *  superclass chain from. The sidecar is where the bug class lives and where the answer is unambiguous.
+     *
+     *  <p>Placed HERE — after {@code addTransformer}, before the retransform that publishes target' — rather than at
+     *  the conversion gate, for a measured reason: the check reflects on already-loaded classes, and
+     *  {@code Class.getDeclaredFields/getDeclaredMethods} RESOLVE every member descriptor, which force-loads those
+     *  types. Run before the CFT exists, that pulls mixin targets in unhooked (measured on Wurst: +67 classes loaded
+     *  during conversion and CommandSuggestions/StatsScreen/DirectJoinServerScreen silently went inert). Here the CFT
+     *  is live, so anything it drags in converts normally, and nothing that could execute an illegal access has been
+     *  published yet: sidecars are defined but no target' references them until the retransform below. */
+    static void verifyMemberAccessGate(Instrumentation inst){
+        Map<String,Class<?>> live = new HashMap<>();
+        for (Class<?> c : inst.getAllLoadedClasses()) { String n = c.getName().replace('.','/');
+            Class<?> prev = live.get(n); if (prev == null || (prev.getClassLoader() != SYS && c.getClassLoader() == SYS)) live.put(n, c); }
+        int mark = LateAttachVerifier.issueMark(), errs0 = LateAttachVerifier.errorCount();
+        int loaded0 = inst.getAllLoadedClasses().length;
+        for (var e : convMap.entrySet()) { Conv cv = e.getValue();
+            if (cv.whole) continue;   // future-loaded and defined WHOLE: it genuinely receives the widened bytes on load
+            LateAttachVerifier.verifyMemberAccess(e.getKey(), "sidecar", cv.sidecar, live::get);
+        }
+        List<String> found = LateAttachVerifier.issuesSince(mark);
+        int illegal = LateAttachVerifier.errorCount() - errs0;   // the remainder are ACCESS_RESOLVE/ACCESS_SCAN notes (WARN), which never gate
+        // Resolving a member forces the JVM to resolve that member's descriptor types, so the scan itself pulls
+        // classes in. They all arrive through the CFT (installed above) and are converted normally — a future-loaded
+        // target dragged in here still gets its target'/WHOLE definition. Counted anyway so the cost stays visible.
+        InjectionLogger.info("pre-publish access gate: "+convMap.size()+" conversions checked, "+illegal+" illegal member access(es)"
+            +" (+"+(inst.getAllLoadedClasses().length-loaded0)+" classes resolved by the scan)"
+            +(found.size()>illegal ? " ("+(found.size()-illegal)+" reference(s) not resolvable here, noted only)" : ""));
+        for (String f : found) { if (illegal > 0) InjectionLogger.error("  "+f); else InjectionLogger.warn("  "+f); }
     }
     static void refreshLoadedAccessState(Instrumentation inst,Object aw){try{
         // No access widener (aw==null) -> no widened classes to reconcile, but still refresh the attach-window class set.

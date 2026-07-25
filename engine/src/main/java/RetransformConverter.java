@@ -27,6 +27,60 @@ public class RetransformConverter {
         public List<String> notes = new ArrayList<>();
     }
 
+    // ---- ENFORCED access for ALREADY-LOADED classes -----------------------------------------------------------------
+    // Everything the converter reads comes from CLASS_BYTES, i.e. the loader's PRE-MIXIN bytes — which on Fabric are
+    // handed back with the payload's AccessWidener ALREADY APPLIED. For a class that was not yet loaded at attach that
+    // is the truth (it gets DEFINED widened). For an ALREADY-LOADED class it is a LIE: the widener was registered on
+    // the live ClassTweaker after the class was defined, and retransformClasses cannot change member modifiers, so the
+    // loaded class keeps its original access forever. Believing the widened bytes made the converter emit a direct
+    // GETFIELD/INVOKE of a still-private member from the sidecar — a different class — which the JVM rejects with
+    // IllegalAccessError the first time that handler runs (observed: ChatComponent.trimmedMessages under Wurst's AW).
+    //
+    // The correction reads the RAW bytes (what the loader had before the payload's widener existed) rather than the
+    // live java.lang.Class. Reflecting on the live class is the more direct statement of "what the JVM enforces", but
+    // Class.getDeclaredFields/getDeclaredMethods RESOLVE every member descriptor, which force-LOADS those types — and
+    // conversion runs before the agent's ClassFileTransformer is installed, so a mixin target dragged in that way
+    // loads unhooked. Measured on Wurst: +67 classes loaded during conversion and three targets
+    // (CommandSuggestions, StatsScreen, DirectJoinServerScreen) silently went inert. Raw bytes cost nothing and can
+    // only ever be MORE restrictive than the live class (the only thing between them is another mod's boot-time
+    // widener), so the worst case is a redundant trip through the reflective accessor.
+    /** Class bytes as they were BEFORE the payload's AccessWidener was registered. Installed by the agent. */
+    public static volatile java.util.function.Function<String,byte[]> RAW_CLASS_BYTES;
+    /** Was this class already loaded when we attached (so the payload's widener could not reach it)? */
+    public static volatile Predicate<String> ALREADY_LOADED = n -> false;
+    /** Already-loaded classes an `accessible class` widening could not reach (the agent's INACC set): the bytes claim
+     *  ACC_PUBLIC, the loaded class is not. The same lie, at class level. */
+    public static volatile Predicate<String> TYPE_INACCESSIBLE = n -> false;
+    private static boolean alreadyLoaded(String internal){ try { return ALREADY_LOADED.test(internal); } catch(Throwable t){ return false; } }
+    private static final java.util.concurrent.ConcurrentHashMap<String,Optional<ClassNode>> RAW_NODES = new java.util.concurrent.ConcurrentHashMap<>();
+    private static ClassNode rawNode(String internal){
+        return RAW_NODES.computeIfAbsent(internal, k -> { try {
+            var f = RAW_CLASS_BYTES; byte[] b = f == null ? null : f.apply(k); if (b == null) return Optional.<ClassNode>empty();
+            ClassNode n = new ClassNode(); new ClassReader(b).accept(n, ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
+            return Optional.of(n);
+        } catch(Throwable t){ return Optional.<ClassNode>empty(); } }).orElse(null);
+    }
+    /** Access flags the JVM enforces for the field {@code owner.name:desc}. Null when {@code owner} was not already
+     *  loaded (the widened bytes are then the truth) or does not DECLARE that field (caller falls back / keeps walking). */
+    static Integer enforcedFieldAccess(String owner, String name, String desc){
+        if (desc == null || !alreadyLoaded(owner)) return null;
+        ClassNode n = rawNode(owner); if (n == null) return null;
+        for (FieldNode f : n.fields) if (f.name.equals(name) && f.desc.equals(desc)) return f.access;
+        return null;
+    }
+    /** Same for a method/constructor declared by {@code owner}. */
+    static Integer enforcedMethodAccess(String owner, String name, String desc){
+        if (!alreadyLoaded(owner)) return null;
+        ClassNode n = rawNode(owner); if (n == null) return null;
+        for (MethodNode m : n.methods) if (m.name.equals(name) && m.desc.equals(desc)) return m.access;
+        return null;
+    }
+    /** Class access with an inert (already-loaded) `accessible class` widening masked back off. */
+    static int effectiveClassAccess(String internal, int fromBytes){
+        if (fromBytes >= 0 && (fromBytes & Opcodes.ACC_PUBLIC) != 0) { try { if (TYPE_INACCESSIBLE.test(internal)) return fromBytes & ~Opcodes.ACC_PUBLIC; } catch(Throwable ignored){} }
+        return fromBytes;
+    }
+
     /** NeoForge (JPMS): sidecars cannot enter module `minecraft` (it owns net/minecraft/*), so they are RELOCATED into
      *  a payload-owned package. Null (vanilla/Fabric) keeps the sidecar in the target's own package. When set, the sidecar
      *  becomes cross-package for EVERY target, so the pkg(caller)!=pkg(owner) checks in illegalSidecarMethod /
@@ -68,10 +122,27 @@ public class RetransformConverter {
     final LinkedHashSet<String> superMethods = new LinkedHashSet<>();
     final LinkedHashMap<String,Object[]> ifaceDispatchTramps = new LinkedHashMap<>();
 
+    /** Access of an EXISTING target field, as the JVM enforces it. O is the AW-WIDENED pre-mixin view; for an
+     *  already-loaded target that widening was inert, so the pre-widener (raw) flags override it. A future-loaded
+     *  target has no raw override and O's widened flags stand, which is correct there (it IS defined widened). */
+    int targetFieldAccess(String name) {
+        Integer enforced = enforcedFieldAccess(targetInternal, name, oFieldDesc.get(name));
+        return enforced != null ? enforced : oFieldAcc.getOrDefault(name, 0);
+    }
+    /** Same for an existing target method/ctor. Unknown (i.e. a mixin-ADDED method) -> 0, as before. */
+    int targetMethodAccess(String name, String desc) {
+        String key = name + " " + desc;
+        if (!oMethodAcc.containsKey(key)) return 0;
+        Integer enforced = enforcedMethodAccess(targetInternal, name, desc);
+        return enforced != null ? enforced : oMethodAcc.get(key);
+    }
+
     Result run(byte[] original, byte[] transformed) {
         ClassNode O = read(original), X = read(transformed);
         for (FieldNode f : O.fields) { oFieldAcc.put(f.name, f.access); oFieldDesc.put(f.name, f.desc); }
         for (MethodNode m : O.methods) oMethodAcc.put(m.name + " " + m.desc, m.access);
+        // (oFieldAcc/oMethodAcc hold O's WIDENED flags; targetFieldAccess/targetMethodAccess correct them against the
+        //  pre-widener bytes for an already-loaded target, where the widening was inert. Read them, not these maps.)
         Result r = new Result(); r.sidecarName = sidecar;
 
         Set<String> oF = keysF(O), oM = keysM(O); Set<String> oI = new HashSet<>(O.interfaces);
@@ -674,7 +745,7 @@ public class RetransformConverter {
                         m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, sidecar, accSet(fi.name), "(" + targetDesc + fi.desc + ")V", false));
                 } else if (addedStaticFields.contains(fi.name)) {
                     m.instructions.set(p, new FieldInsnNode(fi.getOpcode(), sidecar, fi.name, fi.desc));
-                } else if (inSidecar && oFieldAcc.containsKey(fi.name) && (oFieldAcc.get(fi.name) & Opcodes.ACC_PUBLIC) == 0
+                } else if (inSidecar && oFieldAcc.containsKey(fi.name) && (targetFieldAccess(fi.name) & Opcodes.ACC_PUBLIC) == 0
                         && (fi.getOpcode() == Opcodes.GETFIELD || fi.getOpcode() == Opcodes.PUTFIELD)) {
                     // B: non-public target field accessed from the sidecar -> reflective accessor (no AW on target)
                     reflectFields.add(fi.name + " " + fi.desc);
@@ -695,7 +766,7 @@ public class RetransformConverter {
                 m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "h$" + mi.name, nd, false));
             } else if (inSidecar && p instanceof MethodInsnNode mi && mi.owner.equals(targetInternal)
                     && (mi.getOpcode() == Opcodes.INVOKESPECIAL || mi.getOpcode() == Opcodes.INVOKEVIRTUAL || mi.getOpcode() == Opcodes.INVOKESTATIC) && !mi.name.equals("<init>")
-                    && (oMethodAcc.getOrDefault(mi.name + " " + mi.desc, 0) & Opcodes.ACC_PRIVATE) != 0) {
+                    && (targetMethodAccess(mi.name, mi.desc) & Opcodes.ACC_PRIVATE) != 0) {
                 // B (methods): a private EXISTING target method called from the relocated sidecar body (invokespecial,
                 // invokevirtual for a nestmate/MixinExtras bridge, or invokestatic) is illegal cross-class -> cached
                 // reflective invoker.
@@ -752,7 +823,7 @@ public class RetransformConverter {
                             idn.bsmArgs[k] = new Handle(Opcodes.H_INVOKESTATIC, g[1], "h$" + h.getName(), nd, false);
                         } else if (inSidecar && h.getOwner().equals(targetInternal)
                                 && (h.getTag() == Opcodes.H_INVOKESPECIAL || h.getTag() == Opcodes.H_INVOKEVIRTUAL || h.getTag() == Opcodes.H_INVOKESTATIC)
-                                && (oMethodAcc.getOrDefault(h.getName() + " " + h.getDesc(), 0) & Opcodes.ACC_PRIVATE) != 0) {
+                                && (targetMethodAccess(h.getName(), h.getDesc()) & Opcodes.ACC_PRIVATE) != 0) {
                             // A relocated body may contain a lambda/metafactory handle to an ORIGINAL private target
                             // method (for example ClientPacketListener::lambda$handleChunkBlocksUpdate$0). The lambda
                             // is spun with the sidecar as its caller, so leaving that handle unchanged fails at runtime
@@ -976,6 +1047,25 @@ public class RetransformConverter {
     static void unbox(InsnList in, Type t) { String b = boxOwner(t); in.add(new TypeInsnNode(Opcodes.CHECKCAST, b)); in.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, b, unboxMethod(t), "()" + t.getDescriptor(), false)); }
     static String unboxMethod(Type t) { switch (t.getSort()) { case Type.BOOLEAN: return "booleanValue"; case Type.BYTE: return "byteValue"; case Type.CHAR: return "charValue"; case Type.SHORT: return "shortValue"; case Type.INT: return "intValue"; case Type.LONG: return "longValue"; case Type.FLOAT: return "floatValue"; default: return "doubleValue"; } }
     static void loadClassConst(InsnList in, Type t) { if (t.getSort() <= Type.DOUBLE) in.add(new FieldInsnNode(Opcodes.GETSTATIC, boxOwner(t), "TYPE", "Ljava/lang/Class;")); else in.add(new LdcInsnNode(t)); }
+
+    /** A class THIS converter generated (a sidecar or its $State). Such a class is a bare Object subclass and is never
+     *  a nestmate of its target, however similar the names look. */
+    static boolean isGeneratedClass(String internal) {
+        if (internal.endsWith("$$Sidecar") || internal.contains("$$Sidecar$")) return true;
+        String p = SIDECAR_PKG; return p != null && internal.startsWith(p);
+    }
+
+    /** A class or member THIS converter generated (sidecar/state classes, relocated handlers, accessors, reflective
+     *  bridges). The pre-publish access gate skips these: they are ours and emitted public by construction, so the
+     *  target's modifiers never apply to them. */
+    static boolean isGeneratedMember(String owner, String name) {
+        if (isGeneratedClass(owner)) return true;
+        return name.startsWith("h$") || name.startsWith("get$") || name.startsWith("set$")
+            || name.startsWith("refGet$") || name.startsWith("refSet$") || name.startsWith("rmi$")
+            || name.startsWith("smi$") || name.startsWith("ifd$") || name.startsWith("F$")
+            || name.startsWith("RM$") || name.startsWith("SMH$")
+            || name.equals("STATE") || name.equals("getState") || name.equals("initState");
+    }
 
     static String ifaceTrampName(String iface, String name, String desc) {
         return "ifd$" + mangle(name) + "__" + mangle(iface + "|" + desc);
@@ -1278,13 +1368,16 @@ public class RetransformConverter {
     static final Map<String,String[]> META = new java.util.concurrent.ConcurrentHashMap<>();   // internal -> [superName, isInterface?"1":"0", iface...]
     static final java.util.concurrent.ConcurrentHashMap<String,Boolean> NON_PUBLIC_FIELDS = new java.util.concurrent.ConcurrentHashMap<>();
     static boolean nonPublicField(String owner,String name,String desc){String key=owner+'\0'+name+' '+desc;Boolean cached=NON_PUBLIC_FIELDS.get(key);if(cached!=null)return cached;
-        boolean result=false;String c=owner;int guard=0;while(c!=null&&!c.equals("java/lang/Object")&&guard++<64){try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)break;ClassReader cr=new ClassReader(b);ClassNode n=new ClassNode();cr.accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);boolean found=false;for(FieldNode f:n.fields)if(f.name.equals(name)&&f.desc.equals(desc)){result=(f.access&Opcodes.ACC_PUBLIC)==0;found=true;break;}if(found)break;c=cr.getSuperName();}catch(Throwable t){break;}}
+        boolean result=false;String c=owner;int guard=0;while(c!=null&&!c.equals("java/lang/Object")&&guard++<64){
+            Integer enforced=enforcedFieldAccess(c,name,desc);if(enforced!=null){result=(enforced&Opcodes.ACC_PUBLIC)==0;break;}   // already-loaded declarer: its pre-widener flags are what the JVM enforces
+            try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)break;ClassReader cr=new ClassReader(b);ClassNode n=new ClassNode();cr.accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);boolean found=false;for(FieldNode f:n.fields)if(f.name.equals(name)&&f.desc.equals(desc)){result=(f.access&Opcodes.ACC_PUBLIC)==0;found=true;break;}if(found)break;c=cr.getSuperName();}catch(Throwable t){break;}}
         Boolean raced=NON_PUBLIC_FIELDS.putIfAbsent(key,result);return raced==null?result:raced;}
     static final java.util.concurrent.ConcurrentHashMap<String,Integer> CLASS_ACCESS = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Class access flags read from CLASS_BYTES (no classloading/init); -1 when the bytes are unavailable. */
+    /** Class access flags read from CLASS_BYTES (no classloading/init); -1 when the bytes are unavailable. An
+     *  `accessible class` widening the bytes carry but the ALREADY-LOADED class never received is masked back off. */
     static int classAccess(String internal){
-        return CLASS_ACCESS.computeIfAbsent(internal,k->{try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(k);
-            return b==null?-1:new ClassReader(b).getAccess();}catch(Throwable t){return -1;}});
+        return effectiveClassAccess(internal, CLASS_ACCESS.computeIfAbsent(internal,k->{try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(k);
+            return b==null?-1:new ClassReader(b).getAccess();}catch(Throwable t){return -1;}}));
     }
     record MethodAccess(String owner,int ownerAccess,int memberAccess){}
     static final java.util.concurrent.ConcurrentHashMap<String,Optional<MethodAccess>> METHOD_ACCESS = new java.util.concurrent.ConcurrentHashMap<>();
@@ -1304,11 +1397,17 @@ public class RetransformConverter {
         int guard=0;
         for(String c=owner;c!=null&&guard++<256;){try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)break;
             ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
-            for(MethodNode m:n.methods)if(m.name.equals(name)&&m.desc.equals(desc))return Optional.of(new MethodAccess(c,n.access,m.access));
+            for(MethodNode m:n.methods)if(m.name.equals(name)&&m.desc.equals(desc))return Optional.of(enforcedOr(c,n.access,name,desc,m.access));
             ifaces.addAll(n.interfaces);c=n.superName;}catch(Throwable ignored){break;}}
         HashSet<String> seen=new HashSet<>();
-        while(!ifaces.isEmpty()){String c=ifaces.removeFirst();if(!seen.add(c))continue;try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)continue;ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);for(MethodNode m:n.methods)if(m.name.equals(name)&&m.desc.equals(desc))return Optional.of(new MethodAccess(c,n.access,m.access));ifaces.addAll(n.interfaces);}catch(Throwable ignored){}}
+        while(!ifaces.isEmpty()){String c=ifaces.removeFirst();if(!seen.add(c))continue;try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)continue;ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);for(MethodNode m:n.methods)if(m.name.equals(name)&&m.desc.equals(desc))return Optional.of(enforcedOr(c,n.access,name,desc,m.access));ifaces.addAll(n.interfaces);}catch(Throwable ignored){}}
         return Optional.empty();
+    }
+    /** The declarer's access as the JVM enforces it: the pre-widener flags when {@code owner} was already loaded (its
+     *  widening was inert), the widened bytes otherwise. */
+    static MethodAccess enforcedOr(String owner,int ownerAccessFromBytes,String name,String desc,int memberAccessFromBytes){
+        Integer enforced=enforcedMethodAccess(owner,name,desc);
+        return new MethodAccess(owner,effectiveClassAccess(owner,ownerAccessFromBytes),enforced!=null?enforced:memberAccessFromBytes);
     }
     static String pkg(String n){int i=n.lastIndexOf('/');return i<0?"":n.substring(0,i);}
     static String[] meta(String cn) {

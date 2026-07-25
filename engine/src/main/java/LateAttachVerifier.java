@@ -204,6 +204,108 @@ public final class LateAttachVerifier {
             }
         }catch(Throwable t){error("ACCESSOR_SCAN",owner,"caller",String.valueOf(t));}
     }
+    // ---- pre-publish ACCESS gate ------------------------------------------------------------------------------------
+    // Everything else in this class is STRUCTURAL: schema equality, and "does an emitted class still reference a member
+    // we relocated away". Those are link-time properties, and so is everything a forced link can prove — /tmp/linkchk
+    // force-links every sidecar and only ever sees VerifyError/NoClassDefFoundError. An IllegalAccessError on a
+    // field/method reference is NOT a link-time failure: HotSpot raises it when the instruction FIRST EXECUTES. So a
+    // sidecar carrying a direct GETFIELD of a still-private target field injects clean, links clean, reports zero
+    // errors — and then kills the client on the first chat message. That is precisely how it shipped.
+    //
+    // Hence this gate: for every member reference the emitted artifacts ACTUALLY CONTAIN (scanned out of the produced
+    // bytes, never a hand-maintained list — same reasoning as unresolvedRtCalls), resolve the member on the LIVE class
+    // and decide whether THIS accessor could legally execute that instruction. The live class is the oracle on
+    // purpose: the bytes the converter reads are AccessWidener-widened, and for an already-loaded class that widening
+    // never took effect, which is the entire bug class being guarded. An owner that is not loaded yet is skipped — it
+    // really will be defined widened, so its widened bytes are the truth.
+    /** Scan one emitted artifact. {@code loaded} maps an internal name to the already-loaded Class, or null. */
+    public static void verifyMemberAccess(String owner, String artifact, byte[] bytes,
+            java.util.function.Function<String,Class<?>> loaded) {
+        try {
+            ClassNode c = new ClassNode(); new ClassReader(bytes).accept(c, 0);
+            Class<?> self = loaded.apply(c.name);      // target' -> the live target; a sidecar -> itself if already defined, else null
+            for (MethodNode m : c.methods) {
+                if (m.instructions == null) continue;
+                for (AbstractInsnNode p = m.instructions.getFirst(); p != null; p = p.getNext()) {
+                    if (p instanceof FieldInsnNode fi) checkAccess(owner, artifact, m.name, c.name, self, loaded, fi.owner, fi.name, fi.desc, true);
+                    else if (p instanceof MethodInsnNode mi && mi.getOpcode() != Opcodes.INVOKEINTERFACE)
+                        checkAccess(owner, artifact, m.name, c.name, self, loaded, mi.owner, mi.name, mi.desc, false);
+                    else if (p instanceof InvokeDynamicInsnNode id) for (Object x : id.bsmArgs) if (x instanceof Handle h) {
+                        boolean fld = h.getTag() >= Opcodes.H_GETFIELD && h.getTag() <= Opcodes.H_PUTSTATIC;
+                        checkAccess(owner, artifact, m.name, c.name, self, loaded, h.getOwner(), h.getName(), h.getDesc(), fld);
+                    }
+                }
+            }
+        } catch (Throwable t) { warn("ACCESS_SCAN", owner, artifact, "access gate could not scan this artifact: " + t); }
+    }
+
+    private static void checkAccess(String owner, String artifact, String method, String accessor, Class<?> self,
+            java.util.function.Function<String,Class<?>> loaded, String o, String n, String d, boolean field) {
+      try {
+        if (o.equals(accessor) || o.isEmpty() || o.charAt(0) == '[') return;          // own member / array pseudo-owner (Object.clone etc.)
+        if (o.startsWith("mcgraft/") || RetransformConverter.isGeneratedMember(o, n)) return;   // our own relocated/synthetic members
+        Class<?> ow = loaded.apply(o);
+        if (ow == null) return;                                                       // not loaded yet -> it WILL be defined widened
+        java.lang.reflect.Member mem = field ? findLiveField(ow, n, d) : findLiveMethod(ow, n, d);
+        if (mem == null) return;                                                      // can't resolve it -> say nothing rather than guess
+        String why = accessDenial(mem.getDeclaringClass(), mem.getModifiers(), accessor, self);
+        if (why == null) return;
+        add("ERROR", "ILLEGAL_MEMBER_ACCESS", owner, artifact, method,
+            accessor + " cannot access " + why + " " + mem.getDeclaringClass().getName().replace('.','/') + "." + n + (field ? " " : "") + d
+            + " — the emitted " + (field ? "GET/PUTFIELD" : "INVOKE") + " would throw IllegalAccessError on first execution");
+      } catch (Throwable t) {
+        // A member of a class whose hierarchy cannot be resolved here (LiquidBounce carries macOS-only
+        // ca.weblite.objc types) is not evidence of anything. Note it and move on — never fail the injection on it.
+        warn("ACCESS_RESOLVE", owner, artifact, o + "." + n + " " + d + " -> " + t);
+      }
+    }
+
+    /** JVMS 5.4.4 access control. {@code self} is the accessor's live Class when it has one; it is null for a target'
+     *  that has not loaded yet, and for a sidecar of such a target.
+     *
+     *  <p>Without {@code self} neither nest membership nor the subclass rule can be evaluated, so the answer would be
+     *  a guess — and guessing "denied" produces exactly the false positives LiquidBounce showed (a record's
+     *  {@code super()} into protected {@code Record.<init>}, and a nested record reading its outer class's private
+     *  fields). The rule is therefore: only report what is denied on EVERY reading. A sidecar is the one accessor we
+     *  never need {@code self} for — it is a bare Object subclass in the target's package and can never be a nestmate
+     *  or a subclass of anything — so full strictness still applies there, which is where the bug class lives. */
+    private static String accessDenial(Class<?> declarer, int mods, String accessor, Class<?> self) {
+        if (java.lang.reflect.Modifier.isPublic(mods)) return null;
+        boolean sidecar = RetransformConverter.isGeneratedClass(accessor);             // provably neither nestmate nor subclass
+        String di = declarer.getName().replace('.','/');
+        String dp = RetransformConverter.pkg(di), ap = RetransformConverter.pkg(accessor);
+        if (java.lang.reflect.Modifier.isPrivate(mods)) {
+            if (sidecar) return "private";
+            if (self != null) { try { return self.getNestHost() == declarer.getNestHost() ? null : "private"; } catch (Throwable ignored) { return null; } }
+            return topLevel(di).equals(topLevel(accessor)) ? null : "private";         // same outer class -> assume the nest we cannot read
+        }
+        if (dp.equals(ap)) return null;                                               // protected and package-private are both fine in-package
+        if (java.lang.reflect.Modifier.isProtected(mods)) {
+            if (sidecar) return "protected";
+            if (self == null) return null;                                            // cannot disprove inheritance
+            return declarer.isAssignableFrom(self) ? null : "protected";
+        }
+        return "package-private";                                                     // no inheritance escape hatch for these
+    }
+    private static String topLevel(String internal){ int i=internal.indexOf('$'); return i<0?internal:internal.substring(0,i); }
+
+    private static java.lang.reflect.Field findLiveField(Class<?> c, String name, String desc) {
+        for (Class<?> k = c; k != null; k = k.getSuperclass())
+            for (java.lang.reflect.Field f : k.getDeclaredFields())
+                if (f.getName().equals(name) && Type.getDescriptor(f.getType()).equals(desc)) return f;
+        for (Class<?> i : c.getInterfaces()) { var f = findLiveField(i, name, desc); if (f != null) return f; }
+        return null;
+    }
+    private static java.lang.reflect.Member findLiveMethod(Class<?> c, String name, String desc) {
+        if (name.equals("<init>")) { for (var ct : c.getDeclaredConstructors()) if (Type.getConstructorDescriptor(ct).equals(desc)) return ct; return null; }
+        if (name.equals("<clinit>")) return null;
+        for (Class<?> k = c; k != null; k = k.getSuperclass())
+            for (java.lang.reflect.Method m : k.getDeclaredMethods())
+                if (m.getName().equals(name) && Type.getMethodDescriptor(m).equals(desc)) return m;
+        for (Class<?> i : c.getInterfaces()) { var m = findLiveMethod(i, name, desc); if (m != null) return m; }
+        return null;
+    }
+
     private static boolean hasAnn(MethodNode m,String d){if(m.visibleAnnotations!=null)for(AnnotationNode a:m.visibleAnnotations)if(a.desc.equals(d))return true;if(m.invisibleAnnotations!=null)for(AnnotationNode a:m.invisibleAnnotations)if(a.desc.equals(d))return true;return false;}
 
     private static void add(String severity,String code,String owner,String artifact,String method,String message){
