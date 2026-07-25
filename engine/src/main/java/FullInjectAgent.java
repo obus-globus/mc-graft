@@ -388,10 +388,32 @@ public class FullInjectAgent {
         for (String cn : cfg.mainEntrypoints) callEntrypoint(cn, "onInitialize");
         for (String cn : cfg.clientEntrypoints) callEntrypoint(cn, "onInitializeClient");
     }
+    /** Invoke a Fabric entrypoint the way the loader's language adapters do, rather than assuming a public no-arg ctor.
+     *
+     *  <p>A Kotlin {@code object} — which is how many mods declare their entrypoint — compiles to a class with a PRIVATE
+     *  constructor plus a static {@code INSTANCE} field holding the singleton. Calling {@code newInstance()} on it fails
+     *  with "cannot access a member ... with modifiers \"private\"", and the mod simply never initialises. Prefer the
+     *  singleton field when present, exactly as Fabric's Kotlin adapter does; otherwise construct, making the
+     *  constructor accessible first, since a Java entrypoint may legitimately keep its no-arg ctor non-public. */
     static void callEntrypoint(String className, String method) throws Exception {
         InjectionLogger.info("(MC main thread) "+className+"."+method+"()");
-        Object inst = Class.forName(className, true, SYS).getDeclaredConstructor().newInstance();
-        inst.getClass().getMethod(method).invoke(inst);
+        Class<?> k = Class.forName(className, true, SYS);
+        Object inst = null;
+        try {
+            java.lang.reflect.Field f = k.getDeclaredField("INSTANCE");
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) && k.isAssignableFrom(f.getType())) {
+                f.setAccessible(true);
+                inst = f.get(null);
+            }
+        } catch (NoSuchFieldException ignored) { /* not a Kotlin object — construct it below */ }
+        if (inst == null) {
+            java.lang.reflect.Constructor<?> c = k.getDeclaredConstructor();
+            c.setAccessible(true);
+            inst = c.newInstance();
+        }
+        java.lang.reflect.Method m = k.getMethod(method);
+        m.setAccessible(true);
+        m.invoke(inst);
     }
     static String simpleName(String fqcn) { int i = fqcn.lastIndexOf('.'); return i < 0 ? fqcn : fqcn.substring(i + 1); }
 
