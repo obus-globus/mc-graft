@@ -81,7 +81,7 @@ impl App {
     fn new() -> Self {
         let (tx, rx) = channel();
         let repo = build::find_repo_root(None).ok();
-        let presets = repo.as_ref().map(|r| config::discover_presets(r)).unwrap_or_default();
+        let presets = config::discover_presets(repo.as_deref());
         // Locate the precompiled base jar; if not yet built but a repo is present, pre-fill its canonical build path so
         // the Quick-pack field guides the user to `./gradlew agentBase`.
         let base_jar = crate::pack::find_base_jar(repo.as_deref())
@@ -964,7 +964,12 @@ fn short_main(main: &str, cmdline: &str) -> String {
 fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String, exts: &[&str]) {
     ui.horizontal(|ui| {
         ui.label(label);
-        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY).hint_text("path…"));
+        // Reserve room for the button: desired_width(INFINITY) claims ALL remaining space in a horizontal layout, so
+        // the Browse button got laid out past the right edge and was effectively invisible — the field looked
+        // type-only. Leave it a fixed slice, with a floor so a narrow window shrinks the text box rather than the button.
+        const BROWSE_W: f32 = 84.0;
+        let field_w = (ui.available_width() - BROWSE_W).max(140.0);
+        ui.add(egui::TextEdit::singleline(value).desired_width(field_w).hint_text("path…"));
         if ui.button("Browse…").clicked() {
             let mut dlg = rfd::FileDialog::new();
             if !exts.is_empty() {

@@ -127,18 +127,74 @@ pub struct Preset {
     pub path: PathBuf,
 }
 
-/// Discover the bundled example configs as presets, sorted by name.
-pub fn discover_presets(repo: &Path) -> Vec<Preset> {
-    let mut out = Vec::new();
+/// Find bootstrap configs, so a standalone install can keep them next to the binary instead of needing a checkout.
+///
+/// Searched in priority order, first name winning so a local file shadows a bundled example:
+///   1. the working directory and `configs/` under it — i.e. drop `wurst.properties` beside the exe you ran
+///   2. the executable's directory and `configs/` under it
+///   3. the per-user config dir (`$XDG_CONFIG_HOME` / `~/.config`, `%APPDATA%` on Windows) under `mcgraft/`
+///   4. `<repo>/examples/<id>/bootstrap.properties`, the checkout layout
+///
+/// A flat file is named by its stem (`wurst.properties` -> "wurst"), which is what the GUI matches against the
+/// payload's mod id when auto-applying a preset.
+pub fn discover_presets(repo: Option<&Path>) -> Vec<Preset> {
+    let mut out: Vec<Preset> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("configs"));
+        dirs.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("configs"));
+            dirs.push(d.to_path_buf());
+        }
+    }
+    #[cfg(windows)]
+    let user = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let user = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(u) = user {
+        dirs.push(u.join("mcgraft"));
+    }
+    dirs.dedup();
+    for d in dirs {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let mut found: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("properties"))
+            .filter_map(|p| p.file_stem().map(|s| (s.to_string_lossy().into_owned(), p.clone())))
+            .collect();
+        found.sort();
+        for (name, path) in found {
+            if seen.insert(name.clone()) {
+                out.push(Preset { name, path });
+            }
+        }
+    }
+
+    if let Some(repo) = repo {
+        discover_repo_examples(repo, &mut out, &mut seen);
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The checkout layout, searched last so a local file of the same name takes precedence.
+fn discover_repo_examples(repo: &Path, out: &mut Vec<Preset>, seen: &mut std::collections::BTreeSet<String>) {
     let examples = repo.join("examples");
     if let Ok(rd) = std::fs::read_dir(&examples) {
         for e in rd.flatten() {
             let p = e.path().join("bootstrap.properties");
-            if p.is_file() {
-                out.push(Preset { name: e.file_name().to_string_lossy().into_owned(), path: p });
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_file() && seen.insert(name.clone()) {
+                out.push(Preset { name, path: p });
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
 }
