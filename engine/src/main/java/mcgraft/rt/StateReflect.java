@@ -14,7 +14,10 @@ public final class StateReflect {
     private static final ClassLoader SYS = Platform.LOADER;
     private static final Map<String,String> FIELD_STATE = new ConcurrentHashMap<>();   // "target|name" -> $State internal name
     private static final Map<String,String> STATE_SIDECAR = new ConcurrentHashMap<>(); // $State internal name -> sidecar internal name
-    private static final Map<Class<?>,Method> GETSTATE = new ConcurrentHashMap<>();     // $State class -> sidecar.getState(target)
+    // Optional, not a bare Method: ConcurrentHashMap.computeIfAbsent does NOT store a null mapping, so caching the raw
+    // result would re-run resolveGetState (a Class.forName plus a defensive-copying getDeclaredMethods()) on EVERY
+    // field access once resolution failed once — a reflection storm on a path reached from render/tick threads.
+    private static final Map<Class<?>,Optional<Method>> GETSTATE = new ConcurrentHashMap<>(); // $State class -> sidecar.getState(target)
 
     private StateReflect() {}
 
@@ -63,10 +66,19 @@ public final class StateReflect {
     private static Object actual(Field f, Object obj) {
         Class<?> dc = f.getDeclaringClass();
         if (obj == null || !STATE_SIDECAR.containsKey(dc.getName().replace('.','/'))) return obj;
+        // Past this point f IS a relocated $State field, so `obj` (the MC target) is definitively the WRONG receiver
+        // for it — returning it would hand a $State-declared Field an instance of an unrelated class and produce
+        // "IllegalArgumentException: object is not an instance of declaring class" at the mod's call site, i.e. exactly
+        // the failure this shim exists to prevent, with the real cause discarded. Fail loudly instead, the way
+        // declaredField above already does for its analogous case.
+        Method gs = GETSTATE.computeIfAbsent(dc, k -> Optional.ofNullable(resolveGetState(k))).orElse(null);
+        if (gs == null) throw new IllegalStateException("StateReflect: no getState for relocated $State " + dc.getName());
         try {
-            Method gs = GETSTATE.computeIfAbsent(dc, StateReflect::resolveGetState);
-            return gs == null ? obj : gs.invoke(null, obj);
-        } catch (Throwable t) { return obj; }
+            return gs.invoke(null, obj);
+        } catch (Throwable t) {
+            InjectionLogger.warn("StateReflect: $State redirect failed for " + dc.getName() + "." + f.getName() + ": " + t);
+            throw t instanceof RuntimeException r ? r : new IllegalStateException(t);
+        }
     }
 
     private static Method resolveGetState(Class<?> stateClass) {

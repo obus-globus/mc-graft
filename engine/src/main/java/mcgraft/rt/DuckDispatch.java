@@ -13,7 +13,7 @@ public final class DuckDispatch {
     private static final Map<Key,Method> METHODS = new ConcurrentHashMap<>();
     // For a SHARED duck interface (one a real bundle class genuinely implements), a receiver may be a real implementor
     // rather than a de-implemented mixin target; these cache the interface Class + the real interface method for it.
-    private static final Map<String,Class<?>> IFACES = new ConcurrentHashMap<>();
+    private static final Map<String,Optional<Class<?>>> IFACES = new ConcurrentHashMap<>();
     // The real interface method depends only on (iface, name, desc), not the receiver class — key it that way so a
     // shared interface with many receiver classes doesn't spawn a redundant cache entry per class.
     private static final Map<String,Method> REAL_METHODS = new ConcurrentHashMap<>();
@@ -67,10 +67,12 @@ public final class DuckDispatch {
     }
 
     private static Class<?> ifaceClass(String iface) {
+        // Optional so the "unavailable" answer is CACHED: computeIfAbsent does not store a null mapping, so returning
+        // null bare would re-attempt Class.forName on every dispatch for a pure-duck interface.
         return IFACES.computeIfAbsent(iface, n -> {
-            try { return Class.forName(n.replace('/','.'), false, SYS); }
-            catch (Throwable t) { return null; }   // interface unavailable -> treat as pure-duck (no genuine implementors)
-        });
+            try { return Optional.<Class<?>>of(Class.forName(n.replace('/','.'), false, SYS)); }
+            catch (Throwable t) { return Optional.empty(); }   // unavailable -> pure-duck (no genuine implementors)
+        }).orElse(null);
     }
 
     private static Method realMethod(Class<?> ic, String name, String desc) {

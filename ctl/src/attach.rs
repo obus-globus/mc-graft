@@ -71,11 +71,49 @@ mod unix_impl {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    /// The tmp directory the target JVM writes its attach socket into. HotSpot uses the OS temp dir (`/tmp`), which —
-    /// for a process in another mount namespace (container) — we reach through `/proc/<pid>/root/tmp`.
+    /// The tmp directory the target JVM writes its attach socket into.
+    ///
+    /// Linux: HotSpot uses `/tmp`, reached through `/proc/<pid>/root/tmp` for a process in another mount namespace.
+    /// macOS: there is no `/proc`, and HotSpot does NOT use `/tmp` — it uses the per-user Darwin temp dir, which
+    /// launchd exports as `TMPDIR` (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, which we can't call under `forbid(unsafe)`).
+    /// `/tmp` is only jattach's last-resort fallback, so preferring `TMPDIR` there is what makes macOS attach work.
     fn attach_dir(pid: i32) -> PathBuf {
-        let ns = PathBuf::from(format!("/proc/{}/root/tmp", pid));
-        if ns.is_dir() { ns } else { PathBuf::from("/tmp") }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = pid;
+            if let Some(t) = std::env::var_os("TMPDIR") {
+                let p = PathBuf::from(t);
+                if p.is_dir() {
+                    return p;
+                }
+            }
+            return PathBuf::from("/tmp");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let ns = PathBuf::from(format!("/proc/{}/root/tmp", pid));
+            if ns.is_dir() { ns } else { PathBuf::from("/tmp") }
+        }
+    }
+
+    /// The pid the TARGET sees for itself. Inside a PID namespace the JVM names its trigger/socket files with its
+    /// namespace-local pid (often 1), not the host pid we signal with — so using the host pid for the file names means
+    /// we create `.attach_pid<host>` while the JVM looks for `.attach_pid<ns>`, then wait 6s for a socket that never
+    /// appears. `NSpid`'s last field is the innermost namespace's view. Absent (no namespaces / older kernel) = same.
+    fn ns_pid(pid: i32) -> i32 {
+        #[cfg(target_os = "linux")]
+        if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status.lines() {
+                if let Some(v) = line.strip_prefix("NSpid:") {
+                    if let Some(last) = v.split_whitespace().next_back() {
+                        if let Ok(n) = last.parse::<i32>() {
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+        pid
     }
 
     /// Refuse to signal anything that isn't demonstrably a live JVM.
@@ -146,7 +184,9 @@ mod unix_impl {
     fn ensure_socket(pid: i32) -> Result<PathBuf, String> {
         verify_is_jvm(pid)?;
         let dir = attach_dir(pid);
-        let sock = dir.join(format!(".java_pid{pid}"));
+        // File names use the pid the JVM sees for ITSELF; kill() below still uses the host pid.
+        let nspid = ns_pid(pid);
+        let sock = dir.join(format!(".java_pid{nspid}"));
         // Require an actual socket owned by us. A regular file or a symlink planted at this well-known path by another
         // local user would otherwise receive our attach request (which carries the agent jar path and game dir) and
         // could reply with a fabricated success. jattach does both checks; so do we.
@@ -157,8 +197,8 @@ mod unix_impl {
         // Use create_new so a concurrent attach's trigger is never truncated: if the file already exists we reuse it and
         // leave cleanup to whoever created it (owned = false).
         let candidates = [
-            PathBuf::from(format!("/proc/{pid}/cwd/.attach_pid{pid}")),
-            dir.join(format!(".attach_pid{pid}")),
+            PathBuf::from(format!("/proc/{pid}/cwd/.attach_pid{nspid}")),
+            dir.join(format!(".attach_pid{nspid}")),
         ];
         let (trigger, owned) = candidates
             .iter()

@@ -668,6 +668,11 @@ public class RetransformConverter {
                     AbstractInsnNode nw=mi.getPrevious();
                     while(nw!=null&&!(nw instanceof TypeInsnNode tn&&tn.getOpcode()==Opcodes.NEW&&tn.desc.equals(mi.owner)))nw=nw.getPrevious();
                     if(nw!=null&&nw.getNext()!=null&&nw.getNext().getOpcode()==Opcodes.DUP){AbstractInsnNode dup=nw.getNext();m.instructions.remove(nw);m.instructions.remove(dup);rewriteAwCtorInline(m,mi,this::typeInaccessibleFromSidecar);}
+                    // illegalSidecarMethod already decided this site throws IllegalAccessError from the relocated body.
+                    // If the NEW/DUP prologue isn't the shape we can lower (result-discarded allocation, a non-javac
+                    // producer), leaving it in place emits the illegal instruction anyway — with nothing in the report.
+                    else LateAttachVerifier.error("CTOR_LOWERING_UNMATCHED", targetInternal, m.name + m.desc,
+                        "cannot lower inaccessible " + mi.owner + ".<init>" + mi.desc + ": no NEW/DUP prologue");
                 } else if (!mi.name.startsWith("<") && (mi.getOpcode()==Opcodes.INVOKEVIRTUAL||mi.getOpcode()==Opcodes.INVOKESTATIC||mi.getOpcode()==Opcodes.INVOKESPECIAL)) {
                     rewriteAwMethodInline(m,mi,this::typeInaccessibleFromSidecar);
                 }
@@ -1023,6 +1028,12 @@ public class RetransformConverter {
                             AbstractInsnNode dup = nw.getNext();
                             m.instructions.remove(nw); m.instructions.remove(dup);
                             rewriteAwCtorInline(m,ci,inacc); changed[0] = true;
+                        } else {
+                            // Same as the sidecar path: we already know this ctor is inaccessible here, so silently
+                            // leaving it emits an IllegalAccessError with nothing in the verification report. Worse,
+                            // changed[0] stays false, so the class may be returned byte-identical and look untouched.
+                            LateAttachVerifier.error("CTOR_LOWERING_UNMATCHED", c.name, m.name + m.desc,
+                                "cannot lower inaccessible " + ci.owner + ".<init>" + ci.desc + ": no NEW/DUP prologue");
                         }
                     } else if (p instanceof MethodInsnNode mi && mi.name.charAt(0) != '<'
                             && (mi.getOpcode() == Opcodes.INVOKEVIRTUAL || mi.getOpcode() == Opcodes.INVOKESTATIC || mi.getOpcode() == Opcodes.INVOKESPECIAL)

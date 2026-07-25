@@ -125,12 +125,39 @@ kind = "merge"                    # merge (RFC 7386) | jsonpatch (RFC 6902)
 # --- bytecode patch (in-place edit of an EXISTING class) ---
 [[patch]]
 class  = "com/example/mod/HudRenderer"
-format = "krakatau-diff"          # krakatau-diff (v1). `ops` (structured DSL) is RESERVED for a later phase.
-file   = "patch/HudRenderer.j.diff"
+format = "ops"                    # "ops" is the default and the only implemented format; krakatau-diff is deferred.
+  [[patch.op]]
+  action = "replace_const"        # swap an int or String constant load, in any encoding
+  in     = "getMaxRange()I"       # optional: restrict to one method, "name(descriptor)". Omit = whole class.
+  from   = 64
+  to     = 256
+  [[patch.op]]
+  action = "redirect_invoke"      # retarget a call; the descriptor is preserved, so the stack is unchanged
+  from   = "java/lang/System.currentTimeMillis()J"
+  to     = "com/example/FakeClock.now"
+  [[patch.op]]
+  action = "set_return"           # replace a whole method body with `return <const>`; requires `in`
+  in     = "isPremium()Z"
+  to     = false
 ```
 
-A `krakatau-diff` patch applies as: **disassemble** the original class → **apply the unified diff** → **reassemble**.
-Being a line diff over disassembly, it is sensitive to the exact base class — hence the base guard.
+### `[[patch.op]]` reference
+
+| action | required | meaning |
+| --- | --- | --- |
+| `replace_const` | `from`, `to` (both int, or both string) | Replace every matching constant load. `in` narrows it to one method. |
+| `redirect_invoke` | `from = "owner/Class.name(desc)"`, `to = "owner/Class.name"` | Retarget a call site; the descriptor is carried over from `from`. |
+| `set_return` | `in`, optional `to` | Replace the method body with a constant return. `to` omitted = the type's zero/null. |
+
+Every op must match at least one site: an op that matches nothing fails the whole run rather than silently doing
+nothing. Notes and foot-guns:
+
+- `replace_const` with `from = 0`/`1` and no `in` matches *every* `iconst_0`/`iconst_1` in the class — booleans, array
+  indices, loop counters included. Scope it with `in`.
+- `set_return` on `<init>` removes the mandatory `super()` call; nothing rejects that at pack time.
+- `redirect_invoke` keeps the original opcode, so retargeting an `invokevirtual` at an interface method yields
+  `IncompatibleClassChangeError` at runtime. Not knowable at pack time.
+- `set_return to = "null"` is the null reference, not the string `"null"`.
 
 ## Apply order & conflicts
 
@@ -162,10 +189,16 @@ bundles for the run). Off by choice, never off by default.
 
 ## Validation
 
-**v1** has no bytecode edits, so the only structural risk is malformed JSON — merges are parsed, applied, and
-re-serialized, which guarantees the result is well-formed JSON. The patched jar is written and re-read (a round-trip),
-then flows through the normal pack pipeline (mixin-target derivation, dependency scan, graft.properties) unchanged. A
-`[[merge]]` on `fabric.mod.json` therefore moves the pipeline's inputs by design.
+JSON edits are structurally safe by construction: merges are parsed, applied, and re-serialized, so the result is
+well-formed JSON or the run fails. The patched jar is written and re-read (a round-trip), then flows through the normal
+pack pipeline (mixin-target derivation, dependency scan, graft.properties) unchanged. A `[[merge]]` on
+`fabric.mod.json` therefore moves the pipeline's inputs by design.
+
+Bytecode edits get less. `apply_ops` re-parses the class it produced, and an op matching nothing fails the run, but
+neither of those proves the *edit* was correct — only that the output is parseable and that something matched. There is
+currently **no pack-time JVM verification**: a patched class that is structurally valid but semantically wrong (an
+op that matched more sites than intended, a `set_return` on a constructor) fails at class-load time inside the game,
+not here.
 
 **Phase 2** will re-verify every added/modified `.class` with `ristretto_classfile` (constant-pool integrity, stack
 maps, descriptors). Important framing (and a project rule — see CLAUDE.md): **that verify only rejects *malformed*
@@ -182,13 +215,22 @@ a tempdir on first use) as an opt-in convenience — and gate the whole bytecode
 who only want overlay/JSON never carry an alpha JVM tool or hit exec pitfalls (tmpfs `noexec`, AV quarantine, exec bit).
 The pinned `krak2` version is recorded so disassembly-format drift is detectable.
 
-## Reserved: structured `ops` DSL (later)
+## Why `ops` and not `krakatau-diff`
 
-The `format = "ops"` value on a `[[patch]]` is reserved for a future base-robust, semantic patch DSL
-(`replace_const` / `remove_call` / `redirect_invoke` / `insert_before` / …) built on `ristretto_classfile`. Given the
-phase-2 risks below, `ops` may end up preferable to `krakatau-diff` as the *primary* bytecode format.
+`ops` shipped and `krakatau-diff` did not, for the reason in the first risk below: a line diff over disassembly is only
+as stable as the disassembler's output, and krak2's default mode does not round-trip. The `ops` DSL sidesteps that
+entirely by editing the parsed class instead of its text.
 
-## Phase 2 risks (must-solve before bytecode patching ships)
+What makes `ops` safe is narrower than it first looks, and worth stating precisely: `ristretto_classfile` keeps branch
+targets, exception ranges, line numbers and stack-map frames as *logical instruction offsets* and recomputes byte
+offsets on write, so replacing one instruction with another never shifts an index — **`apply_op` takes a slice, so the
+type system enforces that the instruction count cannot change.** Instruction *byte width* is a different matter and is
+NOT free: a wider encoding shifts later byte offsets, which can push a stack-map delta past what the compact
+`SameFrame` form can encode and can invalidate `LocalVariableTable`'s raw byte offsets. Every edited method is
+therefore normalised on the way out (frames promoted to their `*Extended` forms, stale debug tables dropped). Ops that
+*insert* or *remove* instructions would need real frame-index adjustment and are deliberately not implemented.
+
+## Risks in the deferred `krakatau-diff` path
 
 - **`krakatau-diff` base fragility (the big one).** krak2's *default* disassembly does **not** round-trip — it may
   reorder constant-pool entries, so the disassembly text of the same class differs between runs/versions. A unified diff

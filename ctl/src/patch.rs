@@ -1,9 +1,10 @@
 //! Payload patches (v1): user-supplied edits applied to the mod jar BEFORE grafting, entirely at pack time in Rust.
 //!
-//! v1 scope (no JVM / no bytecode tooling): file **overlay** (add/replace), **delete**, **rename**, and JSON **merge**
-//! (RFC 7396) on resource entries such as `fabric.mod.json`. Bytecode edits (`[[patch]]`), assembled `new/` classes, and
-//! RFC-6902 `jsonpatch` are deferred to a later phase (they need the Krakatau toolchain / a JSON-Patch impl) and are
-//! rejected here with a clear message rather than silently ignored.
+//! Scope: file **overlay** (add/replace), **delete**, **rename**, JSON **merge** (RFC 7396) and **jsonpatch**
+//! (RFC 6902) on resource entries such as `fabric.mod.json`, whole-class Krakatau assembly (`new/`, bare `.j`), and
+//! in-place bytecode edits via the `ops` DSL (`[[patch]] format = "ops"`, see [`crate::bytecode`]). Only the
+//! `krakatau-diff` `[[patch]]` format remains deferred; it is parsed and rejected with a clear message rather than
+//! silently ignored.
 //!
 //! Patches are applied to the payload jar's contents and produce a rewritten temp jar; everything downstream (mixin
 //! target derivation, graft.properties, dependency scan) then reads the PATCHED jar, so a `[[merge]]` on `fabric.mod.json`
@@ -303,6 +304,16 @@ pub fn apply_patches<F: FnMut(&str)>(
     let base_sha = hex(&Sha256::digest(&payload_bytes));
     let base_mod_id = read_mod_id(&payload_bytes);
     let mut jar = Jar::read(&payload_bytes)?;
+
+    // Patching rewrites entries, so the per-entry digests in META-INF/MANIFEST.MF no longer match while the signature
+    // files survive — the jar looks signed but fails verification. Say so once, rather than letting it surface as an
+    // opaque SecurityException later.
+    if jar.order.iter().any(|n| {
+        let up = n.to_ascii_uppercase();
+        up.starts_with("META-INF/") && (up.ends_with(".SF") || up.ends_with(".RSA") || up.ends_with(".DSA") || up.ends_with(".EC"))
+    }) {
+        log("  WARNING: payload jar is signed — patching invalidates its signature (signature files are left in place)");
+    }
 
     // Cross-patch conflict ledger: path -> name of the patch that last wrote it. A second patch touching the same path
     // is a conflict resolved per that bundle's on-conflict policy.

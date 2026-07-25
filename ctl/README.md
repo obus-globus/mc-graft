@@ -92,8 +92,8 @@ bare Krakatau `.j` file. Supported (all JDK-free):
 
 Patches apply before mod-info derivation, so a merge on `fabric.mod.json` correctly changes the derived
 id/mixins/deps/entrypoints. A `[target]` guard warns on mod-id mismatch and hard-fails on `sha256` mismatch (override
-with `--no-verify-base`). Deferred to phase 2: the `krakatau-diff` `[[patch]]` format and RFC-6902 `jsonpatch` (both
-rejected with a message for now). See [`../docs/patches.md`](../docs/patches.md) for the full format; example bundle at
+with `--no-verify-base`). Only the `krakatau-diff` `[[patch]]` format remains deferred (rejected with a message);
+in-place bytecode edits use the `ops` DSL. See [`../docs/patches.md`](../docs/patches.md) for the full format; example bundle at
 [`../examples/patches/demo.mcpatch`](../examples/patches/demo.mcpatch).
 
 ## How attach works
