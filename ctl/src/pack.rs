@@ -64,6 +64,8 @@ pub fn pack_agent<F: FnMut(&str)>(
     let mut targets: BTreeSet<String> = derive_mixin_targets(payload, &info.mixins)?.into_iter().collect();
     log(&format!("  {} payload target class(es)", targets.len()));
 
+    report_resource_needs(payload, cfg, &targets, &mut log);
+
     // Optionally also apply the DEPENDENCY mods' own mixins (fabric-api etc.) — needed for mods that rely on
     // fabric-api's runtime hooks (custom-payload networking, etc.) that a late-attached fabric-api never installed.
     let mut dep_configs: Vec<String> = Vec::new();
@@ -443,6 +445,103 @@ fn resolve_dep(coord: &str) -> Result<(String, Vec<u8>), String> {
         }
     }
     Err(format!("could not resolve {coord} from any known repo (last: {last})"))
+}
+
+/// Warn when the payload ships resources or defers init to a resource reload, but the config that makes either work
+/// under late attach isn't enabled.
+///
+/// A late-attached mod is invisible to the loader's resource system: its `assets/` never becomes a resource pack, and a
+/// reload listener it registers during init arrives AFTER the boot-time reload, so it is simply never called. The
+/// symptoms are a missing texture (`Missing resource <ns>:<file>`) and, for anything initialised from that listener, a
+/// null field at first use — neither of which points anywhere near the real cause. Both are one config line away, so
+/// the useful thing is to say so at pack time rather than let it surface as a crash during gameplay.
+///
+/// This reports rather than auto-enables: `reloadResources` triggers a full reload of the running client (a visible
+/// hitch, and it re-runs every other mod's listeners too), which is not a decision to make silently on the user's
+/// behalf.
+fn report_resource_needs(
+    payload: &Path,
+    cfg: &crate::config::AgentConfig,
+    targets: &BTreeSet<String>,
+    log: &mut impl FnMut(&str),
+) {
+    let Ok(bytes) = std::fs::read(payload) else { return };
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { return };
+
+    let mut asset_namespaces: BTreeSet<String> = BTreeSet::new();
+    let mut has_lang = false;
+    let mut reload_listener = false;
+    let mut reads_own_metadata = false;
+    for i in 0..zip.len() {
+        let Ok(mut e) = zip.by_index(i) else { continue };
+        let name = e.name().to_string();
+        if let Some(rest) = name.strip_prefix("assets/") {
+            // Only RENDER-PATH resources matter here — things fetched through a ResourceLocation at draw time, which
+            // is what silently resolves to "Missing resource" without a pack. Sounds are deliberately excluded: they
+            // go through the sound_event REGISTRY instead, which bootstrap.thawRegistries already covers, and a
+            // sounds-only mod (LiquidBounce) works fine with no mod container. Flagging it there would be noise.
+            let render_path = rest.ends_with(".png")
+                || rest.ends_with(".fsh")
+                || rest.ends_with(".vsh")
+                || rest.ends_with(".glsl")
+                || ["/textures/", "/models/", "/font/", "/shaders/", "/post_effect/", "/lang/"]
+                    .iter()
+                    .any(|d| rest.contains(d));
+            if render_path {
+                if let Some(ns) = rest.split('/').next().filter(|s| !s.is_empty()) {
+                    asset_namespaces.insert(ns.to_string());
+                }
+                has_lang |= rest.contains("/lang/");
+            }
+        }
+        // A class's constant pool carries the API names it references, so a substring scan is enough to tell whether
+        // the mod hooks the reload pipeline or looks itself up in the loader — no bytecode parsing needed.
+        if name.ends_with(".class") && !(reload_listener && reads_own_metadata) {
+            let mut buf = Vec::new();
+            if e.read_to_end(&mut buf).is_ok() {
+                let hay = String::from_utf8_lossy(&buf);
+                reload_listener |= hay.contains("ResourceManagerHelper")
+                    || hay.contains("ResourceReloadListener")
+                    || hay.contains("PreparableReloadListener");
+                reads_own_metadata |= hay.contains("getModContainer");
+            }
+        }
+    }
+
+    // A mod can also hook the reload pipeline by MIXING INTO it rather than via the loader API — Wurst registers its
+    // translator through a LanguageManager mixin, which no API-name scan can see. The derived target list does.
+    let mixes_reload_pipeline = targets.iter().any(|t| {
+        t.contains("resources/language/") || t.contains("packs/resources/") || t.contains("client/resources/")
+    });
+    let want_reload = reload_listener || mixes_reload_pipeline;
+    let want_container = !asset_namespaces.is_empty() || reads_own_metadata;
+    if (!want_reload || cfg.reload_resources) && (!want_container || cfg.register_mod_container) {
+        return; // nothing to advise, or already configured
+    }
+    log("  NOTE: this payload ships resources that late attach does not wire up automatically:");
+    if want_container && !cfg.register_mod_container {
+        let ns: Vec<&str> = asset_namespaces.iter().map(String::as_str).collect();
+        if !ns.is_empty() {
+            log(&format!(
+                "    - assets/ for namespace(s) {} — without a mod container these never become a resource pack, so \
+                 its textures resolve as 'Missing resource'",
+                ns.join(", ")
+            ));
+        }
+        if reads_own_metadata {
+            log("    - the mod calls getModContainer (reads its own metadata), which fails on late attach");
+        }
+        log("      => set  bootstrap.registerModContainer=true");
+    }
+    if want_reload && !cfg.reload_resources {
+        log(&format!(
+            "    - it registers a resource-reload listener{} — the boot-time reload has already passed, so that \
+             listener never fires and anything it initialises stays null",
+            if has_lang { " and ships lang files" } else { "" }
+        ));
+        log("      => set  bootstrap.reloadResources=true");
+    }
+    log("    pass these with  --config <file.properties>  (see examples/liquidbounce/bootstrap.properties)");
 }
 
 fn assemble(
