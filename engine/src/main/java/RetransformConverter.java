@@ -485,7 +485,38 @@ public class RetransformConverter {
         s.instructions = m.instructions; s.tryCatchBlocks = m.tryCatchBlocks;
         s.maxStack = m.maxStack; s.maxLocals = m.maxLocals;
         rewriteRefs(s, true);   // rewrite added-member refs inside the moved body
+        reportIllegalSuperCalls(m, s);
         return s;
+    }
+
+    /** Flag a {@code super.x()} call left in a body we just moved to the sidecar.
+     *
+     *  <p>A mixin that OVERRIDES an inherited target method and calls {@code super} compiles to
+     *  {@code invokespecial <Super>.x}. {@code invokespecial} requires the *current* class to be assignable to the
+     *  reference class, and the sidecar is a bare {@code java.lang.Object} subclass — so once the body is relocated the
+     *  call is unverifiable and the JVM rejects the whole sidecar with
+     *  {@code VerifyError: Bad invokespecial instruction: current class isn't assignable to reference class}. That
+     *  error surfaces whenever the sidecar first loads, typically deep in gameplay rather than at attach.
+     *
+     *  <p>We cannot fix it for an already-loaded target. The correct lowering is a bridge method ON the target (which
+     *  IS assignable) that the sidecar then calls virtually — but {@code retransformClasses} cannot ADD methods, which
+     *  is the whole reason the body was relocated in the first place. So this is a genuine architectural limit of
+     *  retransform-based injection, the "inherited-method overrides" caveat in the README, and the only useful move is
+     *  to name it loudly BEFORE publishing rather than emit bytecode we know the verifier will reject.
+     *
+     *  <p>Only non-{@code <init>} invokespecial counts: constructors are lowered separately, and an invokespecial to a
+     *  private method of the target is already routed through the reflective {@code rmi$} bridge by {@link #rewriteRefs}
+     *  (so anything still pointing at the sidecar itself is ours and fine). */
+    private void reportIllegalSuperCalls(MethodNode original, MethodNode relocated) {
+        if (relocated.instructions == null) return;
+        for (AbstractInsnNode p = relocated.instructions.getFirst(); p != null; p = p.getNext()) {
+            if (!(p instanceof MethodInsnNode mi) || mi.getOpcode() != Opcodes.INVOKESPECIAL) continue;
+            if (mi.name.equals("<init>") || mi.owner.equals(sidecar) || mi.owner.equals(stateName)) continue;
+            LateAttachVerifier.error("SUPER_CALL_IN_RELOCATED_METHOD", targetInternal, original.name + original.desc,
+                "mixin overrides an inherited method and calls super." + mi.name + " (" + mi.owner + "); the relocated "
+                + "body cannot legally invokespecial from the sidecar, and retransform cannot add a bridge to the "
+                + "already-loaded target. This mixin is unsupported under late attach.");
+        }
     }
 
     /** GLOBAL table of mixin-ADDED methods across ALL targets, keyed by "owner name desc" -> [owner, sidecar,
