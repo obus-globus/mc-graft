@@ -50,7 +50,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned by commit: @stable is a BRANCH, so the tag-immutability argument doesn't even apply there. The toolchain
+      # is now named explicitly because a bare SHA no longer says which one (the action's own default is `stable`).
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4   # stable branch @ 2026-07-25
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ctl
@@ -84,11 +88,16 @@ jobs:
     name: Build jattach.exe
     runs-on: windows-latest
     steps:
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756   # v1.13.0
       - name: Build jattach v2.2
         shell: cmd
+        env:
+          # Pinned by commit, not by the mutable v2.2 tag: this binary is embedded into every released mcgraft.exe, and
+          # the copy vendored under tool/ is SHA-256 verified before it runs — the release path must be no weaker.
+          JATTACH_COMMIT: 030d74328bd6b04114f804ba1b4de2ddfa031b55   # v2.2
         run: |
-          git clone --branch v2.2 --depth 1 https://github.com/jattach/jattach jattach
+          git clone https://github.com/jattach/jattach jattach
+          git -C jattach checkout %JATTACH_COMMIT%
           cd jattach
           cl /O2 /D_CRT_SECURE_NO_WARNINGS /DJATTACH_VERSION=\"2.2\" /Fejattach.exe src\windows\jattach.c advapi32.lib /link /SUBSYSTEM:CONSOLE,5.02
       - uses: actions/upload-artifact@v4
@@ -109,7 +118,9 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4   # stable branch @ 2026-07-25
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ctl
@@ -157,7 +168,7 @@ jobs:
         with:
           path: artifacts
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65   # v2.6.2
         with:
           files: |
             artifacts/mc-graft-base/mc-graft-base.jar

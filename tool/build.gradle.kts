@@ -31,8 +31,8 @@ tasks.withType<JavaCompile>().configureEach {
     options.compilerArgs.addAll(listOf("--add-modules", "jdk.attach"))
 }
 
-// SpotBugs — the Java linter for the standalone tool (same policy as the root build). Java 17 bytecode, so the stock
-// tool ASM reads it fine (no version override needed). Run `./gradlew spotbugsMain`; report in build/reports/spotbugs/.
+// SpotBugs — the Java linter for the standalone tool (same policy as the root build). Run `./gradlew spotbugsMain`;
+// report in build/reports/spotbugs/.
 spotbugs {
     toolVersion.set("4.9.3")
     effort.set(Effort.MAX)
@@ -45,9 +45,25 @@ tasks.withType<SpotBugsTask>().configureEach {
     reports.create("xml") { required.set(false) }
 }
 // The tool's own classes are Java 17, but SpotBugs also scans REFERENCED JDK classes (Swing, java.lang.*), which are
-// v69 when analysis runs on a JDK 25. Force ASM 9.8 (reads v69) onto the spotbugs classpath so those don't error.
+// v69 when analysis runs on a JDK 25. Raise ASM to 9.8 (reads v69) on the spotbugs classpath so those don't error. A
+// FLOOR, not a pin: an unconditional useVersion also DOWNgrades, so a later SpotBugs shipping a newer ASM — or a newer
+// JDK's class-file version needing one — would fail deep inside ASM instead of at a legible version boundary.
+val spotbugsAsmFloor = "9.8"
+fun belowVersion(version: String?, floor: String): Boolean {
+    val parts = { v: String -> v.split('.', '-').map { it.toIntOrNull() ?: 0 } }
+    val have = version?.let(parts) ?: return true
+    val want = parts(floor)
+    for (i in 0 until maxOf(have.size, want.size)) {
+        val a = have.getOrElse(i) { 0 }
+        val b = want.getOrElse(i) { 0 }
+        if (a != b) return a < b
+    }
+    return false
+}
 configurations.matching { it.name == "spotbugs" }.configureEach {
-    resolutionStrategy.eachDependency { if (requested.group == "org.ow2.asm") useVersion("9.8") }
+    resolutionStrategy.eachDependency {
+        if (requested.group == "org.ow2.asm" && belowVersion(requested.version, spotbugsAsmFloor)) useVersion(spotbugsAsmFloor)
+    }
 }
 
 tasks.jar {

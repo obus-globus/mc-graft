@@ -308,9 +308,11 @@ public final class InjectorUi extends JFrame {
                 }
                 String agentArgs = args.toString();
                 Injector.inject(Long.toString(process.pid), jar, agentArgs, message -> {
+                    // "Agent load" (not "Agent loaded") so both back-ends match: JdkAttacher says "Attached successfully"
+                    // / "Loading agent:", jattach says "Agent load delivered via jattach (return code 0)."
                     int progress = message.startsWith("Attached") ? 40
                             : message.startsWith("Loading") ? 45
-                            : message.startsWith("Agent loaded") ? 70 : 20;
+                            : message.startsWith("Agent load") ? 70 : 20;
                     publish(new LogUpdate(message, progress));
                 });
                 return null;
@@ -319,8 +321,9 @@ public final class InjectorUi extends JFrame {
             @Override protected void process(List<LogUpdate> updates) {
                 for (LogUpdate update : updates) {
                     appendLog(update.message);
-                    progressBar.setValue(update.progress);
-                    progressBar.setString(update.message);
+                    // Monotonic: on the jattach path every relayed stdout line scores the unclassified 20, which would
+                    // otherwise drag the bar back down from 40/45 as the attach progresses.
+                    setProgressIfHigher(update.progress, update.message);
                 }
             }
 

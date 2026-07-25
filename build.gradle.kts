@@ -72,7 +72,7 @@ tasks.withType<JavaCompile>().configureEach { options.release.set(25) }
 // SpotBugs — the project's Java linter. Bytecode static analysis over the engine + mixin-service classes (bug patterns:
 // null derefs, ignored return values, bad casts, concurrency mistakes). Chosen over a style checker because the code is
 // intentionally dense; SpotBugs flags likely BUGS, not formatting. Run `./gradlew spotbugsEngine spotbugsMixinservice`
-// (or just `check`); the HTML report lands in build/reports/spotbugs/. Tool ASM 9.8 reads Java 25 (class v69) bytecode.
+// (or just `check`); the HTML report lands in build/reports/spotbugs/. Tool ASM >= 9.8 reads Java 25 (class v69) bytecode.
 // ---------------------------------------------------------------------------------------------------------------------
 spotbugs {
     toolVersion.set("4.9.3")
@@ -85,10 +85,26 @@ tasks.withType<SpotBugsTask>().configureEach {
     reports.create("html") { required.set(true) }
     reports.create("xml") { required.set(false) }
 }
-// SpotBugs 4.9.x bundles an ASM that rejects class-file major version 69 (Java 25). Force ASM 9.8 (the first release that
-// reads v69) onto the spotbugs tool classpath so it can analyze this engine's Java 25 bytecode.
+// SpotBugs 4.9.x bundles an ASM that rejects class-file major version 69 (Java 25). Raise ASM to 9.8 (the first release
+// that reads v69) on the spotbugs tool classpath so it can analyze this engine's Java 25 bytecode. A FLOOR, not a pin:
+// an unconditional useVersion also DOWNgrades, so a later SpotBugs that already ships a newer ASM — or a class-file bump
+// (Java 26 = v70) needing one — would fail deep inside ASM instead of at a legible version boundary.
+val spotbugsAsmFloor = "9.8"
+fun belowVersion(version: String?, floor: String): Boolean {
+    val parts = { v: String -> v.split('.', '-').map { it.toIntOrNull() ?: 0 } }
+    val have = version?.let(parts) ?: return true
+    val want = parts(floor)
+    for (i in 0 until maxOf(have.size, want.size)) {
+        val a = have.getOrElse(i) { 0 }
+        val b = want.getOrElse(i) { 0 }
+        if (a != b) return a < b
+    }
+    return false
+}
 configurations.matching { it.name == "spotbugs" }.configureEach {
-    resolutionStrategy.eachDependency { if (requested.group == "org.ow2.asm") useVersion("9.8") }
+    resolutionStrategy.eachDependency {
+        if (requested.group == "org.ow2.asm" && belowVersion(requested.version, spotbugsAsmFloor)) useVersion(spotbugsAsmFloor)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

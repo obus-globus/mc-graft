@@ -451,6 +451,22 @@ public class RetransformConverter {
      *  receiver (real interface call for genuine implementors, sidecar for duck targets). */
     public static volatile Set<String> SHARED_IFACES = java.util.Collections.emptySet();
     public static boolean isSharedIface(String internal) { return SHARED_IFACES.contains(internal); }
+
+    /** Whether a use site of mixin-added interface {@code iface} may be COLLAPSED to its single implementor.
+     *
+     *  <p>This MUST agree with {@link #eraseIfaceInternal}, which only erases descriptors for payload-scope interfaces.
+     *  Collapsing rewrites a site to name a concrete class, so collapsing an interface whose descriptors are NOT erased
+     *  leaves an interface-typed value feeding a class-typed site — and JVMS 4.10.1.2 treats an interface-typed value as
+     *  Object for assignability to a class type, i.e. VerifyError. It would also break a genuine non-mixin implementor,
+     *  whose instances would now fail a CHECKCAST that names one specific target. Interfaces failing this test route
+     *  through DuckDispatch instead, which discriminates real implementors from de-implemented targets per receiver.
+     *
+     *  <p>The predicate used to be `impls.size() == 1 && !isSharedIface(...)` alone, which silently mis-rewrote any
+     *  mixin-added interface living outside the payload scope (e.g. in a bundled library jar) rather than reporting it. */
+    static boolean canCollapse(String iface, List<String[]> impls) {
+        return impls.size() == 1 && isPayloadIface(iface) && !isSharedIface(iface);
+    }
+
     String[] addedFieldTarget(String owner, String name, String desc) {
         if (GFIELD == null) return null;
         for (String c = owner; c != null && !c.equals("java/lang/Object"); c = superOf(c)) { String[] g = GFIELD.get(gkey(c, name, desc)); if (g != null) return g; }
@@ -515,7 +531,7 @@ public class RetransformConverter {
             if (GIFACE != null && p instanceof TypeInsnNode gti && GIFACE.containsKey(gti.desc)
                     && (gti.getOpcode() == Opcodes.CHECKCAST || gti.getOpcode() == Opcodes.INSTANCEOF)) {
                 List<String[]> impls = GIFACE.get(gti.desc);
-                if (impls.size() == 1 && !isSharedIface(gti.desc)) {
+                if (canCollapse(gti.desc, impls)) {
                     gti.desc = impls.get(0)[0];
                 } else if (gti.getOpcode() == Opcodes.CHECKCAST) {
                     InsnList suffix = new InsnList(); suffix.add(new LdcInsnNode(gti.desc));
@@ -529,7 +545,7 @@ public class RetransformConverter {
                 }
             } else if (GIFACE != null && p instanceof MethodInsnNode gmi && gmi.getOpcode() == Opcodes.INVOKEINTERFACE && GIFACE.containsKey(gmi.owner)) {
                 List<String[]> impls = GIFACE.get(gmi.owner);
-                if (impls.size() == 1 && !isSharedIface(gmi.owner)) {
+                if (canCollapse(gmi.owner, impls)) {
                     String[] ts = impls.get(0);
                     m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + gmi.name, "(L" + ts[0] + ";" + gmi.desc.substring(1), false));
                 } else {
@@ -793,7 +809,7 @@ public class RetransformConverter {
                 if (p instanceof TypeInsnNode ti && ifaceMap.containsKey(ti.desc)
                         && (ti.getOpcode() == Opcodes.CHECKCAST || ti.getOpcode() == Opcodes.INSTANCEOF)) {
                     String iface = ti.desc; List<String[]> impls = ifaceMap.get(iface);
-                    if (impls.size() == 1 && !isSharedIface(iface)) ti.desc = impls.get(0)[0];
+                    if (canCollapse(iface, impls)) ti.desc = impls.get(0)[0];
                     else if (ti.getOpcode() == Opcodes.CHECKCAST) {
                         InsnList call = new InsnList(); call.add(new LdcInsnNode(iface));
                         call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/DuckDispatch", "cast",
@@ -808,7 +824,7 @@ public class RetransformConverter {
                     n++;
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() == Opcodes.INVOKEINTERFACE && ifaceMap.containsKey(mi.owner)) {
                     List<String[]> impls = ifaceMap.get(mi.owner);
-                    if (impls.size() == 1 && !isSharedIface(mi.owner)) {
+                    if (canCollapse(mi.owner, impls)) {
                         String[] ts = impls.get(0);
                         m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + mi.name, "(L" + ts[0] + ";" + mi.desc.substring(1), false));
                     } else {
