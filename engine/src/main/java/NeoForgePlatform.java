@@ -86,10 +86,12 @@ final class NeoForgePlatform implements LoaderPlatform {
         return payloadBundle;
     }
     /** Hard identity-split hazards NeoForge provides itself — resolved parent-first via the TCL, never on the PayloadLoader.
-     *  mcef is excluded too: the bundled Fabric-flavoured mcef jar's MCEF.<clinit> transitively references Sodium
-     *  classes absent from sodium-neoforge, crashing the (stretch) browser stage; without it the payload skips the browser. */
+     *  These are loader-identity concerns only (a second copy of ASM/Mixin breaks the transformer pipeline); payload
+     *  libraries never belong here. Extend via {@code payload.loaderProvided} rather than by naming a mod's library. */
     private static boolean isLoaderProvided(String base){ String b=base.toLowerCase();
-        return b.startsWith("asm-")||b.startsWith("asm.")||b.contains("sponge-mixin")||b.contains("mixinextras")||b.contains("mcef"); }
+        if (b.startsWith("asm-")||b.startsWith("asm.")||b.contains("sponge-mixin")||b.contains("mixinextras")) return true;
+        for (String extra : PayloadConfig.get().loaderProvided) if (b.contains(extra)) return true;
+        return false; }
 
     static void scanPackages(Path jar, Set<String> owned) {
         try (JarFile jf = new JarFile(jar.toFile())) { for (var en = jf.entries(); en.hasMoreElements();) {

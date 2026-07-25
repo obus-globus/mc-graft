@@ -49,6 +49,10 @@ public final class PayloadConfig {
     // from the payload jar. Used to scope the caller-rewrite preflight + the already-loaded-payload snapshot so the
     // engine makes no assumption about any one mod's package. Empty -> the engine falls back to the payload class set.
     public final List<String> payloadPackages;
+    // Extra nested-jar basename substrings the mod LOADER already provides, on top of the built-in identity hazards
+    // (asm, sponge-mixin, mixinextras). Staging one of these a second time splits class identity. Payload-specific
+    // exclusions belong here, not hardcoded in a platform (payload.loaderProvided).
+    public final List<String> loaderProvided;
     // Internal-name prefixes of bundled library mods (e.g. xaero/lib) whose OWN runtime casts to duck interfaces their
     // mixins add to MC classes; those library classes must be caller-rewritten too (payload.callerRewrite.packages).
     public final List<String> callerRewritePackages;
@@ -99,6 +103,7 @@ public final class PayloadConfig {
         reloadResources = Boolean.parseBoolean(p.getProperty("bootstrap.reloadResources", "false").trim());
         thawRegistries = csv(p.getProperty("bootstrap.thawRegistries", ""));
         payloadPackages = csv(p.getProperty("payload.packages", ""));
+        loaderProvided = csv(p.getProperty("payload.loaderProvided", ""));
         callerRewritePackages = csv(p.getProperty("payload.callerRewrite.packages", ""));
         depCallerRewritePackages = csv(p.getProperty("bootstrap.depCallerRewrite.packages", ""));
         gameDirProperty = blankToNull(p.getProperty("bootstrap.gameDirProperty", ""));

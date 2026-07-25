@@ -53,7 +53,6 @@ final class VanillaPlatform implements LoaderPlatform {
             } } }
         if(payloadBundle==null) throw new IllegalStateException("Bundled agent-libs/payload.jar not found");
         Thread.currentThread().setContextClassLoader(sys);
-        try { Class.forName("vspike.McefNative").getMethod("stageIfBundled", File.class, String.class).invoke(null, agentJar, InjectionLogger.PREFIX); } catch (Throwable t) {}
         return payloadBundle;
     }
 

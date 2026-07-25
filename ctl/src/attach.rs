@@ -12,8 +12,9 @@
 pub struct AttachResult {
     /// JVM command-completion status (first response line). 0 = the command was accepted.
     pub jvm_status: i32,
-    /// The `instrument` agent's `Agent_OnAttach` return code, parsed from its "return code: N" output. 0 = agentmain OK.
-    pub agent_rc: Option<i32>,
+    /// The `instrument` agent's `Agent_OnAttach` outcome. 0 = agentmain OK; anything else = it failed and `output`
+    /// carries the JVM's explanation. Always determined — see [`classify_agent_rc`].
+    pub agent_rc: i32,
     /// The full raw response text (thread-dump-free; just the attach channel's reply).
     pub output: String,
 }
@@ -28,6 +29,32 @@ fn parse_return_code(line: &str) -> Option<i32> {
     tail.split(|c: char| !(c.is_ascii_digit() || c == '-'))
         .rfind(|s| !s.is_empty() && *s != "-")
         .and_then(|s| s.parse::<i32>().ok())
+}
+
+/// Classify the `instrument` agent's outcome from the JVM's reply *body* (everything after the status line).
+///
+/// HotSpot reports a `load` result in three different shapes depending on JDK, and only one of them mentions a return
+/// code. Mirrors jattach's `posix/jattach_hotspot.c`, which is the reference implementation vendored under
+/// `thirdparty/`:
+///
+/// - `return code: N` — JDK 9..17
+/// - a bare number    — JDK 8
+/// - anything else    — JDK 21+ (i.e. what modern Minecraft runs on): `load` *always* reports 0 at the command level
+///   and the body itself IS the error message. Treating this shape as "no return code reported" is why a failed
+///   agentmain used to be announced as a successful injection.
+///
+/// An empty body means the command was accepted with nothing to report.
+fn classify_agent_rc(body: &str) -> i32 {
+    let Some(first) = body.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return 0;
+    };
+    if let Some(rc) = parse_return_code(first) {
+        return rc;
+    }
+    if let Ok(rc) = first.parse::<i32>() {
+        return rc;
+    }
+    -1
 }
 
 #[cfg(unix)]
@@ -139,8 +166,10 @@ mod unix_impl {
         stream.read_to_end(&mut buf).map_err(|e| format!("read attach response: {e}"))?;
         let output = String::from_utf8_lossy(&buf).into_owned();
 
-        let jvm_status = output.lines().next().unwrap_or("").trim().parse::<i32>().unwrap_or(-1);
-        let agent_rc = output.lines().find_map(super::parse_return_code);
+        // Line 1 is the command status; everything after it is the body the agent outcome is derived from.
+        let mut lines = output.lines();
+        let jvm_status = lines.next().unwrap_or("").trim().parse::<i32>().unwrap_or(-1);
+        let agent_rc = super::classify_agent_rc(&lines.collect::<Vec<_>>().join("\n"));
 
         Ok(AttachResult { jvm_status, agent_rc, output })
     }
@@ -157,12 +186,15 @@ pub fn load_agent(pid: i32, agent_jar: &std::path::Path, agent_args: &str) -> Re
     let jar = agent_jar
         .canonicalize()
         .map_err(|e| format!("agent jar {}: {e}", agent_jar.display()))?;
-    let bin = jattach_bin()?;
-    let option = if agent_args.is_empty() {
-        jar.display().to_string()
-    } else {
-        format!("{}={}", jar.display(), agent_args)
+    // `canonicalize` on Windows yields an extended-length path (`\\?\C:\...`). That string is handed to the JPLIS
+    // `instrument` agent, which ends at `new JarFile(path)`; JDK 9+ resolves that through `java.nio`, which rejects
+    // '?' in a path outright (`InvalidPathException`). Keep canonicalize for its existence check, drop the prefix.
+    let jar = {
+        let s = jar.display().to_string();
+        s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
     };
+    let bin = jattach_bin()?;
+    let option = if agent_args.is_empty() { jar.clone() } else { format!("{jar}={agent_args}") };
     // jattach <pid> load instrument false "<jar>[=<args>]" — the JVM's response is relayed to stdout.
     let out = std::process::Command::new(&bin)
         .arg(pid.to_string())
@@ -177,9 +209,20 @@ pub fn load_agent(pid: i32, agent_jar: &std::path::Path, agent_args: &str) -> Re
     if !out.status.success() {
         return Err(format!("jattach failed (exit {:?}): {}", out.status.code(), combined.trim()));
     }
-    // First numeric line of stdout is the JVM command status; the agent rc is the "return code: N" line if present.
-    let jvm_status = stdout.lines().find_map(|l| l.trim().parse::<i32>().ok()).unwrap_or(0);
-    let agent_rc = combined.lines().find_map(parse_return_code);
+    // jattach prints `JVM response code = ` with NO trailing newline and then dumps the JVM's raw reply, so the status
+    // digit is glued onto that label line and the reply body follows on subsequent lines. Anchor on the marker rather
+    // than hunting for "the first numeric line", which would otherwise pick up a number out of the body. Unknown
+    // shape => -1 (failure), never 0: defaulting to success is how a failed load gets reported as a good one.
+    const MARKER: &str = "JVM response code = ";
+    let (jvm_status, body) = match stdout.find(MARKER) {
+        Some(i) => {
+            let mut rest = stdout[i + MARKER.len()..].lines();
+            let status = rest.next().unwrap_or("").trim().parse::<i32>().unwrap_or(-1);
+            (status, rest.collect::<Vec<_>>().join("\n"))
+        }
+        None => (-1, stdout.clone()),
+    };
+    let agent_rc = classify_agent_rc(&body);
     Ok(AttachResult { jvm_status, agent_rc, output: combined })
 }
 

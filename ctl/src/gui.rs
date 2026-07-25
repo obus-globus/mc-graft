@@ -342,15 +342,23 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             match attach::load_agent(pid, &agent, &agent_args) {
-                Ok(r) if r.jvm_status == 0 => {
-                    let _ = tx.send(Msg::Line(match r.agent_rc {
-                        Some(0) => "agent delivered (Agent_OnAttach=0)".into(),
-                        Some(rc) => format!("agent delivered, Agent_OnAttach={rc} (agentmain failed — see log)"),
-                        None => "agent load delivered (no return code reported)".into(),
-                    }));
+                Ok(r) if r.jvm_status == 0 && r.agent_rc == 0 => {
+                    let _ = tx.send(Msg::Line("agent delivered (Agent_OnAttach=0)".into()));
                     ctx.request_repaint();
                     tail_log(&log_path, &tx, &ctx);
                     let _ = tx.send(Msg::InjectDone(Ok(())));
+                }
+                // The load command was accepted but agentmain failed inside the client. Still tail the log so the
+                // stack trace is visible, then report failure — this must not surface as "Injection finished."
+                Ok(r) if r.jvm_status == 0 => {
+                    let _ = tx.send(Msg::Line(format!("agentmain FAILED (Agent_OnAttach={})", r.agent_rc)));
+                    ctx.request_repaint();
+                    tail_log(&log_path, &tx, &ctx);
+                    let _ = tx.send(Msg::InjectDone(Err(format!(
+                        "agentmain failed inside the client (Agent_OnAttach={}): {}",
+                        r.agent_rc,
+                        r.output.trim()
+                    ))));
                 }
                 Ok(r) => {
                     let _ = tx.send(Msg::InjectDone(Err(format!(

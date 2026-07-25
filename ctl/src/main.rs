@@ -256,6 +256,9 @@ fn cmd_inject(a: InjectArgs) {
     eprintln!("Injection log: {}", log_path.display());
     let start_off = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
+    // A non-zero agent_rc means agentmain threw inside the client. Report it and still follow the log (which carries
+    // the stack trace), but exit non-zero so scripts and humans both see a failure rather than "delivered".
+    let mut agent_failed = false;
     match attach::load_agent(pid, &a.agent, &agent_args) {
         Ok(r) => {
             if r.jvm_status != 0 {
@@ -264,12 +267,15 @@ fn cmd_inject(a: InjectArgs) {
                     r.jvm_status, r.output.trim()
                 ));
             }
-            match r.agent_rc {
-                Some(0) => eprintln!("Agent delivered (Agent_OnAttach returned 0)."),
-                Some(rc) => eprintln!(
-                    "Agent delivered but Agent_OnAttach returned {rc} — agentmain failed inside the client; see the log."
-                ),
-                None => eprintln!("Agent load delivered (no return code reported — watch the log to confirm)."),
+            if r.agent_rc == 0 {
+                eprintln!("Agent delivered (Agent_OnAttach returned 0).");
+            } else {
+                agent_failed = true;
+                eprintln!(
+                    "Agent load FAILED: agentmain reported {} inside the client. JVM response:\n{}",
+                    r.agent_rc,
+                    r.output.trim()
+                );
             }
         }
         Err(e) => die(&format!("attach failed: {e}")),
@@ -277,10 +283,13 @@ fn cmd_inject(a: InjectArgs) {
 
     if a.no_follow {
         eprintln!("Attached. Follow the log with:  mcgraft logs --follow {}", log_path.display());
-        return;
+    } else {
+        eprintln!("--- injection log (Ctrl-C to stop) ---");
+        let _ = follow_log(&log_path, start_off, true, Instant::now() + Duration::from_secs(300));
     }
-    eprintln!("--- injection log (Ctrl-C to stop) ---");
-    let _ = follow_log(&log_path, start_off, true, Instant::now() + Duration::from_secs(300));
+    if agent_failed {
+        std::process::exit(1);
+    }
 }
 
 /// Print the log from `start_off`, optionally following. Stops on a terminal marker or `deadline` when following.

@@ -1,17 +1,23 @@
 //! In-place bytecode edits for `[[patch]] format = "ops"` — a small, base-robust structured patch DSL over
-//! `ristretto_classfile`. Each op replaces exactly one instruction in place (1→1), which ristretto handles safely at
-//! any byte size: it stores branch targets, exception ranges, line numbers and StackMapTable frame deltas as *logical
-//! instruction offsets* and recomputes every byte offset on `to_bytes`, so replacing an instruction never shifts an
-//! index or invalidates a frame. This sidesteps the round-trip fragility of the Krakatau-diff approach.
+//! `ristretto_classfile`. Each op replaces exactly one instruction in place (1→1). Instruction *count* is what makes
+//! that safe: ristretto stores branch targets, exception ranges, line numbers and StackMapTable frame deltas as
+//! *logical instruction offsets* and recomputes every byte offset on `to_bytes`, so a 1→1 replacement never shifts an
+//! index. `apply_op` takes `&mut [Instruction]` (a slice, not a Vec) so the type system enforces that.
 //!
-//! v1 ops (all stack-neutral, 1→1 replacements):
+//! Instruction *byte size*, however, is NOT free — a replacement can widen or narrow the encoding (`iconst_1` →
+//! `sipush`, `ldc` → `ldc_w`), and two of ristretto's `Code` sub-attributes mishandle that. See
+//! [`sanitize_touched_code`], which every edited method is run through.
+//!
+//! v1 ops:
 //!
 //! - `replace_const` — swap an int or String constant load (any encoding) for another.
 //! - `redirect_invoke` — retarget a method call to a different owner/name (descriptor preserved -> stack-safe).
+//! - `set_return` — replace a whole method body with `return <const>` (the one length-changing op; handled in
+//!   [`apply_ops`], not [`apply_op`], and it drops the offset-bearing attributes outright).
 //!
-//! Stack-changing ops (insert/remove/set_return) would need frame-index adjustment and are intentionally not here yet.
+//! Ops that insert or remove instructions would need frame-index adjustment and are intentionally not here yet.
 
-use ristretto_classfile::attributes::{Attribute, Instruction};
+use ristretto_classfile::attributes::{Attribute, Instruction, StackFrame};
 use ristretto_classfile::{ClassFile, ConstantPool};
 
 pub struct Op {
@@ -50,6 +56,7 @@ pub fn apply_ops(class_bytes: &[u8], ops: &[Op]) -> Result<Vec<u8>, String> {
         let ret = return_type(&mdesc);
         for attr in &mut m.attributes {
             let Attribute::Code { code, max_stack, exception_table, attributes, .. } = attr else { continue };
+            let mut touched = 0usize;
             for (oi, op) in ops.iter().enumerate() {
                 if let Some((n, d)) = &op.in_method {
                     if *n != mname || *d != mdesc {
@@ -73,9 +80,17 @@ pub fn apply_ops(class_bytes: &[u8], ops: &[Op]) -> Result<Vec<u8>, String> {
                             )
                         });
                         hits[oi] += 1;
+                        touched += 1;
                     }
-                    kind => hits[oi] += apply_op(code, kind, cp)?,
+                    kind => {
+                        let n = apply_op(code, kind, cp)?;
+                        hits[oi] += n;
+                        touched += n;
+                    }
                 }
+            }
+            if touched > 0 {
+                sanitize_touched_code(attributes);
             }
         }
     }
@@ -85,6 +100,106 @@ pub fn apply_ops(class_bytes: &[u8], ops: &[Op]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     cf.to_bytes(&mut out).map_err(|e| format!("serialize class: {e}"))?;
     Ok(out)
+}
+
+/// Repair the `Code` sub-attributes of a method an op actually edited, so a change in an instruction's *encoded byte
+/// width* can't corrupt the class. Both hazards below are invisible until the JVM refuses to load the result.
+///
+/// 1. **StackMapTable frame-type overflow.** ristretto re-derives frame deltas from the new byte offsets on write, but
+///    writes `SameFrame`/`SameLocals1StackItemFrame` back in their compact form — and `u8::try_from` accepts a delta of
+///    64..=255, which is out of range for both (JVMS §4.7.4 allows 0..=63 and 64..=127 respectively). An over-range
+///    `SameFrame` re-parses as a `SameLocals1StackItemFrame`, which then consumes a `verification_type_info` byte and
+///    desynchronizes the whole rest of the table — `ClassFormatError: StackMapTable format error`. Promoting both to
+///    their `*Extended` forms, which carry a real `u16 offset_delta`, makes any delta representable. This is
+///    information-preserving: `StackFrame::offset_delta()` reports the same logical value for either encoding, and the
+///    write path reads exactly that.
+///
+/// 2. **Stale byte offsets in debug attributes.** Only `LineNumberTable` and `StackMapTable` get remapped on write;
+///    `LocalVariableTable`, `LocalVariableTypeTable` and the type-annotation tables keep *raw byte* `start_pc`/`length`
+///    values. After a size change those ranges are wrong, and a `start_pc + length` past the new `code_length` is a
+///    hard `ClassFormatError`. They are debug info only, so drop them rather than trying to remap. (`set_return`
+///    already does this for the same reason.)
+fn sanitize_touched_code(attributes: &mut Vec<Attribute>) {
+    attributes.retain(|a| {
+        !matches!(
+            a,
+            Attribute::LocalVariableTable { .. }
+                | Attribute::LocalVariableTypeTable { .. }
+                | Attribute::RuntimeVisibleTypeAnnotations { .. }
+                | Attribute::RuntimeInvisibleTypeAnnotations { .. }
+        )
+    });
+    for a in attributes.iter_mut() {
+        let Attribute::StackMapTable { frames, .. } = a else { continue };
+        for f in frames.iter_mut() {
+            match f {
+                StackFrame::SameFrame { frame_type } => {
+                    let offset_delta = u16::from(*frame_type);
+                    *f = StackFrame::SameFrameExtended { frame_type: 251, offset_delta };
+                }
+                StackFrame::SameLocals1StackItemFrame { frame_type, stack } => {
+                    let offset_delta = u16::from(frame_type.saturating_sub(64));
+                    let stack = std::mem::take(stack);
+                    *f = StackFrame::SameLocals1StackItemFrameExtended { frame_type: 247, offset_delta, stack };
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Reuse an existing constant-pool entry instead of appending a duplicate.
+///
+/// `ConstantPool::add` never deduplicates, so without these a class-wide op appends a fresh entry per matched site (up
+/// to six for a `redirect_invoke`). That bloats the pool toward its `u16` ceiling, and — because a constant's *index*
+/// decides whether a load encodes as `ldc` (2 bytes) or `ldc_w` (3) — it also silently widens instructions, which is
+/// what makes the hazards in [`sanitize_touched_code`] fire in the first place.
+fn intern_string(cp: &mut ConstantPool, s: &str) -> Result<u16, String> {
+    for i in 1..pool_len(cp) {
+        if cp.try_get_string(i).map(|v| v == s).unwrap_or(false) {
+            return Ok(i);
+        }
+    }
+    cp.add_string(s).map_err(|e| e.to_string())
+}
+
+fn intern_integer(cp: &mut ConstantPool, v: i32) -> Result<u16, String> {
+    for i in 1..pool_len(cp) {
+        if cp.try_get_integer(i).map(|x| *x == v).unwrap_or(false) {
+            return Ok(i);
+        }
+    }
+    cp.add_integer(v).map_err(|e| e.to_string())
+}
+
+fn intern_class(cp: &mut ConstantPool, name: &str) -> Result<u16, String> {
+    for i in 1..pool_len(cp) {
+        if cp.try_get_class(i).map(|v| v == name).unwrap_or(false) {
+            return Ok(i);
+        }
+    }
+    cp.add_class(name).map_err(|e| e.to_string())
+}
+
+fn intern_method_ref(cp: &mut ConstantPool, iface: bool, owner: &str, name: &str, desc: &str) -> Result<u16, String> {
+    for i in 1..pool_len(cp) {
+        if let Some((was_iface, o, nm, d)) = resolve_ref(cp, i) {
+            if was_iface == iface && o == owner && nm == name && d == desc {
+                return Ok(i);
+            }
+        }
+    }
+    let cls = intern_class(cp, owner)?;
+    if iface {
+        cp.add_interface_method_ref(cls, name, desc).map_err(|e| e.to_string())
+    } else {
+        cp.add_method_ref(cls, name, desc).map_err(|e| e.to_string())
+    }
+}
+
+/// Pool length as a `u16` bound; entries are 1-based, and index 0 is a placeholder.
+fn pool_len(cp: &ConstantPool) -> u16 {
+    u16::try_from(cp.len()).unwrap_or(u16::MAX)
 }
 
 fn apply_op(code: &mut [Instruction], kind: &OpKind, cp: &mut ConstantPool) -> Result<usize, String> {
@@ -107,8 +222,8 @@ fn apply_op(code: &mut [Instruction], kind: &OpKind, cp: &mut ConstantPool) -> R
                 };
                 let Some(ci) = idx else { continue };
                 if cp.try_get_string(ci).map(|s| s == from.as_str()).unwrap_or(false) {
-                    let ni = cp.add_string(to).map_err(|e| e.to_string())?;
-                    *ins = if ni <= u16::from(u8::MAX) { Instruction::Ldc(ni as u8) } else { Instruction::Ldc_w(ni) };
+                    let ni = intern_string(cp, to)?;
+                    *ins = ldc(ni);
                     n += 1;
                 }
             }
@@ -125,12 +240,7 @@ fn apply_op(code: &mut [Instruction], kind: &OpKind, cp: &mut ConstantPool) -> R
                 // method uses InterfaceMethodref); preserve that kind when writing the new ref.
                 let Some((was_iface, o, nm, d)) = resolve_ref(cp, ci) else { continue };
                 if o == from.0 && nm == from.1 && d == from.2 {
-                    let cls = cp.add_class(&to.0).map_err(|e| e.to_string())?;
-                    let ni = if was_iface {
-                        cp.add_interface_method_ref(cls, &to.1, &from.2).map_err(|e| e.to_string())?
-                    } else {
-                        cp.add_method_ref(cls, &to.1, &from.2).map_err(|e| e.to_string())?
-                    };
+                    let ni = intern_method_ref(cp, was_iface, &to.0, &to.1, &from.2)?;
                     match &mut *ins {
                         Instruction::Invokevirtual(x) | Instruction::Invokestatic(x) | Instruction::Invokespecial(x) => *x = ni,
                         Instruction::Invokeinterface(x, _) => *x = ni,
@@ -175,7 +285,7 @@ fn int_push(v: i32, cp: &mut ConstantPool) -> Result<Instruction, String> {
         5 => Instruction::Iconst_5,
         _ if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&v) => Instruction::Bipush(v as i8),
         _ if (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&v) => Instruction::Sipush(v as i16),
-        _ => Instruction::Ldc_w(cp.add_integer(v).map_err(|e| e.to_string())?),
+        _ => ldc(intern_integer(cp, v)?),
     })
 }
 
@@ -245,7 +355,7 @@ fn return_body(ret: &str, value: &Option<RetVal>, cp: &mut ConstantPool) -> Resu
                 if ret != "Ljava/lang/String;" {
                     return Err(format!("set_return: a string value can only be returned as String, not '{ret}'"));
                 }
-                let idx = cp.add_string(s).map_err(|e| e.to_string())?;
+                let idx = intern_string(cp, s)?;
                 b.push(ldc(idx));
                 b.push(Instruction::Areturn);
                 1

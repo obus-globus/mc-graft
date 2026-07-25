@@ -1029,6 +1029,73 @@ mod tests {
         assert!(apply_ops(&patched, &[Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 999, to: 1 } }]).is_ok());
     }
 
+    /// C1 regression: a size-GROWING replacement must not corrupt the StackMapTable.
+    ///
+    /// Every other fixture here is a branch-free method with no frames, which is exactly why this bug class survived.
+    /// This one puts the first frame at byte offset 63 — the largest delta a compact `SameFrame` can encode — with an
+    /// `iconst_1` (1 byte) ahead of it that the op widens to `sipush 300` (3 bytes). Before the fix the frame was
+    /// re-emitted as `SameFrame { frame_type: 65 }`, which is out of range for that form and re-parses as a
+    /// `SameLocals1StackItemFrame`, desynchronizing the rest of the table; HotSpot rejects the class with
+    /// `ClassFormatError: StackMapTable format error: access beyond the end of attribute`.
+    #[test]
+    fn ops_growing_replacement_keeps_stackmap_valid() {
+        if krak2_bin().is_err() {
+            return;
+        }
+        use crate::bytecode::{apply_ops, Op, OpKind};
+        use ristretto_classfile::attributes::{Attribute, StackFrame};
+
+        let mut j = String::from(
+            ".version 52 0\n.class public com/demo/F\n.super java/lang/Object\n\
+             .method public static m : ()V\n.code stack 2 locals 0\niconst_0\nifne L63\niconst_1\npop\n",
+        );
+        j.push_str(&"nop\n".repeat(57)); // pad so L63 lands at byte offset exactly 63
+        j.push_str("L63:\n.stack same\nreturn\n.end code\n.end method\n");
+        let cls = assemble_j(j.as_bytes()).unwrap().remove(0).1;
+
+        let frames_of = |bytes: &[u8]| -> Vec<StackFrame> {
+            let cf = ristretto_classfile::ClassFile::from_bytes(bytes).expect("class re-parses");
+            cf.methods
+                .iter()
+                .flat_map(|m| &m.attributes)
+                .filter_map(|a| match a {
+                    Attribute::Code { attributes, .. } => Some(attributes),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|a| match a {
+                    Attribute::StackMapTable { frames, .. } => Some(frames.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        // Pin the fixture. ristretto reports deltas as *logical instruction* offsets, so this is 61 instructions
+        // (iconst_0, ifne, iconst_1, pop, 57×nop) even though the on-disk byte offset is 63. If someone retunes the
+        // padding, this fails and the byte arithmetic below must be re-derived — otherwise the test would quietly
+        // stop covering the boundary it exists to cover.
+        let before = frames_of(&cls);
+        assert_eq!(before.len(), 1, "fixture must carry exactly one stack-map frame");
+        assert_eq!(before[0].offset_delta(), 61, "fixture drifted off the 63-byte boundary");
+
+        let op = Op { in_method: None, kind: OpKind::ReplaceConstInt { from: 1, to: 300 } };
+        let patched = apply_ops(&cls, std::slice::from_ref(&op)).unwrap();
+
+        // Byte offset 63 -> 65, which no longer fits a compact SameFrame (0..=63). ristretto never promotes frames on
+        // its own, so seeing the extended form proves our promotion ran. Under the bug it emitted `SameFrame { 65 }`,
+        // and re-reading that lands in the 64..=127 window -> it comes back as SameLocals1StackItemFrame with a
+        // bogus stack, which is precisely the table desync HotSpot rejects.
+        let frames = frames_of(&patched);
+        assert_eq!(frames.len(), 1, "one frame expected after patching");
+        assert!(
+            matches!(frames[0], StackFrame::SameFrameExtended { .. }),
+            "expected promotion to SameFrameExtended; got {:?} (a SameLocals1StackItemFrame here means the \
+             compact-form overflow is back)",
+            frames[0]
+        );
+    }
+
     // M2 regression: an op that matches nothing errors even when another op in the same patch matched.
     #[test]
     fn ops_every_op_must_match() {

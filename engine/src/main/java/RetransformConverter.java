@@ -761,7 +761,11 @@ public class RetransformConverter {
     static MethodNode buildIfaceDispatchTramp(String trampName, String iface, String name, String desc) {
         Type[] at = Type.getArgumentTypes(desc); Type rt = Type.getReturnType(desc);
         String td = "(Ljava/lang/Object;" + desc.substring(1);
-        MethodNode m = new MethodNode(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC, trampName, td, null, null);
+        // MUST be public: this lives on the sidecar but is invoked from target' (and from other sidecars), which are
+        // separate classes with no nest relationship — a private static cross-class INVOKESTATIC is IllegalAccessError
+        // at first execution. Every other generated sidecar member (h$, get$/set$, refGet$/refSet$, rmi$, initState,
+        // getState) is public for the same reason.
+        MethodNode m = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC, trampName, td, null, null);
         InsnList in = m.instructions;
         in.add(new VarInsnNode(Opcodes.ALOAD, 0));
         in.add(new LdcInsnNode(iface)); in.add(new LdcInsnNode(name)); in.add(new LdcInsnNode(desc));
