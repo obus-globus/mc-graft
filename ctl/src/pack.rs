@@ -472,6 +472,7 @@ fn report_resource_needs(
     let mut has_lang = false;
     let mut reload_listener = false;
     let mut reads_own_metadata = false;
+    let mut registers_keybinds = false;
     for i in 0..zip.len() {
         let Ok(mut e) = zip.by_index(i) else { continue };
         let name = e.name().to_string();
@@ -504,6 +505,10 @@ fn report_resource_needs(
                     || hay.contains("ResourceReloadListener")
                     || hay.contains("PreparableReloadListener");
                 reads_own_metadata |= hay.contains("getModContainer");
+                registers_keybinds |= hay.contains("KeyMappingHelper")
+                    || hay.contains("KeyBindingHelper")
+                    || hay.contains("registerKeyMapping")
+                    || hay.contains("registerKeyBinding");
             }
         }
     }
@@ -514,11 +519,12 @@ fn report_resource_needs(
         t.contains("resources/language/") || t.contains("packs/resources/") || t.contains("client/resources/")
     });
     let want_reload = reload_listener || mixes_reload_pipeline;
+    let want_keybinds = registers_keybinds && !cfg.reopen_key_bindings;
     let want_container = !asset_namespaces.is_empty() || reads_own_metadata;
-    if (!want_reload || cfg.reload_resources) && (!want_container || cfg.register_mod_container) {
+    if (!want_reload || cfg.reload_resources) && (!want_container || cfg.register_mod_container) && !want_keybinds {
         return; // nothing to advise, or already configured
     }
-    log("  NOTE: this payload ships resources that late attach does not wire up automatically:");
+    log("  NOTE: this payload uses APIs that late attach does not wire up automatically:");
     if want_container && !cfg.register_mod_container {
         let ns: Vec<&str> = asset_namespaces.iter().map(String::as_str).collect();
         if !ns.is_empty() {
@@ -540,6 +546,13 @@ fn report_resource_needs(
             if has_lang { " and ships lang files" } else { "" }
         ));
         log("      => set  bootstrap.reloadResources=true");
+    }
+    if want_keybinds {
+        // fabric-api's KeyMappingRegistryImpl throws 'GameOptions has already been initialised' for any registration
+        // after the options screen exists — which is always true when attaching to a running client.
+        log("    - it registers a key mapping — fabric-api refuses that once GameOptions exists, which is always the");
+        log("      case under late attach, so the mod's init throws");
+        log("      => set  bootstrap.reopenKeyBindings=true");
     }
     log("    pass these with  --config <file.properties>  (see examples/liquidbounce/bootstrap.properties)");
 }
