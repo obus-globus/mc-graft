@@ -387,6 +387,10 @@ public class FullInjectAgent {
             catch (Throwable t) { InjectionLogger.warn("dependency-module entrypoint "+cn+" failed (best-effort, continuing): "+rootMsg(t)); } }
         for (String cn : cfg.mainEntrypoints) callEntrypoint(cn, "onInitialize");
         for (String cn : cfg.clientEntrypoints) callEntrypoint(cn, "onInitializeClient");
+        // Guaranteed merge point for keybinds the entrypoints just registered. The registration method is also hooked
+        // (KeyBindingReopen.appendSync) to cover deferred registration, but that hook is absent if its rewrite did not
+        // apply; this call keeps the inline case working regardless. Both paths are idempotent.
+        if (cfg.reopenKeyBindings) mcgraft.rt.KeyBindSync.syncFrom(SYS, KeyBindingReopen.TARGET);
     }
     /** Invoke a Fabric entrypoint the way the loader's language adapters do, rather than assuming a public no-arg ctor.
      *
