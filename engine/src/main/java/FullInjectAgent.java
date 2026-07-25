@@ -49,6 +49,17 @@ public class FullInjectAgent {
         verifyAsmRuntime();
         for (Class<?> c : inst.getAllLoadedClasses()) preLoaded.add(c.getName().replace('.','/'));   // snapshot BEFORE we load anything
         inst.redefineModule(Object.class.getModule(), Set.of(), Map.of(), Map.of("java.lang", Set.of(FullInjectAgent.class.getModule())), Set.of(), Map.of());
+        // A sidecar's smi$ super-call bridge needs MethodHandles.privateLookupIn on its target. On vanilla/Fabric the
+        // sidecar is defined into the target's own package and loader, so both sit in the same unnamed (hence open)
+        // module and this never fires. Only a JPMS loader that relocated sidecars out of the target's module
+        // (RetransformConverter.SIDECAR_PKG, i.e. NeoForge) can fail that check — open the package on demand then.
+        // Registered as a lazy fallback rather than a blanket up-front open so we never widen a module we didn't need to.
+        mcgraft.rt.AwReflect.MODULE_OPENER = (target, sidecarClass) -> {
+            Module tm = target.getModule(), sm = sidecarClass.getModule();
+            if (tm == null || !tm.isNamed() || tm.isOpen(target.getPackageName(), sm)) return;
+            InjectionLogger.info("opening "+target.getPackageName()+" of module "+tm.getName()+" to "+sm+" for a super-call bridge");
+            inst.redefineModule(tm, Set.of(), Map.of(), Map.of(target.getPackageName(), Set.of(sm)), Set.of(), Map.of());
+        };
         RetransformConverter.CLASS_BYTES = PLATFORM::originalBytes;
         InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
         File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());

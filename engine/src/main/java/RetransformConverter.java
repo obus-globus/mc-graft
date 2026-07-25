@@ -62,6 +62,10 @@ public class RetransformConverter {
     final Map<String,Integer> oMethodAcc = new HashMap<>();    // original "name desc" -> access
     final LinkedHashSet<String> reflectMethods = new LinkedHashSet<>(); // "name desc" of private target methods called from sidecar
     final Set<String> reflectStaticMethods = new HashSet<>();  // subset of reflectMethods invoked without a receiver
+    /** {@code "<refcOwner> <name> <desc>"} of every {@code super.x()} site found in a body we relocated, lowered to a
+     *  {@code findSpecial} MethodHandle bridge. Keyed by OWNER as well as name+desc: one target can super-call the same
+     *  signature against two different levels of its hierarchy. */
+    final LinkedHashSet<String> superMethods = new LinkedHashSet<>();
     final LinkedHashMap<String,Object[]> ifaceDispatchTramps = new LinkedHashMap<>();
 
     Result run(byte[] original, byte[] transformed) {
@@ -138,6 +142,13 @@ public class RetransformConverter {
         for (String key : reflectMethods) { String nm = key.substring(0, key.indexOf(' ')), dc = key.substring(key.indexOf(' ') + 1); addReflectiveInvoker(S, nm, dc, reflectStaticMethods.contains(key)); }
         if (!reflectMethods.isEmpty()) addReflectMethodInit(S);
         r.notes.add("reflective (private @Shadow) methods: " + reflectMethods);
+        // super.x() bridges: findSpecial MethodHandles bound with specialCaller = the target (see addSuperInvoker).
+        // Every rewriteRefs(inSidecar=true) call has already run by this point (relocateMethod, the merged/appended
+        // <clinit> deltas and buildInstanceStateInitializer are all above), so superMethods is complete here — the
+        // same invariant reflectFields/reflectMethods rely on.
+        for (String key : superMethods) { String[] k = key.split(" "); addSuperInvoker(S, k[0], k[1], k[2]); }
+        if (!superMethods.isEmpty()) addSuperMethodInit(S);
+        r.notes.add("super-call (findSpecial) bridges: " + superMethods);
 
         // Retransform must publish the loaded class's exact redefinition-constrained schema. Mixin can reorder overwritten methods
         // and @Mutable deliberately clears ACC_FINAL on @Shadow fields; both are useful while producing X but neither
@@ -489,33 +500,29 @@ public class RetransformConverter {
         return s;
     }
 
-    /** Flag a {@code super.x()} call left in a body we just moved to the sidecar.
+    /** BACKSTOP: a non-{@code <init>} {@code invokespecial} left in a body we just moved to the sidecar.
      *
-     *  <p>A mixin that OVERRIDES an inherited target method and calls {@code super} compiles to
-     *  {@code invokespecial <Super>.x}. {@code invokespecial} requires the *current* class to be assignable to the
-     *  reference class, and the sidecar is a bare {@code java.lang.Object} subclass — so once the body is relocated the
-     *  call is unverifiable and the JVM rejects the whole sidecar with
-     *  {@code VerifyError: Bad invokespecial instruction: current class isn't assignable to reference class}. That
-     *  error surfaces whenever the sidecar first loads, typically deep in gameplay rather than at attach.
+     *  <p>JVMS 4.10.1.9 requires the receiver of a non-{@code <init>} {@code invokespecial} to be assignable to the
+     *  CURRENT class as well as to the reference class. The sidecar is a bare {@code java.lang.Object} subclass that is
+     *  never instantiated, so NO such instruction can verify here, whatever the owner — the JVM rejects the entire
+     *  sidecar with {@code VerifyError: Bad invokespecial instruction: current class isn't assignable to reference
+     *  class}, and only at LINK time, i.e. the first time gameplay touches any hook on that target.
      *
-     *  <p>We cannot fix it for an already-loaded target. The correct lowering is a bridge method ON the target (which
-     *  IS assignable) that the sidecar then calls virtually — but {@code retransformClasses} cannot ADD methods, which
-     *  is the whole reason the body was relocated in the first place. So this is a genuine architectural limit of
-     *  retransform-based injection, the "inherited-method overrides" caveat in the README, and the only useful move is
-     *  to name it loudly BEFORE publishing rather than emit bytecode we know the verifier will reject.
-     *
-     *  <p>Only non-{@code <init>} invokespecial counts: constructors are lowered separately, and an invokespecial to a
-     *  private method of the target is already routed through the reflective {@code rmi$} bridge by {@link #rewriteRefs}
-     *  (so anything still pointing at the sidecar itself is ours and fine). */
+     *  <p>{@link #rewriteRefs} lowers all three legitimate shapes before this runs: a call to a mixin-ADDED method
+     *  becomes an {@code h$} static, a call to a private method becomes the reflective {@code rmi$}/AwReflect bridge,
+     *  and a genuine {@code super.x()} becomes the {@code smi$} findSpecial bridge. So reaching this check means the
+     *  converter failed to classify a site, not that the payload is unsupported — hence it stays FATAL, but it is a
+     *  self-check on us and the message must not assert anything about the mixin's intent (the site is just as likely
+     *  a {@code @Unique} helper reaching for inherited behaviour as an override calling super). */
     private void reportIllegalSuperCalls(MethodNode original, MethodNode relocated) {
         if (relocated.instructions == null) return;
         for (AbstractInsnNode p = relocated.instructions.getFirst(); p != null; p = p.getNext()) {
             if (!(p instanceof MethodInsnNode mi) || mi.getOpcode() != Opcodes.INVOKESPECIAL) continue;
             if (mi.name.equals("<init>") || mi.owner.equals(sidecar) || mi.owner.equals(stateName)) continue;
             LateAttachVerifier.error("SUPER_CALL_IN_RELOCATED_METHOD", targetInternal, original.name + original.desc,
-                "mixin overrides an inherited method and calls super." + mi.name + " (" + mi.owner + "); the relocated "
-                + "body cannot legally invokespecial from the sidecar, and retransform cannot add a bridge to the "
-                + "already-loaded target. This mixin is unsupported under late attach.");
+                "relocated body contains super." + mi.name + " (" + mi.owner + "." + mi.name + mi.desc + ") that the "
+                + "converter did not lower; no invokespecial can verify from a sidecar, so this would VerifyError the "
+                + "whole sidecar at link time. This is a converter bug — the site should have become an h$/rmi$/smi$ call.");
         }
     }
 
@@ -698,6 +705,25 @@ public class RetransformConverter {
                 if (isStatic) reflectStaticMethods.add(key);
                 String nd = isStatic ? mi.desc : "(" + targetDesc + mi.desc.substring(1);
                 m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, sidecar, "rmi$" + invokerId(mi.name, mi.desc), nd, false));
+            } else if (inSidecar && p instanceof MethodInsnNode mi && mi.getOpcode() == Opcodes.INVOKESPECIAL
+                    && !mi.name.startsWith("<") && isAssignable(targetInternal, mi.owner)) {
+                // SUPER CALL. A mixin that overrides an inherited target method (or a @Unique helper that just wants the
+                // inherited behaviour) compiles to `invokespecial <Super>.x`. JVMS 4.10.1.9 requires the receiver of a
+                // non-<init> invokespecial to be assignable to the CURRENT class as well as the reference class, and the
+                // sidecar is a bare Object subclass that is never instantiated — so once the body moves here NO
+                // invokespecial can verify, whatever the owner. Lower it to a findSpecial MethodHandle bound with
+                // specialCaller = the target: that is the JDK's supported super-invocation primitive and it binds the
+                // method NON-virtually from a class that is not a subclass of the reference class.
+                //
+                // This branch must precede illegalSidecarMethod's AwReflect lowering, which routes a super call to a
+                // protected/package-private method through Method.invoke — and Method.invoke RE-DISPATCHES VIRTUALLY
+                // (JLS 15.12.4.4), silently turning `super.x()` into `this.x()` and inviting infinite recursion. The
+                // predicate here is exactly "owner is a supertype of the target", i.e. the sites where that rewrite
+                // would have been wrong; a private method of some unrelated class is NOT a super call, stays on the
+                // AwReflect path, and is faithful there because a private method cannot be overridden.
+                superMethods.add(mi.owner + " " + mi.name + " " + mi.desc);
+                m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, sidecar,
+                    "smi$" + superInvokerId(mi.owner, mi.name, mi.desc), "(" + targetDesc + mi.desc.substring(1), false));
             } else if (inSidecar && p instanceof MethodInsnNode mi && illegalSidecarMethod(sidecar,mi.owner,mi.name,mi.desc)) {
                 // Relocation also loses nestmate/subclass privileges for methods and constructors declared outside
                 // the target package. Lower them through the same cached reflection runtime used for late AW access.
@@ -866,6 +892,64 @@ public class RetransformConverter {
         else { in.add(new TypeInsnNode(Opcodes.CHECKCAST, rt.getInternalName())); in.add(new InsnNode(Opcodes.ARETURN)); }
         m.maxStack = 9 + at.length; m.maxLocals = slot; S.methods.add(m);
     }
+
+    /** Distinct slot per (refcOwner, name, desc): one target can super-call the same signature at two hierarchy levels. */
+    static String superInvokerId(String owner, String name, String desc) {
+        return mangle(owner) + "__" + mangle(name) + "__" + mangle(desc);
+    }
+
+    /** SUPER-CALL bridge {@code smi$<id>(Target self, args...)}: a direct {@code invokeExact} on the
+     *  {@code SMH$<id>} handle that {@link #addSuperMethodInit} bound with {@code findSpecial}.
+     *
+     *  <p>{@code invokeExact} is signature-polymorphic, so the call site descriptor IS the handle's type
+     *  ({@code (Target, args...)ret} — {@code findSpecial} prepends the specialCaller as the receiver parameter). That
+     *  means no boxing, no varargs array, no reflective unwrapping, and a JIT-inlinable direct call: this bridge is
+     *  cheaper than the {@code rmi$}/{@code Method.invoke} path it replaces, not more expensive. It also propagates the
+     *  callee's exceptions unwrapped, matching what the original {@code invokespecial} did. */
+    void addSuperInvoker(ClassNode S, String owner, String name, String desc) {
+        String id = superInvokerId(owner, name, desc);
+        S.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "SMH$" + id, "Ljava/lang/invoke/MethodHandle;", null, null));
+        Type[] at = Type.getArgumentTypes(desc); Type rt = Type.getReturnType(desc);
+        String bridgeDesc = "(" + targetDesc + desc.substring(1);
+        MethodNode m = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "smi$" + id, bridgeDesc, null, null);
+        InsnList in = m.instructions;
+        in.add(new FieldInsnNode(Opcodes.GETSTATIC, sidecar, "SMH$" + id, "Ljava/lang/invoke/MethodHandle;"));
+        in.add(new VarInsnNode(Opcodes.ALOAD, 0));                       // receiver == specialCaller-typed leading arg
+        int slot = 1;
+        for (Type a : at) { in.add(new VarInsnNode(a.getOpcode(Opcodes.ILOAD), slot)); slot += a.getSize(); }
+        in.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/invoke/MethodHandle", "invokeExact", bridgeDesc, false));
+        in.add(new InsnNode(rt.getSort() == Type.VOID ? Opcodes.RETURN : rt.getOpcode(Opcodes.IRETURN)));
+        m.maxStack = slot + 1; m.maxLocals = slot; S.methods.add(m);
+    }
+
+    /** Bind each super-call handle in the sidecar {@code <clinit>}, at the same point as the reflective handles (see
+     *  {@link #reflectInitPoint}: before any merged mixin {@code <clinit>} body, which may itself contain smi$ calls).
+     *
+     *  <p>{@code MethodHandles.lookup()} is caller-sensitive, so invoking it HERE yields a full-privilege Lookup on the
+     *  SIDECAR — which on vanilla/Fabric lives in the target's own package, classloader and (unnamed, hence open)
+     *  module. {@link mcgraft.rt.AwReflect#superHandle} turns that into a private Lookup on the target and calls
+     *  {@code findSpecial(refc, name, type, target)}. Routing through the rt helper (rather than emitting the
+     *  privateLookupIn/findSpecial pair inline) keeps the JPMS fallback in one place and puts the call under the
+     *  existing {@link #unresolvedRtCalls} contract gate. */
+    void addSuperMethodInit(ClassNode S) {
+        MethodNode clinit = findMethod(S, "<clinit>");
+        if (clinit == null) throw new IllegalStateException("sidecar has no <clinit>; addSidecarClinit must run first");
+        AbstractInsnNode ret = reflectInitPoint(clinit);
+        InsnList add = new InsnList();
+        for (String key : superMethods) {
+            String[] k = key.split(" ");   // owner name desc — none of the three can contain a space
+            add.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/invoke/MethodHandles", "lookup", "()Ljava/lang/invoke/MethodHandles$Lookup;", false));
+            add.add(new LdcInsnNode(Type.getObjectType(targetInternal)));   // specialCaller + privateLookupIn subject
+            add.add(new LdcInsnNode(Type.getObjectType(k[0])));             // refc (the super declaring class/interface)
+            add.add(new LdcInsnNode(k[1]));
+            add.add(new LdcInsnNode(Type.getMethodType(k[2])));             // CONSTANT_MethodType
+            add.add(new MethodInsnNode(Opcodes.INVOKESTATIC, AWR, "superHandle",
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;", false));
+            add.add(new FieldInsnNode(Opcodes.PUTSTATIC, sidecar, "SMH$" + superInvokerId(k[0], k[1], k[2]), "Ljava/lang/invoke/MethodHandle;"));
+        }
+        clinit.instructions.insertBefore(ret, add); clinit.maxStack = Math.max(clinit.maxStack, 5);
+    }
+
     /** resolve each private target Method reflectively in the sidecar <clinit>. */
     void addReflectMethodInit(ClassNode S) {
         MethodNode clinit = findMethod(S, "<clinit>");

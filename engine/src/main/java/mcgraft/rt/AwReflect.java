@@ -1,7 +1,11 @@
 package mcgraft.rt;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 
 /** Runtime reflection helper for the payload's direct access to non-public members / inaccessible TYPES of ALREADY-LOADED MC
  *  classes (which the AccessWidener could not widen — retransform forbids modifier changes). Owner + parameter types
@@ -76,5 +80,39 @@ public final class AwReflect {
         catch(InvocationTargetException e){ throw re(e.getCause()==null?e:e.getCause()); }
         catch(Throwable e){ throw re(new RuntimeException("reflective invoke of "+label+" failed", e)); }
     }
+    /** JPMS escape hatch, installed by the agent: opens the package of {@code target} to the module of
+     *  {@code sidecarClass} via {@code Instrumentation.redefineModule}. Only ever consulted on the failure path below,
+     *  so it is inert on vanilla/Fabric (target and sidecar share one unnamed — therefore already open — module) and
+     *  only does work on a JPMS loader where sidecars were relocated out of the target's module. */
+    public static volatile BiConsumer<Class<?>,Class<?>> MODULE_OPENER;
+
+    /** Bind a {@code super.x()} call for a RELOCATED mixin body.
+     *
+     *  <p>{@code invokespecial} is unusable from a sidecar (JVMS 4.10.1.9: the receiver must be assignable to the
+     *  current class, and nothing is ever an instance of a sidecar). {@code Method.invoke} is not a substitute either —
+     *  it re-dispatches virtually (JLS 15.12.4.4), which turns {@code super.x()} into {@code this.x()} and can recurse
+     *  forever. {@code Lookup.findSpecial} is the JDK's actual super-invocation primitive: with
+     *  {@code specialCaller == target} it binds the method NON-virtually and the resulting handle's type is
+     *  {@code (target, args...)ret}, so the sidecar bridge can {@code invokeExact} it with no boxing.
+     *
+     *  @param caller full-privilege Lookup on the SIDECAR (its {@code <clinit>} calls the caller-sensitive
+     *                {@code MethodHandles.lookup()}), which is what authorises {@code privateLookupIn} on the target */
+    public static MethodHandle superHandle(MethodHandles.Lookup caller, Class<?> target, Class<?> refc, String name, MethodType type){
+        MethodHandles.Lookup priv;
+        try { priv = MethodHandles.privateLookupIn(target, caller); }
+        catch (IllegalAccessException first) {
+            BiConsumer<Class<?>,Class<?>> op = MODULE_OPENER;
+            if (op == null) throw re(new RuntimeException("no private Lookup on "+target.getName()+" for super call "
+                +refc.getName()+"."+name+type, first));
+            op.accept(target, caller.lookupClass());
+            try { priv = MethodHandles.privateLookupIn(target, caller); }
+            catch (IllegalAccessException e){ throw re(new RuntimeException("no private Lookup on "+target.getName()
+                +" for super call "+refc.getName()+"."+name+type+" even after opening its package", e)); }
+        }
+        try { return priv.findSpecial(refc, name, type, target); }
+        catch (ReflectiveOperationException e){ throw re(new RuntimeException("cannot bind super call "
+            +refc.getName()+"."+name+type+" from "+target.getName(), e)); }
+    }
+
     private static RuntimeException re(Throwable e){ return e instanceof RuntimeException r ? r : new RuntimeException(e); }
 }
