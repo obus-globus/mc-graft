@@ -498,6 +498,11 @@ final class FabricPlatform implements LoaderPlatform {
             catch (UnsupportedOperationException e) { List<Object> nm = new ArrayList<>(mods); nm.add(container); modsF.set(inst, nm); }
             String ver = "?"; try { ver = String.valueOf(lmmC.getMethod("getVersion").invoke(meta)); } catch(Throwable ignore){}
             InjectionLogger.info("registered synthetic ModContainer for '"+cfg.id+"' ("+ver+")");
+            // The container alone does not put the mod's resources in front of the client — the pack list was built at
+            // startup — so anything it ships under assets/ (notably lang files) stays unresolved and its translation
+            // keys render raw. Refresh just the language data; PayloadResources explains why this is deliberately not
+            // a full resource reload.
+            mcgraft.rt.PayloadResources.refreshLanguage(payloadJar, cfg.id);
         } catch (Throwable t) {
             Throwable c = t instanceof InvocationTargetException && t.getCause()!=null ? t.getCause() : t;
             InjectionLogger.warn("registerModContainer for '"+cfg.id+"' failed (mod self-metadata lookups may throw): "+c.getClass().getSimpleName()+": "+c.getMessage());

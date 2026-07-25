@@ -528,11 +528,16 @@ fn report_resource_needs(
     if want_container && !cfg.register_mod_container {
         let ns: Vec<&str> = asset_namespaces.iter().map(String::as_str).collect();
         if !ns.is_empty() {
+            // Be precise about what the container buys. It refreshes LANGUAGE data only (see PayloadResources): the
+            // live resource manager is deliberately never rebuilt, because that is the destructive reload that wipes a
+            // payload's compiled render pipelines. Textures genuinely still need bootstrap.reloadResources=true, and
+            // claiming otherwise here is how someone spends an evening wondering why their icon is missing.
             log(&format!(
-                "    - assets/ for namespace(s) {} — without a mod container these never become a resource pack, so \
-                 its textures resolve as 'Missing resource'",
+                "    - assets/ for namespace(s) {} — the live resource manager was built before the payload existed, \
+                 so its translation keys render raw (e.g. a keybind shows as 'mod.key.foo')",
                 ns.join(", ")
             ));
+            log("      (this fixes lang files; textures need bootstrap.reloadResources=true as well)");
         }
         if reads_own_metadata {
             log("    - the mod calls getModContainer (reads its own metadata), which fails on late attach");
