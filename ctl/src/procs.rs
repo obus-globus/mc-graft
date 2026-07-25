@@ -314,3 +314,25 @@ fn platform_list() -> Vec<Jvm> {
         })
         .collect()
 }
+
+/// Cheap liveness check for a single pid — used to stop tailing an injection log when the client exits, rather than
+/// sitting on a fixed timeout. Deliberately not `list_jvms()`: that walks every process and would be absurd in a poll.
+#[cfg(unix)]
+pub fn is_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(windows)]
+pub fn is_alive(pid: i32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let Ok(raw) = u32::try_from(pid) else { return false };
+    let target = Pid::from_u32(raw);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, ProcessRefreshKind::nothing());
+    sys.process(target).is_some()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn is_alive(_pid: i32) -> bool {
+    true
+}

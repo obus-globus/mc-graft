@@ -43,6 +43,8 @@ struct App {
     show_details: bool,
     /// Result of the on-demand "Ask the JVM" probe, shown in the detail window.
     probe: Option<String>,
+    /// Set when the user hits Stop; the log-tail worker polls it so a stuck follow can always be abandoned.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_refresh: Instant,
     // build inputs
     repo: Option<PathBuf>,
@@ -92,6 +94,7 @@ impl App {
             selected: None,
             show_details: false,
             probe: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_refresh: Instant::now() - Duration::from_secs(10),
             repo,
             payload: String::new(),
@@ -346,12 +349,14 @@ impl App {
         self.log_line(format!("---- inject -> PID {pid} ----"));
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let cancel = self.cancel.clone();
         spawn_worker(tx.clone(), ctx.clone(), Msg::InjectDone, move || {
             match attach::load_agent(pid, &agent, &agent_args) {
                 Ok(r) if r.jvm_status == 0 && r.agent_rc == 0 => {
                     let _ = tx.send(Msg::Line("agent delivered (Agent_OnAttach=0)".into()));
                     ctx.request_repaint();
-                    tail_log(&log_path, &tx, &ctx);
+                    tail_log(&log_path, pid, &cancel, &tx, &ctx);
                     let _ = tx.send(Msg::InjectDone(Ok(())));
                 }
                 // The load command was accepted but agentmain failed inside the client. Still tail the log so the
@@ -359,7 +364,7 @@ impl App {
                 Ok(r) if r.jvm_status == 0 => {
                     let _ = tx.send(Msg::Line(format!("agentmain FAILED (Agent_OnAttach={})", r.agent_rc)));
                     ctx.request_repaint();
-                    tail_log(&log_path, &tx, &ctx);
+                    tail_log(&log_path, pid, &cancel, &tx, &ctx);
                     let _ = tx.send(Msg::InjectDone(Err(format!(
                         "agentmain failed inside the client (Agent_OnAttach={}): {}",
                         r.agent_rc,
@@ -806,6 +811,16 @@ impl eframe::App for App {
                 {
                     self.start_inject(ctx);
                 }
+                // Always available while busy: injection itself finishes in seconds, but the log follow can legitimately
+                // run for minutes, and the user should never have to restart the app to get the controls back.
+                if ui
+                    .add_enabled(self.busy, egui::Button::new("Stop"))
+                    .on_hover_text("Stop following the injection log and re-enable the controls (the injection itself is already done)")
+                    .clicked()
+                {
+                    self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.status = "Stopped following the log.".into();
+                }
             });
 
             ui.add_space(8.0);
@@ -837,22 +852,43 @@ impl eframe::App for App {
 }
 
 /// Tail `path` line-by-line into the channel until a terminal marker or a timeout.
-fn tail_log(path: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::Context) {
+/// Follow the injection log until the agent reports a terminal marker, the target client exits, the user cancels, or a
+/// backstop deadline elapses.
+///
+/// The liveness check is the important one. Without it this sat on the fixed 5-minute deadline, so closing Minecraft
+/// left the UI busy — every button disabled — and a freshly restarted client could not be injected until the timer ran
+/// out. A tail with no reader is pointless: once the process is gone no further lines can ever arrive.
+fn tail_log(path: &std::path::Path, pid: i32, cancel: &std::sync::atomic::AtomicBool, tx: &Sender<Msg>, ctx: &egui::Context) {
     use std::io::{BufRead, BufReader};
+    use std::sync::atomic::Ordering;
     let appear = Instant::now() + Duration::from_secs(10);
-    while !path.exists() && Instant::now() < appear {
+    while !path.exists() && Instant::now() < appear && !cancel.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
     }
     let Ok(f) = std::fs::File::open(path) else { return };
     let mut r = BufReader::new(f);
     let deadline = Instant::now() + Duration::from_secs(300);
+    let mut next_liveness = Instant::now() + Duration::from_secs(2);
     let mut line = String::new();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(Msg::Line("[stopped following the log]".into()));
+            return;
+        }
         line.clear();
         match r.read_line(&mut line) {
             Ok(0) => {
                 if Instant::now() > deadline {
                     return;
+                }
+                // Poll liveness on a timer rather than per read: on Windows this costs a process query.
+                if Instant::now() > next_liveness {
+                    next_liveness = Instant::now() + Duration::from_secs(2);
+                    if !crate::procs::is_alive(pid) {
+                        let _ = tx.send(Msg::Line(format!("[client {pid} exited — no further log output]")));
+                        ctx.request_repaint();
+                        return;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }

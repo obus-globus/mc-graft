@@ -255,7 +255,7 @@ public class FullInjectAgent {
                     rw = ifaceMap.isEmpty()? rw : RetransformConverter.rewriteCaller(rw, ifaceMap);
                     if (n.equals(KeyBindingReopen.TARGET)) rw = KeyBindingReopen.rewrite(n, rw);   // dep classes: also strip the keybind guard (this branch pre-empts the standalone KeyBindingReopen branch below)
                     if (DEBUG) InjectionLogger.info("CFT caller "+n+" changed="+(rw!=b));
-                    rw = RetransformConverter.rewriteLbAw(rw, awRes);
+                    rw = RetransformConverter.rewritePayloadAw(rw, awRes);
                     if (!LateAttachVerifier.verifyCaller(n, b, rw, gadded, gfield, ifaceMap)) return null;
                     return rw==b? null : rw;
                 }
@@ -308,7 +308,7 @@ public class FullInjectAgent {
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 
         verifyMemberAccessGate(inst);
-        preflightLbClasses(payloadBundle,awRes,gadded,gfield,ifaceMap);
+        preflightPayloadClasses(payloadBundle,awRes,gadded,gfield,ifaceMap);
         if(LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();
             throw new IllegalStateException("Late-attach preflight failed before target retransformation; see report");
@@ -501,7 +501,7 @@ public class FullInjectAgent {
             byte[] o; try (InputStream in = SYS.getResourceAsStream(internal+".class")) { if(in==null){InjectionLogger.warn("  diag: no original bytes for "+internal);return;} o=in.readAllBytes(); }
             byte[] rw = AccessorBridgeRewriter.rewrite(internal, o);
             if(!ifaceMap.isEmpty()) rw = RetransformConverter.rewriteCaller(rw, ifaceMap);
-            rw = RetransformConverter.rewriteLbAw(rw, AW_RES);
+            rw = RetransformConverter.rewritePayloadAw(rw, AW_RES);
             java.util.Set<String> om = methodSet(o), rm = methodSet(rw);
             java.util.Set<String> dropped = new java.util.TreeSet<>(om); dropped.removeAll(rm);
             java.util.Set<String> added = new java.util.TreeSet<>(rm); added.removeAll(om);
@@ -749,7 +749,7 @@ public class FullInjectAgent {
         InjectionLogger.info("ASM runtime="+version+" source="+source+" Java25Compatible="+supported);
         if(!supported)throw new IllegalStateException("the payload requires ASM >= 9.8, but active ASM is "+version+" from "+source+". Restart with a correctly packaged agent or remove the preloaded ASM collision.");
     }
-    static void preflightLbClasses(Path lbJar,RetransformConverter.Resolver resolver,Map<String,String[]> gadded,
+    static void preflightPayloadClasses(Path lbJar,RetransformConverter.Resolver resolver,Map<String,String[]> gadded,
             Map<String,String[]> gfield,Map<String,List<String[]>> ifaces){int total=0,changed=0,failed=0;
         PayloadConfig cfg=PayloadConfig.get();
         try(JarFile jf=new JarFile(lbJar.toFile())){for(var en=jf.entries();en.hasMoreElements();){JarEntry e=en.nextElement();String n=e.getName();
@@ -760,12 +760,12 @@ public class FullInjectAgent {
             try{byte[] b;try(InputStream in=jf.getInputStream(e)){b=in.readAllBytes();}
                 byte[] rw=AccessorBridgeRewriter.rewrite(n.substring(0,n.length()-6),b);
                 if(!ifaces.isEmpty())rw=RetransformConverter.rewriteCaller(rw,ifaces);
-                rw=RetransformConverter.rewriteLbAw(rw,resolver);
+                rw=RetransformConverter.rewritePayloadAw(rw,resolver);
                 if(!LateAttachVerifier.verifyCaller(n.substring(0,n.length()-6),b,rw,gadded,gfield,ifaces))failed++;
                 if(!Arrays.equals(b,rw))changed++;
             }catch(Throwable t){failed++;LateAttachVerifier.error("CALLER_PREFLIGHT_FAILURE",n,"caller",rootMsg(t));}
         }}catch(Throwable t){LateAttachVerifier.error("CALLER_PREFLIGHT_IO_FAILURE",String.valueOf(lbJar),"caller",rootMsg(t));failed++;}
-        InjectionLogger.info("LB caller preflight: "+total+" classes, "+changed+" rewritten, "+failed+" failed");
+        InjectionLogger.info("payload caller preflight: "+total+" classes, "+changed+" rewritten, "+failed+" failed");
     }
     /** Pre-publish ACCESS gate — see {@link LateAttachVerifier#verifyMemberAccess}. Checks every member reference the
      *  emitted SIDECAR bytes actually contain against the LIVE class, i.e. the modifiers the JVM will enforce, and

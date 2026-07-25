@@ -1223,9 +1223,9 @@ public class RetransformConverter {
      *  reflective calls (fields/methods/ctors -> mcgraft/rt/AwReflect via string-named owner+param types, so no inaccessible
      *  type appears as a constant), and erase CHECKCASTs to inaccessible types. Classes loaded AFTER attach get the
      *  AccessWidener on-load, so their members stay direct (Resolver returns false for them). */
-    public static synchronized byte[] rewriteLbAw(byte[] lbBytes, Resolver r) {
+    public static synchronized byte[] rewritePayloadAw(byte[] payloadBytes, Resolver r) {
         Predicate<String> inacc = r::typeInaccessible;
-            ClassNode c = read(lbBytes);
+            ClassNode c = read(payloadBytes);
             boolean[] changed = {false};
             for (MethodNode m : c.methods) {
                 if (m.instructions == null) continue;
@@ -1259,7 +1259,7 @@ public class RetransformConverter {
                     }
                 }
             }
-            return changed[0] ? write(c, lbBytes) : lbBytes;
+            return changed[0] ? write(c, payloadBytes) : payloadBytes;
     }
 
     static void rewriteAwMethodInline(MethodNode m, MethodInsnNode mi, Predicate<String> inacc) {
