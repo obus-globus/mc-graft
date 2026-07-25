@@ -281,8 +281,37 @@ final class FabricPlatform implements LoaderPlatform {
         Thread th = Thread.currentThread();
         ClassLoader prev = th.getContextClassLoader();
         th.setContextClassLoader(knot);
-        try { return (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, in); }
+        try { return (byte[]) mTransformClassBytes.invoke(transformer, dotted, dotted, widen(dotted.replace('.','/'), in)); }
         finally { th.setContextClassLoader(prev); }
+    }
+
+    /** Apply the payload's AccessWidener to bytes before Mixin sees them.
+     *
+     *  <p>Mixin builds its {@code ClassInfo} metadata from whatever bytes it is handed. Knot's ClassTweaker widens
+     *  classes as they LOAD, so a class already loaded before we registered the payload's widener yields un-widened
+     *  pre-mixin bytes here — and then a mixin targeting a member the widener makes accessible fails to match, because
+     *  {@code ClassInfo.findMethod} is looking at the private original. Mixin surfaces that as
+     *  {@code LVTGeneratorError: Could not locate method metadata for <name>}.
+     *
+     *  <p>Concretely: Wurst widens {@code Minecraft.startUseItem()V} (private) and injects into it; on a production
+     *  instance that is exactly this failure. {@code VSpikeBytecodeProvider} already does this on the vanilla path and
+     *  its comment describes the same mechanism — the Fabric path simply never had the equivalent. Widening is
+     *  idempotent, so applying it to bytes Knot already widened is a no-op. */
+    private byte[] widen(String internal, byte[] in) {
+        if (aw == null || in == null) return in;
+        try {
+            if (!(boolean) aw.getClass().getMethod("isTarget", String.class).invoke(aw, internal)) return in;
+            byte[] out = (byte[]) aw.getClass().getMethod("apply", String.class, byte[].class).invoke(aw, internal, in);
+            return out != null ? out : in;
+        } catch (Throwable t) {
+            InjectionLogger.warn("access-widening pre-mixin bytes failed for " + internal + " (continuing un-widened): " + rootOf(t));
+            return in;
+        }
+    }
+
+    private static String rootOf(Throwable t) {
+        Throwable c = t instanceof InvocationTargetException && t.getCause() != null ? t.getCause() : t;
+        return c.getClass().getSimpleName() + ": " + c.getMessage();
     }
 
     /** MixinExtras (and other injectors) name their synthetic bridges `...$<methods.size()>`; that counter is a global
