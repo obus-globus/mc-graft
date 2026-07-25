@@ -75,6 +75,10 @@ public final class PayloadConfig {
     // client init would throw. With this set, mc-graft strips that guard and splices late-registered keybinds into the
     // live options so they function and appear in Controls. (bootstrap.reopenKeyBindings=true)
     public final boolean reopenKeyBindings;
+    // Which class/method carries that guard. Null = fabric-api's KeyMappingRegistryImpl.registerKeyMapping, the common
+    // case; set these when a different loader or library has the same late-registration guard, so the engine doesn't
+    // need to know about it (bootstrap.reopenKeyBindings.owner / .method).
+    public final String reopenKeyBindingsOwner, reopenKeyBindingsMethod;
     // (Fabric) bridge fabric-api's PayloadTypeRegistry into MC's live custom-payload codec dispatch, so a mod that
     // registers a custom packet type (e.g. Xaero's xaerominimap:main) can encode/decode it under late-attach without
     // fabric-api's own networking mixins being applied. (bootstrap.bridgePayloadCodecs=true)
@@ -110,6 +114,8 @@ public final class PayloadConfig {
         joinGateScreen = blankToNull(p.getProperty("bootstrap.joinGate.screen", ""));
         registerModContainer = Boolean.parseBoolean(p.getProperty("bootstrap.registerModContainer", "false").trim());
         reopenKeyBindings = Boolean.parseBoolean(p.getProperty("bootstrap.reopenKeyBindings", "false").trim());
+        reopenKeyBindingsOwner = blankToNull(p.getProperty("bootstrap.reopenKeyBindings.owner", ""));
+        reopenKeyBindingsMethod = blankToNull(p.getProperty("bootstrap.reopenKeyBindings.method", ""));
         bridgePayloadCodecs = Boolean.parseBoolean(p.getProperty("bootstrap.bridgePayloadCodecs", "false").trim());
     }
 

@@ -215,7 +215,11 @@ public final class LateAttachVerifier {
 
     public static synchronized Path writeReport() {
         try {
-            String override=System.getProperty("lb.agent.verificationReport");
+            // Namespaced under mcgraft.* like every other knob (mcgraft.agent.debug, mcgraft.sidecarPackage); the old
+            // lb.agent.* name was a leak from the LiquidBounce-injector fork this engine came from. Still honoured so
+            // an existing invocation doesn't silently start writing somewhere else.
+            String override=System.getProperty("mcgraft.verificationReport");
+            if(override==null||override.isBlank()) override=System.getProperty("lb.agent.verificationReport");
             // Default: a random-named temp file (createTempFile = O_EXCL + owner-only), not a fixed
             // /tmp/liquidbounce-lateattach-verification-<pid>.json a local attacker could pre-plant a symlink at (the
             // path is printed to the injection log, so a fixed name buys nothing). An explicit override is the caller's.

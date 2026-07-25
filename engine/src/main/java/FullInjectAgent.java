@@ -64,7 +64,7 @@ public class FullInjectAgent {
         RetransformConverter.CALLER_REWRITE_PREFIXES = crPrefixes;
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
-        if (cfg.reopenKeyBindings) KeyBindingReopen.arm();   // arm the fabric-api keybinding-registry guard strip
+        if (cfg.reopenKeyBindings) KeyBindingReopen.arm(cfg.reopenKeyBindingsOwner, cfg.reopenKeyBindingsMethod);   // arm the keybinding-registry guard strip
         if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, payloadBundle);   // so the mod's self-metadata lookups resolve
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
@@ -282,7 +282,7 @@ public class FullInjectAgent {
         // Options' constructor), so it is already loadable + retransformable.
         if(cfg.reopenKeyBindings) try{
             Class<?> kri=Class.forName(KeyBindingReopen.TARGET.replace('/','.'),false,SYS);
-            if(inst.isModifiableClass(kri)){ inst.retransformClasses(kri); InjectionLogger.info("reopened fabric-api keybinding registry (late registration enabled)"); }
+            if(inst.isModifiableClass(kri)){ inst.retransformClasses(kri); InjectionLogger.info("reopened keybinding registry "+KeyBindingReopen.TARGET+" (late registration enabled)"); }
             else InjectionLogger.warn("keybinding registry class not modifiable; late keybinds may fail");
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 

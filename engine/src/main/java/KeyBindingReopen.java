@@ -14,13 +14,22 @@ import mcgraft.rt.InjectionLogger;
  *  respond to input; stripping the guard just lets fabric-api's own bookkeeping (its modded-keybinding list) complete
  *  without throwing. Armed only when the payload sets {@code bootstrap.reopenKeyBindings=true}; disabled otherwise. */
 public final class KeyBindingReopen {
-    /** fabric-api's keybinding registry impl (stable internal name). null -> the feature is disabled. */
+    /** fabric-api's keybinding registry impl — the common case, so it stays the default and `=true` keeps working. Any
+     *  other loader/library with the same late-registration guard is reachable through
+     *  bootstrap.reopenKeyBindings.owner/.method instead of by editing the engine. */
+    private static final String DEFAULT_IMPL = "net/fabricmc/fabric/impl/client/keymapping/KeyMappingRegistryImpl";
+    static final String DEFAULT_METHOD = "registerKeyMapping";
+    /** Owner (internal name) whose registration method carries the guard. null -> the feature is disabled. */
     public static volatile String TARGET = null;
-    private static final String IMPL = "net/fabricmc/fabric/impl/client/keymapping/KeyMappingRegistryImpl";
+    /** The registration method to strip the guard from. */
+    public static volatile String METHOD = DEFAULT_METHOD;
 
     private KeyBindingReopen() {}
 
-    public static void arm() { TARGET = IMPL; }
+    public static void arm(String owner, String method) {
+        TARGET = (owner == null || owner.isBlank()) ? DEFAULT_IMPL : owner;
+        METHOD = (method == null || method.isBlank()) ? DEFAULT_METHOD : method;
+    }
 
     /** Remove the leading {@code Minecraft.getInstance().options != null -> throw} guard from registerKeyMapping.
      *  Idempotent: a class with no such guard (already stripped, or a future fabric-api that drops it) is returned as-is. */
@@ -29,7 +38,7 @@ public final class KeyBindingReopen {
         new ClassReader(bytes).accept(c, 0);
         boolean changed = false;
         for (MethodNode m : c.methods) {
-            if (!m.name.equals("registerKeyMapping")) continue;
+            if (!m.name.equals(METHOD)) continue;
             // The guard is the method's leading `... IFNULL <rest>; new IllegalStateException; ...; athrow; <rest>:`.
             // The only IFNULL in this method is that guard (the dedup loop uses IFEQ / IF_ACMPNE); everything before its
             // target label is the guard prologue, and the label is reached solely via that branch (the fall-through path
