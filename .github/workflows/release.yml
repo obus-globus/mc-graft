@@ -59,7 +59,15 @@ jobs:
         with:
           workspaces: ctl
           key: ${{ matrix.name }}
+      # krak2 is pinned to a commit, so its binary is identical on every run — caching it removes ~90s per job.
+      - name: Cache krak2
+        id: krak2-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/krakatau/target/release/krak2
+          key: krak2-${{ runner.os }}-${{ runner.arch }}-ae49743af92bbab1684b19bb1bee22b0a64d8ce5
       - name: Build krak2 (Krakatau) to embed
+        if: steps.krak2-cache.outputs.cache-hit != 'true'
         working-directory: .
         env:
           KRAK2_COMMIT: ae49743af92bbab1684b19bb1bee22b0a64d8ce5   # pinned Krakatau v2 (do not float on branch HEAD)
@@ -130,7 +138,14 @@ jobs:
         with:
           name: jattach-windows
           path: ${{ runner.temp }}/jattach
+      - name: Cache krak2.exe
+        id: krak2-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/krakatau/target/release/krak2.exe
+          key: krak2-${{ runner.os }}-${{ runner.arch }}-ae49743af92bbab1684b19bb1bee22b0a64d8ce5
       - name: Build krak2.exe (Krakatau) to embed
+        if: steps.krak2-cache.outputs.cache-hit != 'true'
         working-directory: .
         env:
           KRAK2_COMMIT: ae49743af92bbab1684b19bb1bee22b0a64d8ce5   # pinned Krakatau v2
