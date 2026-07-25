@@ -18,10 +18,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * mixin-modified {@code hashCode()} that reads a relocated field would recurse back into {@code getState()}.
  *
  * <p>So keys are weak AND compared by reference identity ({@link System#identityHashCode}, never {@code equals()}):
- * relocated state dies with its target exactly as a real {@code @Unique} field would, without ever calling a target's
- * {@code hashCode()}/{@code equals()}. Backed by a {@link ConcurrentHashMap} + {@link ReferenceQueue} drain, so it is
- * safe even though the generated {@code getState} is already {@code synchronized}. Only {@link #get}/{@link #put}/
- * {@link #remove} are exercised by the generated accessors; the rest are best-effort or unsupported.
+ * relocated state dies with its target without ever calling a target's {@code hashCode()}/{@code equals()}. Backed by a
+ * {@link ConcurrentHashMap} + {@link ReferenceQueue} drain, so it is safe even though the generated {@code getState} is
+ * already {@code synchronized}. Only {@link #get}/{@link #put}/{@link #remove} are exercised by the generated
+ * accessors; the rest are best-effort or unsupported.
+ *
+ * <p><b>Caveat — values must not strongly reach their own key.</b> Values are held strongly (only keys are weak), so a
+ * relocated field that stores something reachable back to the target (e.g. {@code @Unique Foo f = new Foo(this)}) keeps
+ * a strong path {@code STATE -> State -> ... -> target}, the {@code WeakReference} never clears, and the entry is
+ * immortal. As a real {@code @Unique} field this would be a plain cycle the collector handles; relocated, it is a leak.
+ * This is the same hazard {@link java.util.WeakHashMap} documents. Nothing detects it here.
  */
 public final class WeakIdentityHashMap implements Map<Object, Object> {
     private final ConcurrentHashMap<Key, Object> map = new ConcurrentHashMap<>();
@@ -44,10 +50,20 @@ public final class WeakIdentityHashMap implements Map<Object, Object> {
 
     private void expunge() { for (Object dead; (dead = queue.poll()) != null; ) map.remove(dead); }
 
-    @Override public Object get(Object key) { expunge(); return map.get(new Key(key)); }
-    @Override public Object put(Object key, Object value) { expunge(); return map.put(new Key(key, queue), value); }
-    @Override public Object remove(Object key) { expunge(); return map.remove(new Key(key)); }
-    @Override public boolean containsKey(Object key) { expunge(); return map.containsKey(new Key(key)); }
+    /* A null key must be rejected outright rather than stored. Key.equals() is false whenever the referent is null, and
+     * a WeakReference over null is never enqueued — so a null-keyed entry could never be found by get(), never removed,
+     * and never expunged, and each put(null, v) would append ANOTHER unreachable entry (identityHashCode(null) is 0, so
+     * they all pile into one bucket). Worse, it would mask a real bug: the generated getState(self) reaches here with a
+     * null receiver only where the pre-injection bytecode would have thrown NPE on a GETFIELD, so silently handing back
+     * a throwaway State turns a null-receiver crash into an invisible wrong-value one. Throwing restores the original
+     * semantics at the true call site. */
+    @Override public Object get(Object key) { if (key == null) return null; expunge(); return map.get(new Key(key)); }
+    @Override public Object put(Object key, Object value) {
+        if (key == null) throw new NullPointerException("WeakIdentityHashMap does not support null keys");
+        expunge(); return map.put(new Key(key, queue), value);
+    }
+    @Override public Object remove(Object key) { if (key == null) return null; expunge(); return map.remove(new Key(key)); }
+    @Override public boolean containsKey(Object key) { if (key == null) return false; expunge(); return map.containsKey(new Key(key)); }
     @Override public int size() { expunge(); return map.size(); }
     @Override public boolean isEmpty() { expunge(); return map.isEmpty(); }
     @Override public void clear() { map.clear(); while (queue.poll() != null) { /* drain */ } }

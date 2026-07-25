@@ -118,6 +118,19 @@ jobs:
         with:
           workspaces: ctl
 
+      # The bytecode-op and Krakatau-assembly tests skip themselves when krak2 is absent, and a `return` in a #[test]
+      # reports as PASSED — so without this the entire patch/bytecode surface was silently untested while CI stayed
+      # green. Build the same pinned krak2 the release workflow embeds, and set MCGRAFT_REQUIRE_KRAK2 so those tests
+      # hard-fail instead of skipping if discovery ever breaks again.
+      - name: Build krak2 (Krakatau) so the bytecode tests actually run
+        working-directory: .
+        env:
+          KRAK2_COMMIT: ae49743af92bbab1684b19bb1bee22b0a64d8ce5   # keep in sync with release.yml
+        run: |
+          git clone https://github.com/Storyyeller/Krakatau /tmp/krakatau
+          git -C /tmp/krakatau checkout "$KRAK2_COMMIT"
+          cargo build --release --manifest-path /tmp/krakatau/Cargo.toml
+
       - name: Clippy (deny warnings)
         run: cargo clippy --release --all-targets -- -D warnings
 
@@ -125,6 +138,9 @@ jobs:
         run: cargo build --release
 
       - name: Test
+        env:
+          MCGRAFT_KRAK2: /tmp/krakatau/target/release/krak2
+          MCGRAFT_REQUIRE_KRAK2: '1'
         run: cargo test --release
 
       - name: Upload mcgraft binary

@@ -52,6 +52,15 @@ public final class InjectorUi extends JFrame {
     private SwingWorker<Void, String> logTailWorker;
     private volatile boolean tailingInjectionLog;
 
+    // Whether the agent path names a real file is resolved OFF the EDT and cached here. File.isFile() is a blocking stat
+    // and the document listener asks on every keystroke, so a pasted UNC path to an unreachable host would otherwise
+    // freeze the window for the whole SMB timeout. Callers that don't change the path (selection, setBusy) hit the cache
+    // and stay synchronous. All three fields are EDT-only.
+    private final javax.swing.Timer agentPathDebounce = new javax.swing.Timer(250, event -> checkAgentPath());
+    private String checkedAgentPath;
+    private boolean checkedAgentPathIsFile;
+    private int agentPathCheckId;   // discards a slow stat whose path the user has already typed past
+
     private InjectorUi(String initialAgent) {
         super("mc-graft injector");
         setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
@@ -149,6 +158,7 @@ public final class InjectorUi extends JFrame {
         content.add(actions, BorderLayout.SOUTH);
 
         getRootPane().setDefaultButton(injectButton);
+        agentPathDebounce.setRepeats(false);   // one stat per typing pause, not one per 250 ms forever
         updateInjectEnabled();
         refreshProcesses();
     }
@@ -158,8 +168,31 @@ public final class InjectorUi extends JFrame {
     }
 
     private void updateInjectEnabled() {
-        boolean ready = processTable.getSelectedRow() >= 0 && new File(agentField.getText().trim()).isFile();
-        injectButton.setEnabled(ready);
+        String path = agentField.getText().trim();
+        if (!path.equals(checkedAgentPath)) {   // unknown until the off-EDT stat lands; hold Inject disabled until then
+            injectButton.setEnabled(false);
+            agentPathDebounce.restart();
+            return;
+        }
+        injectButton.setEnabled(processTable.getSelectedRow() >= 0 && checkedAgentPathIsFile);
+    }
+
+    /** Stat the current agent path on a throwaway daemon thread (never a SwingWorker: its pool is shared with the
+     *  process scan and the attach, and a stat wedged on a dead network share would starve them). */
+    private void checkAgentPath() {
+        String path = agentField.getText().trim();
+        int id = ++agentPathCheckId;
+        Thread probe = new Thread(() -> {
+            boolean isFile = !path.isEmpty() && new File(path).isFile();
+            SwingUtilities.invokeLater(() -> {
+                if (id != agentPathCheckId) return;   // a later edit already superseded this path
+                checkedAgentPath = path;
+                checkedAgentPathIsFile = isFile;
+                updateInjectEnabled();
+            });
+        }, "agent-path-check");
+        probe.setDaemon(true);   // a stat hung on an unreachable share must not keep the JVM alive
+        probe.start();
     }
 
     private void browseForAgent() {
@@ -366,16 +399,26 @@ public final class InjectorUi extends JFrame {
             }
 
             @Override protected void done() {
-                if (!isCancelled() && sawSuccess) {
-                    progressBar.setValue(100);
-                    progressBar.setString("payload injection complete");
-                    appendLog("payload injection completed successfully.");
-                } else if (!isCancelled() && progressBar.getValue() < 100) {
-                    appendLog("Stopped waiting for the injection completion marker.");
-                    progressBar.setString("Injection log monitoring ended");
+                try {
+                    if (isCancelled()) return;   // cancelled by a failed attach / a restarted tail; get() would only throw CancellationException
+                    get();                       // surface a tail I/O failure instead of reporting it as the timeout below
+                    if (sawSuccess) {
+                        progressBar.setValue(100);
+                        progressBar.setString("payload injection complete");
+                        appendLog("payload injection completed successfully.");
+                    } else if (progressBar.getValue() < 100) {
+                        appendLog("Stopped waiting for the injection completion marker.");
+                        progressBar.setString("Injection log monitoring ended");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    appendLog("Log tail failed: " + rootMessage(e));
+                    progressBar.setString("Injection log unavailable");
+                } finally {
+                    tailingInjectionLog = false;
+                    setBusy(false, progressBar.getString(), progressBar.getValue());
                 }
-                tailingInjectionLog = false;
-                setBusy(false, progressBar.getString(), progressBar.getValue());
             }
         };
         logTailWorker.execute();

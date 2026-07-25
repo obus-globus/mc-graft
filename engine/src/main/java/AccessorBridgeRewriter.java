@@ -37,8 +37,15 @@ public final class AccessorBridgeRewriter {
                 else if (invoker != null) changed |= rewriteInvoker(m, target, stringValue(invoker, "value"));
             }
             if (!changed) return bytes;
+            // COMPUTE_FRAMES recomputes frames for EVERY method here — the class is round-tripped through a ClassNode,
+            // so ASM's verbatim method-copy fast path can't apply, and untouched methods get reframed alongside the
+            // accessor stubs. Answering java/lang/Object for every merge would type any reference merge (e.g.
+            // `flag ? new ChatScreen() : new TitleScreen()`) as Object, and the verifier then rejects the next
+            // INVOKEVIRTUAL on that value. Interface targets are incidentally immune (JVMS isJavaAssignable accepts any
+            // reference for an interface type), which is why this survived testing. Delegate to the real hierarchy walk
+            // that RetransformConverter.write() already uses for the same writer mode.
             ClassWriter w = new ClassWriter(new ClassReader(bytes), ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES) {
-                @Override protected String getCommonSuperClass(String a, String b) { return "java/lang/Object"; }
+                @Override protected String getCommonSuperClass(String a, String b) { return RetransformConverter.commonSuper(a, b); }
             };
             c.accept(w);
             return w.toByteArray();

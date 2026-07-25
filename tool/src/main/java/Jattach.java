@@ -96,22 +96,33 @@ final class Jattach {
         if (cachedBinary != null && cachedBinary.canExecute()) return cachedBinary;   // extract once per run
         String os = System.getProperty("os.name", "").toLowerCase();
         String arch = System.getProperty("os.arch", "").toLowerCase();
-        String resource, outName;
+        String resource, outName = "jattach";
+        // jattach-macos is a universal x86_64+arm64 binary, so the macOS branch is deliberately arch-blind; Windows-on-arm64
+        // runs the x64 exe under emulation. Linux ships one ELF per arch and gets NO catch-all: handing the x64 ELF to an
+        // arm/riscv64/ppc64le/s390x JVM only yields an ENOEXEC that the exec probe below would misreport as a noexec mount.
         if (os.contains("win")) { resource = "jattach-windows-x64.exe"; outName = "jattach.exe"; }
-        else if (os.contains("mac") || os.contains("darwin")) { resource = "jattach-macos"; outName = "jattach"; }
-        else if (arch.contains("aarch64") || arch.contains("arm64")) { resource = "jattach-linux-arm64"; outName = "jattach"; }
-        else { resource = "jattach-linux-x64"; outName = "jattach"; }
+        else if (os.contains("mac") || os.contains("darwin")) resource = "jattach-macos";
+        else if (arch.equals("aarch64") || arch.equals("arm64")) resource = "jattach-linux-arm64";
+        else if (arch.equals("amd64") || arch.equals("x86_64")) resource = "jattach-linux-x64";
+        else throw new IOException("no bundled jattach for os.arch=" + arch + " (os.name=" + os + ") — only linux x64/arm64,"
+            + " macOS and Windows x64 binaries are shipped. Use a JRE/JDK that ships the jdk.attach module so jattach isn't needed.");
         // Prefer java.io.tmpdir; if it is mounted noexec (or an ACL blocks exec), the exec PROBE below fails even though
         // the exec bit was set, so fall back to a private dir under user.home. File.canExecute() only reads the bit and
         // misses a noexec mount, so we actually run the binary once (no args -> prints usage, exits) to be sure.
         Path out = stage(Files.createTempDirectory("mcgraft-jattach-"), resource, outName);
-        if (!execWorks(out)) {
+        IOException tmpFailure = execFailure(out);
+        if (tmpFailure != null) {
             Path home = Path.of(System.getProperty("user.home", "."));
             Path alt = stage(Files.createTempDirectory(home, ".lb-jattach-"), resource, outName);
-            if (!execWorks(alt))
-                throw new IOException("the extracted jattach binary is not executable — java.io.tmpdir ("
-                    + System.getProperty("java.io.tmpdir") + ") and the " + home + " fallback both reject execution "
-                    + "(e.g. noexec mounts or a restrictive ACL). Use a JRE/JDK that ships the jdk.attach module so jattach isn't needed.");
+            IOException homeFailure = execFailure(alt);
+            if (homeFailure != null)
+                throw new IOException("the extracted jattach binary (" + resource + ") could not be executed — java.io.tmpdir ("
+                    + System.getProperty("java.io.tmpdir") + "): " + tmpFailure.getMessage() + "; " + home + " fallback: "
+                    + homeFailure.getMessage() + ". " + (isFormatError(tmpFailure) || isFormatError(homeFailure)
+                        ? "An exec-format error means the bundled binary does not match this machine (os.arch=" + arch
+                          + ", os.name=" + os + ") — a different temp directory will not help; a matching build is needed."
+                        : "Both paths reject execution (e.g. noexec mounts or a restrictive ACL). Use a JRE/JDK that ships "
+                          + "the jdk.attach module so jattach isn't needed."));
             out = alt;
         }
         cachedBinary = out.toFile();
@@ -136,18 +147,27 @@ final class Jattach {
     }
 
     /** Actually run the binary (no args -> usage + fast exit) to confirm the OS permits execution — catches a noexec
-     *  mount / ACL that {@link java.io.File#canExecute()} (bit-only) misses. */
-    private static boolean execWorks(Path bin) {
+     *  mount / ACL that {@link java.io.File#canExecute()} (bit-only) misses. Returns null when it ran, else the failure
+     *  (kept, not collapsed to a boolean, so the caller can tell EACCES from ENOEXEC — different causes, different fixes). */
+    private static IOException execFailure(Path bin) {
         try {
             Process p = new ProcessBuilder(bin.toString()).redirectErrorStream(true).start();
             p.getInputStream().readAllBytes();   // drain the usage output so the child doesn't block
             p.waitFor();
-            return true;
+            return null;
         } catch (IOException e) {
-            return false;                         // EACCES on a noexec mount / unset exec bit
+            return e;                             // EACCES on a noexec mount / unset exec bit; ENOEXEC on a wrong-arch binary
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return true;                          // it did start; interruption isn't an exec failure
+            return null;                          // it did start; interruption isn't an exec failure
         }
+    }
+
+    /** ENOEXEC — Linux "error=8, Exec format error", Windows ERROR_BAD_EXE_FORMAT (193). The JDK only exposes these as
+     *  message text on the IOException, so match on it; a false negative just falls back to the generic noexec wording. */
+    private static boolean isFormatError(IOException e) {
+        String m = String.valueOf(e.getMessage());
+        return m.contains("Exec format error") || m.contains("error=8,")
+            || m.contains("error=193,") || m.contains("not a valid Win32 application");
     }
 }

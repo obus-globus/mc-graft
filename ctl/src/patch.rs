@@ -776,6 +776,22 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Gate for the krak2-dependent tests: skip locally when the optional tool is absent, but HARD-FAIL when
+    /// `MCGRAFT_REQUIRE_KRAK2` is set (CI does). A bare `return` in a `#[test]` is reported as PASSED, not ignored —
+    /// which is exactly how the entire bytecode-op surface once sat untested behind a green check.
+    fn skip_without_krak2() -> bool {
+        match krak2_bin() {
+            Ok(_) => false,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("MCGRAFT_REQUIRE_KRAK2").is_none(),
+                    "MCGRAFT_REQUIRE_KRAK2 is set but krak2 could not be found: {e}"
+                );
+                true
+            }
+        }
+    }
+
     fn jar_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         {
@@ -892,8 +908,8 @@ mod tests {
     // Requires krak2 (MCGRAFT_KRAK2 or on PATH); skips cleanly when the optional tool isn't present.
     #[test]
     fn krakatau_assemble() {
-        if krak2_bin().is_err() {
-            return; // krak2 not available in this environment — skip
+        if skip_without_krak2() {
+            return;
         }
         let j = b".class public com/demo/Demo\n.super java/lang/Object\n\
                   .method public static answer : ()I\n.code stack 1 locals 0\nbipush 42\nireturn\n.end code\n.end method\n";
@@ -906,7 +922,7 @@ mod tests {
     // In-place bytecode op: replace_const 64 -> 256, verified behaviorally (needs krak2; skips otherwise).
     #[test]
     fn ops_replace_const() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind};
@@ -971,7 +987,7 @@ mod tests {
     // --- ristretto ops (need krak2 to assemble the fixture class; skip cleanly otherwise) ---
     #[test]
     fn ops_redirect_invoke() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind};
@@ -994,7 +1010,7 @@ mod tests {
 
     #[test]
     fn ops_replace_const_str() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind};
@@ -1010,7 +1026,7 @@ mod tests {
 
     #[test]
     fn ops_set_return() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind, RetVal};
@@ -1039,7 +1055,7 @@ mod tests {
     /// `ClassFormatError: StackMapTable format error: access beyond the end of attribute`.
     #[test]
     fn ops_growing_replacement_keeps_stackmap_valid() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind};
@@ -1099,7 +1115,7 @@ mod tests {
     // M2 regression: an op that matches nothing errors even when another op in the same patch matched.
     #[test]
     fn ops_every_op_must_match() {
-        if krak2_bin().is_err() {
+        if skip_without_krak2() {
             return;
         }
         use crate::bytecode::{apply_ops, Op, OpKind};

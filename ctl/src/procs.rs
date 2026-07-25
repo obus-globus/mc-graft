@@ -144,6 +144,14 @@ fn platform_list() -> Vec<Jvm> {
         )
     }
 
+    fn is_jvm(pid: i32) -> bool {
+        comm(pid).as_deref() == Some("java")
+            || fs::read_to_string(format!("/proc/{pid}/maps")).is_ok_and(|m| m.contains("libjvm.so"))
+    }
+
+    // hsperfdata files outlive the JVM that wrote them (a SIGKILLed VM never cleans up), so a recycled pid would
+    // otherwise be listed as an attachable JVM — and injecting into it SIGQUITs an unrelated process. Confirm every
+    // candidate is actually a live JVM, whichever way it was discovered.
     let mut pids: Vec<i32> = hsperf_pids();
     // Also include any /proc entry whose comm is exactly "java" (covers VMs started with -XX:-UsePerfData).
     for pid in proc_pids() {
@@ -153,8 +161,10 @@ fn platform_list() -> Vec<Jvm> {
     }
     pids.into_iter()
         .filter_map(|pid| {
+            // cmdline_args reads /proc/<pid>/cmdline and returns None if the process is gone, so it doubles as the
+            // liveness check — no separate /proc/<pid> existence test is needed (it could never fire after this).
             let args = cmdline_args(pid)?;
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if !is_jvm(pid) {
                 return None;
             }
             Some(classify(pid, &args))

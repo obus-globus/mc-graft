@@ -78,7 +78,60 @@ mod unix_impl {
         if ns.is_dir() { ns } else { PathBuf::from("/tmp") }
     }
 
+    /// Refuse to signal anything that isn't demonstrably a live JVM.
+    ///
+    /// SIGQUIT's default disposition is terminate-and-core-dump, so a mistyped pid doesn't fail harmlessly — it kills
+    /// an unrelated process. `kill(2)` also reads pid 0 as "every process in my process group" (which includes us and
+    /// our shell) and negative pids as a process group, and `--` lets those reach us from the CLI. jattach checks
+    /// existence + ownership before signalling for exactly this reason; mirror that.
+    fn verify_is_jvm(pid: i32) -> Result<(), String> {
+        if pid <= 0 {
+            return Err(format!("refusing to attach to pid {pid}: pid must be positive (0 and negatives signal groups)"));
+        }
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        if !proc.is_dir() {
+            return Err(format!("no such process: {pid}"));
+        }
+        // `comm` is the truncated executable name; a JVM launched via a wrapper may not be "java", so fall back to
+        // looking for libjvm in the mapped libraries, which no non-JVM process has.
+        let comm = fs::read_to_string(proc.join("comm")).unwrap_or_default();
+        if comm.trim() == "java" {
+            return Ok(());
+        }
+        let maps = fs::read_to_string(proc.join("maps")).unwrap_or_default();
+        if maps.contains("libjvm.so") || maps.contains("libjvm.dylib") {
+            return Ok(());
+        }
+        Err(format!(
+            "pid {pid} does not look like a JVM (comm={:?}, no libjvm mapped) — refusing to send SIGQUIT, which would \
+             terminate it",
+            comm.trim()
+        ))
+    }
+
+    /// The attach socket must be a real socket owned by us before we speak to it.
+    fn validate_socket(sock: &Path) -> Result<(), String> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // symlink_metadata, not metadata: a symlink planted here must be rejected, not followed.
+        let md = fs::symlink_metadata(sock).map_err(|e| format!("stat {}: {e}", sock.display()))?;
+        if !md.file_type().is_socket() {
+            return Err(format!(
+                "{} exists but is not a socket — refusing to use it (a file planted at this well-known path would \
+                 receive our attach request and could fake a success reply)",
+                sock.display()
+            ));
+        }
+        // Our own euid without libc (this crate forbids unsafe): /proc/self is owned by it. Where /proc is absent the
+        // check degrades to a no-op, which is why the socket-type check above is the load-bearing one.
+        let me = fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(md.uid());
+        if md.uid() != me {
+            return Err(format!("{} is owned by uid {}, not {me} — refusing to attach", sock.display(), md.uid()));
+        }
+        Ok(())
+    }
+
     fn send_sigquit(pid: i32) -> Result<(), String> {
+        verify_is_jvm(pid)?;
         let st = Command::new("kill")
             .args(["-s", "QUIT", &pid.to_string()])
             .status()
@@ -91,10 +144,14 @@ mod unix_impl {
 
     /// Ensure the JVM's attach socket exists; return its path. Creates+SIGQUITs if needed.
     fn ensure_socket(pid: i32) -> Result<PathBuf, String> {
+        verify_is_jvm(pid)?;
         let dir = attach_dir(pid);
         let sock = dir.join(format!(".java_pid{pid}"));
+        // Require an actual socket owned by us. A regular file or a symlink planted at this well-known path by another
+        // local user would otherwise receive our attach request (which carries the agent jar path and game dir) and
+        // could reply with a fabricated success. jattach does both checks; so do we.
         if sock.exists() {
-            return Ok(sock);
+            return validate_socket(&sock).map(|()| sock);
         }
         // Create the attach trigger. The JVM's SIGQUIT handler checks its cwd first, then /tmp; create it in that order.
         // Use create_new so a concurrent attach's trigger is never truncated: if the file already exists we reuse it and
@@ -144,7 +201,18 @@ mod unix_impl {
             .canonicalize()
             .map_err(|e| format!("agent jar {}: {e}", agent_jar.display()))?;
         let sock = ensure_socket(pid)?;
-        let mut stream = UnixStream::connect(&sock).map_err(|e| format!("connect {}: {e}", sock.display()))?;
+        let mut stream = match UnixStream::connect(&sock) {
+            Ok(s) => s,
+            // A JVM killed with SIGKILL leaves its socket file behind; when the pid is recycled, connect() gets
+            // ECONNREFUSED forever because ensure_socket short-circuits on mere existence. Drop the corpse and let the
+            // trigger+SIGQUIT path recreate it, rather than leaving attach permanently broken with no hint.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = fs::remove_file(&sock);
+                let sock = ensure_socket(pid)?;
+                UnixStream::connect(&sock).map_err(|e| format!("connect {}: {e}", sock.display()))?
+            }
+            Err(e) => return Err(format!("connect {}: {e}", sock.display())),
+        };
         stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
 
         // The instrument agent's option string is "<absolute jar path>[=<args>]".
