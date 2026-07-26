@@ -3,6 +3,7 @@ import org.objectweb.asm.tree.*;
 import org.objectweb.asm.tree.analysis.*;
 import java.util.*;
 import java.util.function.Predicate;
+import mcgraft.rt.InjectionLogger;
 
 /**
  * Schema-neutral converter core. Given an ALREADY-LOADED class's original bytes O and the Mixin-transformed
@@ -576,7 +577,11 @@ public class RetransformConverter {
         if (GIFACE == null || internal == null || !GIFACE.containsKey(internal) || !isPayloadIface(internal)) return internal;
         if (isSharedIface(internal)) return internal;   // shared: keep the interface (phantom); sites route via DuckDispatch
         List<String[]> impls = GIFACE.get(internal);
-        return (impls != null && impls.size() == 1) ? impls.get(0)[0] : "java/lang/Object";
+        // MUST agree with canCollapse (see its javadoc): a site that does NOT collapse leaves an Object on the stack,
+        // so a descriptor erased to the concrete implementor would be fed a value the verifier types as Object. An
+        // implementor we may not NAME is therefore erased to Object, exactly like the multi-implementor case.
+        if (impls != null && impls.size() == 1) return collapseTargetNameable(impls.get(0)[0]) ? impls.get(0)[0] : "java/lang/Object";
+        return "java/lang/Object";
     }
     static Type eraseIfaceType(Type t) {
         if (t.getSort() == Type.OBJECT) { String e = eraseIfaceInternal(t.getInternalName()); return e.equals(t.getInternalName()) ? t : Type.getObjectType(e); }
@@ -737,10 +742,52 @@ public class RetransformConverter {
      *  through DuckDispatch instead, which discriminates real implementors from de-implemented targets per receiver.
      *
      *  <p>The predicate used to be `impls.size() == 1 && !isSharedIface(...)` alone, which silently mis-rewrote any
-     *  mixin-added interface living outside the payload scope (e.g. in a bundled library jar) rather than reporting it. */
+     *  mixin-added interface living outside the payload scope (e.g. in a bundled library jar) rather than reporting it.
+     *
+     *  <p>It then still lacked any check on the IMPLEMENTOR, which is the type the rewritten instruction names — see
+     *  {@link #collapseTargetNameable}. */
     static boolean canCollapse(String iface, List<String[]> impls) {
-        return impls.size() == 1 && isPayloadIface(iface) && !isSharedIface(iface);
+        return impls.size() == 1 && isPayloadIface(iface) && !isSharedIface(iface) && collapseTargetNameable(impls.get(0)[0]);
     }
+
+    /** May bytecode we write name {@code target} directly?
+     *
+     *  <p>Collapsing rewrites a duck-interface site to name the CONCRETE implementor: {@code CHECKCAST <target>},
+     *  {@code INSTANCEOF <target>}, {@code INVOKESTATIC <sidecar>.h$x(L<target>;...)}, and the matching descriptor
+     *  erasure. Those instructions are written into the PAYLOAD'S OWN classes (rewriteCaller) as well as into
+     *  target'/the sidecar, and a payload class lives outside {@code net.minecraft} — so resolving a NON-PUBLIC
+     *  Minecraft class from there is {@code IllegalAccessError} the first time the instruction executes (link-clean,
+     *  verify-clean: it is a run-time resolution failure, which is why nothing before this caught it).
+     *
+     *  <p>Measured instance: LiquidBounce's {@code MixinEntityFluidInteractionTrackerAccessor} has exactly one
+     *  implementor, the PACKAGE-PRIVATE {@code net/minecraft/world/entity/EntityFluidInteraction$Tracker}. The collapse
+     *  turned {@code SimulatedPlayer$Companion}'s {@code CHECKCAST <accessor>} into {@code CHECKCAST <$Tracker>} and
+     *  Killaura died on it on first use.
+     *
+     *  <p>The rule is therefore PUBLIC-only, not "public or same package": one of the writers (rewriteCaller) always
+     *  emits into another package, and {@link #eraseIfaceInternal} — which must agree with the collapse decision — has
+     *  no caller to be relative to. A non-public implementor keeps the {@link mcgraft.rt.DuckDispatch} path, which
+     *  reaches the same sidecar reflectively (no access check on a package-private type) at a dispatch cost.
+     *
+     *  <p>Accessibility comes from {@link #classAccess}, i.e. {@link #effectiveClassAccess} — the SAME notion the
+     *  member-level rewrites use, so an {@code accessible class} widening that was inert (already-loaded class, the
+     *  AW could not reach it) is masked back off here too rather than believed. Unknown bytes ({@code -1}) mean we
+     *  cannot prove the type is nameable, and the DuckDispatch path is correct for every case the collapse handles, so
+     *  the answer is "no": the failure mode of guessing wrong here is a crash, of being conservative a slower call. */
+    static boolean collapseTargetNameable(String target) {
+        if (target == null || target.isEmpty()) return false;
+        int acc = classAccess(target);   // cached per class; effectiveClassAccess is applied on every read, not frozen
+        boolean ok = acc >= 0 && (acc & Opcodes.ACC_PUBLIC) != 0;
+        if (!ok && COLLAPSE_DECLINED.add(target)) InjectionLogger.info("duck-interface collapse declined for " + target
+            + " (class access " + (acc < 0 ? "unknown" : "0x" + Integer.toHexString(acc)) + ", not public): its"
+            + " cast/instanceof/invoke sites route through DuckDispatch instead, because payload code outside its"
+            + " package cannot name it");
+        return ok;
+    }
+    /** Log-dedupe only (one line per declined target). Deliberately NOT a memo of the ANSWER: the inert-widening mask
+     *  behind {@link #effectiveClassAccess} is fed by a set the agent grows as classes load, so a cached "public" could
+     *  outlive its truth. */
+    private static final Set<String> COLLAPSE_DECLINED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     String[] addedFieldTarget(String owner, String name, String desc) { return gLookup(GFIELD, scope, owner, name, desc); }
 
