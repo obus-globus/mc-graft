@@ -469,6 +469,7 @@ fn report_resource_needs(
     let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { return };
 
     let mut asset_namespaces: BTreeSet<String> = BTreeSet::new();
+    let mut sound_namespaces: BTreeSet<String> = BTreeSet::new();
     let mut has_lang = false;
     let mut reload_listener = false;
     let mut reads_own_metadata = false;
@@ -477,10 +478,16 @@ fn report_resource_needs(
         let Ok(mut e) = zip.by_index(i) else { continue };
         let name = e.name().to_string();
         if let Some(rest) = name.strip_prefix("assets/") {
-            // Only RENDER-PATH resources matter here — things fetched through a ResourceLocation at draw time, which
-            // is what silently resolves to "Missing resource" without a pack. Sounds are deliberately excluded: they
-            // go through the sound_event REGISTRY instead, which bootstrap.thawRegistries already covers, and a
-            // sounds-only mod (LiquidBounce) works fine with no mod container. Flagging it there would be noise.
+            // RENDER-PATH resources — things fetched through a ResourceLocation at draw time, which is what silently
+            // resolves to "Missing resource" without a pack.
+            //
+            // Sounds used to be excluded here, on the stated grounds that they go through the sound_event REGISTRY
+            // (covered by bootstrap.thawRegistries) and that "a sounds-only mod (LiquidBounce) works fine with no mod
+            // container". That was wrong, and is now measured: thawRegistries registers the sound EVENT, but the .ogg
+            // FILE is still fetched from the resource manager. LiquidBounce — whose assets/ is sounds and nothing else
+            // — logged 26 "Missing sound for event: liquidbounce:<name>" on a real 26.2 client with the container off,
+            // and 1 with it on. Every sound it ships was silently dead. So sounds DO need the container; they are
+            // tracked separately only because they need a different sentence than a missing texture does.
             let render_path = rest.ends_with(".png")
                 || rest.ends_with(".fsh")
                 || rest.ends_with(".vsh")
@@ -493,6 +500,11 @@ fn report_resource_needs(
                     asset_namespaces.insert(ns.to_string());
                 }
                 has_lang |= rest.contains("/lang/");
+            }
+            if rest.contains("/sounds/") || rest.ends_with("/sounds.json") {
+                if let Some(ns) = rest.split('/').next().filter(|s| !s.is_empty()) {
+                    sound_namespaces.insert(ns.to_string());
+                }
             }
         }
         // A class's constant pool carries the API names it references, so a substring scan is enough to tell whether
@@ -520,7 +532,7 @@ fn report_resource_needs(
     });
     let want_reload = reload_listener || mixes_reload_pipeline;
     let want_keybinds = registers_keybinds && !cfg.reopen_key_bindings;
-    let want_container = !asset_namespaces.is_empty() || reads_own_metadata;
+    let want_container = !asset_namespaces.is_empty() || !sound_namespaces.is_empty() || reads_own_metadata;
     if (!want_reload || cfg.reload_resources) && (!want_container || cfg.register_mod_container) && !want_keybinds {
         return; // nothing to advise, or already configured
     }
@@ -539,10 +551,27 @@ fn report_resource_needs(
             ));
             log("      (this fixes lang files; textures need bootstrap.reloadResources=true as well)");
         }
+        if !sound_namespaces.is_empty() {
+            let ns: Vec<&str> = sound_namespaces.iter().map(String::as_str).collect();
+            // bootstrap.thawRegistries gets the sound EVENT registered; it does nothing for the .ogg behind it.
+            // Measured on LiquidBounce: 26 dead sounds without the container, 1 with it.
+            log(&format!(
+                "    - assets/{}/sounds — thawRegistries registers the sound EVENT, but the .ogg itself is fetched \
+                 from the resource manager, so every sound is silently dead ('Missing sound for event: {}:<name>')",
+                ns.join(", assets/"),
+                ns[0]
+            ));
+        }
         if reads_own_metadata {
             log("    - the mod calls getModContainer (reads its own metadata), which fails on late attach");
         }
         log("      => set  bootstrap.registerModContainer=true");
+        if !cfg.reload_resources {
+            // The container alone makes the mod exist; only the reload re-runs Fabric's ModResourcePackCreator, which
+            // is what actually discovers the pack. Both are needed before any of the above resolves.
+            log("         (and bootstrap.reloadResources=true — the pack is only discovered when a reload re-runs");
+            log("          Fabric's ModResourcePackCreator; the container on its own does not put it in front of MC)");
+        }
     }
     if want_reload && !cfg.reload_resources {
         log(&format!(
