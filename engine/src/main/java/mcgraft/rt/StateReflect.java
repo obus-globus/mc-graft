@@ -12,7 +12,11 @@ import java.util.concurrent.ConcurrentHashMap;
  *  redirect the instance to {@code sidecar.getState(target)}. Non-relocated fields pass through unchanged. */
 public final class StateReflect {
     private static final ClassLoader SYS = Platform.LOADER;
-    private static final Map<String,String> FIELD_STATE = new ConcurrentHashMap<>();   // "target|name" -> $State internal name
+    // "payloadScope|target|name" -> $State internal name. The scope is part of the key because two payloads can each
+    // add a field of the same name to the same already-loaded target, and each gets its OWN sidecar/$State; keying on
+    // (target, name) alone let the second registration overwrite the first, so one payload's reflective read of its own
+    // field silently resolved to the other payload's state object.
+    private static final Map<String,String> FIELD_STATE = new ConcurrentHashMap<>();
     private static final Map<String,String> STATE_SIDECAR = new ConcurrentHashMap<>(); // $State internal name -> sidecar internal name
     // Optional, not a bare Method: ConcurrentHashMap.computeIfAbsent does NOT store a null mapping, so caching the raw
     // result would re-run resolveGetState (a Class.forName plus a defensive-copying getDeclaredMethods()) on EVERY
@@ -21,14 +25,20 @@ public final class StateReflect {
 
     private StateReflect() {}
 
-    public static void register(String targetInternal, String fieldName, String sidecarInternal, String stateInternal) {
-        FIELD_STATE.put(targetInternal + "|" + fieldName, stateInternal);
+    public static void register(String payloadScope, String targetInternal, String fieldName, String sidecarInternal, String stateInternal) {
+        FIELD_STATE.put(payloadScope + "|" + targetInternal + "|" + fieldName, stateInternal);
         STATE_SIDECAR.put(stateInternal, sidecarInternal);
     }
 
-    /** Payload {@code someClass.getDeclaredField(name)} — return the $State field for a relocated added field. */
-    public static Field declaredField(Class<?> target, String name) throws NoSuchFieldException {
-        String stateInternal = FIELD_STATE.get(target.getName().replace('.','/') + "|" + name);
+    /** Payload {@code someClass.getDeclaredField(name)} — return the $State field for a relocated added field.
+     *
+     *  <p>{@code payloadScope} is the id of the payload whose code is asking, stamped into the call site by the
+     *  caller rewrite. An empty/unknown scope (a class no payload claimed) falls back to any payload that relocated
+     *  that field, which is the pre-scoping behaviour and is unambiguous whenever only one payload did. */
+    public static Field declaredField(Class<?> target, String name, String payloadScope) throws NoSuchFieldException {
+        String suffix = target.getName().replace('.','/') + "|" + name;
+        String stateInternal = FIELD_STATE.get(payloadScope + "|" + suffix);
+        if (stateInternal == null) stateInternal = anyScope(suffix);
         if (stateInternal != null) try {
             Field f = Class.forName(stateInternal.replace('/','.'), false, SYS).getDeclaredField(name);
             f.setAccessible(true);
@@ -40,6 +50,15 @@ public final class StateReflect {
                 + " registered but $State lookup failed (" + stateInternal + "): " + t);
         }
         return target.getDeclaredField(name);
+    }
+
+    /** Fallback for a call site whose payload scope could not be determined: the $State registered by ANY payload for
+     *  this (target, field). Only reached when the exact-scope lookup misses, so with a single payload it is the same
+     *  answer the unscoped table used to give. */
+    private static String anyScope(String suffix) {
+        String tail = "|" + suffix;
+        for (Map.Entry<String,String> e : FIELD_STATE.entrySet()) if (e.getKey().endsWith(tail)) return e.getValue();
+        return null;
     }
 
     // Payload Field.get/set (and primitive variants) — redirect a relocated field's instance to its $State.

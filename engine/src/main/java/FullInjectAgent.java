@@ -26,7 +26,7 @@ public class FullInjectAgent {
     static final Set<String> preBootstrapPayload = ConcurrentHashMap.newKeySet();       // payload classes present before normal on-load caller rewriting
     static Set<String> GENUINE_IFACES = java.util.Collections.emptySet();          // interfaces a real (non-mixin) bundle class implements; ∩ GIFACE -> shared duck interfaces
     /** per-target conversion: target' bytes + sidecar/state (defined LAZILY in the CFT with the target's real PD). */
-    static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; volatile boolean defined;
+    static final class Conv { byte[] target, sidecar, state; String sidecarName, stateName; PayloadScope scope; volatile boolean defined;
         boolean whole;   // future-loaded target defined WHOLE (added members kept on the class); no sidecar/state to define
         boolean define(ProtectionDomain pd){ synchronized(this){ if(defined) return true;
             if(whole){ defined=true; return true; }   // the whole class carries its own added members; nothing external to define
@@ -151,18 +151,24 @@ public class FullInjectAgent {
         // to the same system loader, so a classpath lookup returns whichever jar was appended first — i.e. a second
         // injection would silently run with the first payload's config. See resolveAgentJar.
         final PayloadConfig cfg = PayloadConfig.init(agentResource(self, "graft.properties"));
-        RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(payloadBundle, cfg.callerRewritePackages);
+        // Everything this payload generates or records is scoped by its id, so a later payload targeting the same
+        // Minecraft class gets its own sidecar/state/table entries instead of colliding (docs/multi-payload.md §1.3/§1.4).
+        final PayloadScope scope = RetransformConverter.newScope(cfg.id);
+        scope.payloadClasses = readPayloadClasses(payloadBundle, cfg.callerRewritePackages);
         GENUINE_IFACES = scanGenuineImplementors(payloadBundle, cfg.callerRewritePackages);
         // Also caller-rewrite the applied dependency (fabric-api) runtime: its own classes cast MC objects to duck
         // interfaces its mixins add. Match by prefix (they are not in the payload jar). Only when dep-mixins are applied.
         Set<String> crPrefixes = new HashSet<>(cfg.callerRewritePackages);
         if (!cfg.depCallerRewritePackages.isEmpty()) crPrefixes.addAll(cfg.depCallerRewritePackages);   // explicit override
         else if (!cfg.depMixinConfigs.isEmpty()) crPrefixes.add("net/fabricmc/fabric");                 // default: fabric-api's namespace
-        RetransformConverter.CALLER_REWRITE_PREFIXES = crPrefixes;
+        scope.callerRewritePrefixes = crPrefixes;
+        RetransformConverter.republish();
         applyGameDirProperty(cfg, resolveGameDir(a));
         if (cfg.joinGateScreen != null) JoinGateRewriter.CONNECT_SCREEN = cfg.joinGateScreen;   // arm the deferred-join gate
         if (cfg.reopenKeyBindings) KeyBindingReopen.arm(cfg.reopenKeyBindingsOwner, cfg.reopenKeyBindingsMethod);   // arm the keybinding-registry guard strip
         if (cfg.registerModContainer) PLATFORM.registerPayloadMod(cfg, payloadBundle);   // so the mod's self-metadata lookups resolve
+        InjectionLogger.info("payload scope: id='"+scope.id+"' key='"+scope.key+"' -> generated classes are named "
+            +"<target>$$Sidecar$"+scope.key+" (this JVM now holds "+RetransformConverter.scopes().size()+" scope(s))");
         InjectionLogger.info("payload '"+cfg.id+"': mixins="+cfg.mixinConfigs+" aw="+cfg.accessWidener
             +" entrypoints(main="+cfg.mainEntrypoints+", client="+cfg.clientEntrypoints+")"
             +(cfg.hasEventBootstrap()?" eventBootstrap="+cfg.evtStart+(cfg.hasReadinessProbe()?" (async)":" (sync)"):""));
@@ -207,13 +213,13 @@ public class FullInjectAgent {
             if (O == null) { InjectionLogger.warn("mixin target not present in this installation, skipping: "+internal); continue; }
             byte[] X = PLATFORM.transform(internal.replace('/','.'), O);
             if (X == null) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TARGET_MISSING",internal,"target","mixin transformer returned null"); InjectionLogger.error("transform returned null for "+internal); continue; }
-            txMap.put(internal, new byte[][]{O, X}); RetransformConverter.collectAdded(internal, O, X, gadded, gfield, giface);
+            txMap.put(internal, new byte[][]{O, X}); RetransformConverter.collectAdded(scope, internal, O, X, gadded, gfield, giface);
         } catch (Throwable e) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TRANSFORM_FAILURE",internal,"target",rootMsg(e)); InjectionLogger.error("transform fail "+internal+" -> "+rootMsg(e)); } }
-        RetransformConverter.GADDED = gadded; RetransformConverter.GFIELD = gfield; RetransformConverter.GIFACE = giface;
+        scope.gadded = gadded; scope.gfield = gfield; scope.giface = giface;
         // A mixin-added interface that a REAL bundle class also implements is "shared": keep it (phantom) instead of
         // erasing it, and route its sites through DuckDispatch (which discriminates genuine implementors from ducks).
         Set<String> shared = new HashSet<>(giface.keySet()); shared.retainAll(GENUINE_IFACES);
-        RetransformConverter.SHARED_IFACES = shared;
+        scope.sharedIfaces = shared;
         if (!shared.isEmpty()) InjectionLogger.info("shared duck interfaces (phantom, guarded dispatch): " + shared);
         InjectionLogger.info("phase A: "+txMap.size()+" transformed; global added-methods="+gadded.size()+" added-fields="+gfield.size());
         // A FUTURE-loaded target (not loaded at attach) has no schema constraint at define time, so it can be defined
@@ -237,6 +243,10 @@ public class FullInjectAgent {
             gfield.values().removeIf(v -> wholeTargets.contains(v[0]));
             InjectionLogger.info("future-loaded targets defined WHOLE (added members kept on the class): " + wholeTargets);
         }
+        // Publish this payload's tables into the (union) globals the converter and the CFT read. Deliberately AFTER the
+        // wholeTargets pruning above: republish() COPIES each scope's tables into the union, so a later in-place
+        // mutation of `gadded`/`gfield` would not reach the readers.
+        RetransformConverter.republish();
         // Phase B: stage every conversion against the complete global tables.
         int conv=0, eager=0; List<String> skipped=new ArrayList<>();
         LinkedHashMap<String,Conv> pendingConv=new LinkedHashMap<>();
@@ -244,17 +254,17 @@ public class FullInjectAgent {
         for (var e : txMap.entrySet()) { String internal = e.getKey(); try {
             byte[] O = e.getValue()[0], X = e.getValue()[1];
             if (wholeTargets.contains(internal)) {   // define the full mixin output at (future) load time — no sidecar/state
-                Conv cw = new Conv(); cw.whole = true; cw.target = X; pendingConv.put(internal, cw); conv++; continue;
+                Conv cw = new Conv(); cw.whole = true; cw.target = X; cw.scope = scope; pendingConv.put(internal, cw); conv++; continue;
             }
-            RetransformConverter c = new RetransformConverter(internal); RetransformConverter.Result res = c.run(O, X);
-            Conv cv = new Conv(); cv.target=res.target; cv.sidecar=res.sidecar; cv.state=c.stateBytes(); cv.sidecarName=res.sidecarName; cv.stateName=c.stateName();
+            RetransformConverter c = new RetransformConverter(scope, internal); RetransformConverter.Result res = c.run(O, X);
+            Conv cv = new Conv(); cv.scope=scope; cv.target=res.target; cv.sidecar=res.sidecar; cv.state=c.stateBytes(); cv.sidecarName=res.sidecarName; cv.stateName=c.stateName();
             if (!LateAttachVerifier.verifyConversion(internal, O, cv.target, cv.sidecar, cv.state, gadded, gfield, giface)) {
                 skipped.add(internal); continue;
             }
             for (String di : res.droppedInterfaces) {
                 List<String[]> impls = pendingIfaces.computeIfAbsent(di, k -> new ArrayList<>());
-                boolean duplicate=false; for(String[] impl:impls) if(impl[0].equals(internal)){duplicate=true;break;}
-                if(!duplicate) impls.add(new String[]{internal, res.sidecarName});
+                boolean duplicate=false; for(String[] impl:impls) if(impl[0].equals(internal)&&scope.key.equals(impl[2])){duplicate=true;break;}
+                if(!duplicate) impls.add(new String[]{internal, res.sidecarName, scope.key});
             }
             pendingConv.put(internal, cv); conv++;
         } catch (Throwable ex) { skipped.add(internal); LateAttachVerifier.error("CONVERSION_FAILURE",internal,"target",rootMsg(ex)); InjectionLogger.error("convert fail "+internal+" -> "+rootMsg(ex)); } }
@@ -280,18 +290,28 @@ public class FullInjectAgent {
         InjectionLogger.info("converted "+conv+" targets ("+eager+" sidecars eager-defined); ifaceMap="+ifaceMap.size()+" interfaces; skipped="+skipped.size()+(skipped.isEmpty()?"":" "+skipped));
         InjectionLogger.info("ifaceMap keys: " + ifaceMap.keySet());
         for (var ie : ifaceMap.entrySet()) for (String[] impl : ie.getValue())
-            mcgraft.rt.DuckDispatch.register(ie.getKey(), impl[0], impl[1]);
+            mcgraft.rt.DuckDispatch.register(ie.getKey(), impl[0], impl[1], impl[2]);
+        // The ACTUAL generated names, read back off the staged conversions — the observable evidence that sidecars are
+        // scoped per payload rather than shared. Logged (not asserted) so a name collision between two payloads is
+        // visible in the injection log rather than only in a crash.
+        List<String> sampleSidecars = new ArrayList<>();
+        for (Conv cv : pendingConv.values()) { if (cv.sidecarName != null && sampleSidecars.size() < 3) sampleSidecars.add(cv.sidecarName); }
+        InjectionLogger.info("generated sidecar names for scope '"+scope.id+"' (sample of "+pendingConv.size()+"): "+sampleSidecars);
         // Register relocated fields with the reflection shim so a mod that reflectively reads its OWN added field on an
-        // already-loaded target (which had to move to $State) resolves to the per-instance state. gfield here already
-        // excludes whole targets (whose fields stayed on the class).
+        // already-loaded target (which had to move to $State) resolves to the per-instance state. Each payload's fields
+        // are registered under ITS OWN scope, so two payloads relocating a same-named field on the same target do not
+        // overwrite each other. gfield here already excludes whole targets (whose fields stayed on the class).
         int rf = 0;
-        for (var ge : gfield.entrySet()) {   // key = "owner name desc"; parse by owner length (names/descs are space-free)
-            String key = ge.getKey(); String[] v = ge.getValue();   // v = [owner, sidecar, S/I]
-            int sp = key.lastIndexOf(' '); if (sp <= v[0].length()) continue;
-            String name = key.substring(v[0].length() + 1, sp);
-            mcgraft.rt.StateReflect.register(v[0], name, v[1], v[1] + "$State"); rf++;
+        for (PayloadScope s : RetransformConverter.scopes()) {
+            Map<String,String[]> gf = s.gfield; if (gf == null) continue;
+            for (var ge : gf.entrySet()) {   // key = "scope owner name desc"
+                String[] v = ge.getValue();  // v = [owner, sidecar, S/I]
+                String name = RetransformConverter.gkeyMemberName(ge.getKey(), v[0]);
+                if (name == null) continue;
+                mcgraft.rt.StateReflect.register(s.key, v[0], name, v[1], v[1] + "$State"); rf++;
+            }
         }
-        InjectionLogger.info("reflection shim: registered "+rf+" relocated field(s)");
+        InjectionLogger.info("reflection shim: registered "+rf+" relocated field(s) across "+RetransformConverter.scopes().size()+" payload scope(s)");
 
         // Resolver: the payload access of a non-public member of an ALREADY-LOADED MC class must be reflection-routed (that
         // class could not be AW-widened, since retransform bans modifier changes). Future MC classes get the AW on-load.
@@ -313,7 +333,7 @@ public class FullInjectAgent {
                     // targets caller-rewritten. If it somehow already loaded (c!=null), a schema-adding redefine is
                     // illegal — let the JVM keep the pristine class (that mod hook is inert this session).
                     if (c != null) { InjectionLogger.warn("whole target "+n+" was already loaded; cannot add its mixin members via retransform (inert this session)"); return null; }
-                    byte[] t = ifaceMap.isEmpty() ? cv.target : RetransformConverter.rewriteCaller(cv.target, ifaceMap);
+                    byte[] t = ifaceMap.isEmpty() ? cv.target : RetransformConverter.rewriteCaller(cv.target, ifaceMap, cv.scope);
                     if(connect) t = JoinGateRewriter.rewrite(n, t);
                     byte[] w = awApply(n, t); if (w != null) t = w;
                     return t;
@@ -335,7 +355,7 @@ public class FullInjectAgent {
                     return t; }
                 if (RetransformConverter.isCallerRewrite(n)) {
                     byte[] rw = AccessorBridgeRewriter.rewrite(n, b);
-                    rw = ifaceMap.isEmpty()? rw : RetransformConverter.rewriteCaller(rw, ifaceMap);
+                    rw = ifaceMap.isEmpty()? rw : RetransformConverter.rewriteCaller(rw, ifaceMap, RetransformConverter.scopeFor(n));
                     if (n.equals(KeyBindingReopen.TARGET)) rw = KeyBindingReopen.rewrite(n, rw);   // dep classes: also strip the keybind guard (this branch pre-empts the standalone KeyBindingReopen branch below)
                     if (DEBUG) InjectionLogger.info("CFT caller "+n+" changed="+(rw!=b));
                     rw = RetransformConverter.rewritePayloadAw(rw, awRes);
@@ -391,7 +411,14 @@ public class FullInjectAgent {
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 
         verifyMemberAccessGate(inst);
-        preflightPayloadClasses(payloadBundle,awRes,gadded,gfield,ifaceMap);
+        preflightPayloadClasses(payloadBundle,scope,awRes,gadded,gfield,ifaceMap);
+        // Second contract sweep. The gate above the conversion covers the calls the CONVERTER emitted; the caller
+        // rewrite emits its own mcgraft.rt.* call sites (StateReflect), and the preflight just ran it over the whole
+        // payload jar, so anything it emitted is recorded by now. Still before any target' is published.
+        for (String bad : RetransformConverter.unresolvedRtCalls(mcgraft.rt.Platform.LOADER)) {
+            LateAttachVerifier.error("RT_CONTRACT_UNRESOLVED", bad, "runtime", "emitted call does not resolve");
+            InjectionLogger.error("runtime contract broken: " + bad);
+        }
         if(LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();
             throw new IllegalStateException("Late-attach preflight failed before target retransformation; see report");
@@ -610,7 +637,7 @@ public class FullInjectAgent {
         try {
             byte[] o; try (InputStream in = SYS.getResourceAsStream(internal+".class")) { if(in==null){InjectionLogger.warn("  diag: no original bytes for "+internal);return;} o=in.readAllBytes(); }
             byte[] rw = AccessorBridgeRewriter.rewrite(internal, o);
-            if(!ifaceMap.isEmpty()) rw = RetransformConverter.rewriteCaller(rw, ifaceMap);
+            if(!ifaceMap.isEmpty()) rw = RetransformConverter.rewriteCaller(rw, ifaceMap, RetransformConverter.scopeFor(internal));
             rw = RetransformConverter.rewritePayloadAw(rw, AW_RES);
             java.util.Set<String> om = methodSet(o), rm = methodSet(rw);
             java.util.Set<String> dropped = new java.util.TreeSet<>(om); dropped.removeAll(rm);
@@ -883,7 +910,7 @@ public class FullInjectAgent {
         InjectionLogger.info("ASM runtime="+version+" source="+source+" Java25Compatible="+supported);
         if(!supported)throw new IllegalStateException("the payload requires ASM >= 9.8, but active ASM is "+version+" from "+source+". Restart with a correctly packaged agent or remove the preloaded ASM collision.");
     }
-    static void preflightPayloadClasses(Path lbJar,RetransformConverter.Resolver resolver,Map<String,String[]> gadded,
+    static void preflightPayloadClasses(Path lbJar,PayloadScope scope,RetransformConverter.Resolver resolver,Map<String,String[]> gadded,
             Map<String,String[]> gfield,Map<String,List<String[]>> ifaces){int total=0,changed=0,failed=0;
         PayloadConfig cfg=PayloadConfig.get();
         try(JarFile jf=new JarFile(lbJar.toFile())){for(var en=jf.entries();en.hasMoreElements();){JarEntry e=en.nextElement();String n=e.getName();
@@ -893,7 +920,7 @@ public class FullInjectAgent {
             if(!cfg.payloadPackages.isEmpty()&&!cfg.ownsClass(n.substring(0,n.length()-6)))continue; total++;
             try{byte[] b;try(InputStream in=jf.getInputStream(e)){b=in.readAllBytes();}
                 byte[] rw=AccessorBridgeRewriter.rewrite(n.substring(0,n.length()-6),b);
-                if(!ifaces.isEmpty())rw=RetransformConverter.rewriteCaller(rw,ifaces);
+                if(!ifaces.isEmpty())rw=RetransformConverter.rewriteCaller(rw,ifaces,scope);
                 rw=RetransformConverter.rewritePayloadAw(rw,resolver);
                 if(!LateAttachVerifier.verifyCaller(n.substring(0,n.length()-6),b,rw,gadded,gfield,ifaces))failed++;
                 if(!Arrays.equals(b,rw))changed++;

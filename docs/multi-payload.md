@@ -204,6 +204,45 @@ Introduce an explicit `PayloadScope` (id + its own tables) and thread the id thr
 Every reader of these names must agree on the new form: the reflection shim, caller rewriting, and
 `DuckDispatch` lookup. Grep-complete, not judgement calls.
 
+**Status: DONE, verified through the single-injection path** (P2 makes the bookkeeping *capable* of holding two
+payloads; actually admitting a second injection is still P3's `everInjected`).
+
+Landed as `PayloadScope` (id + sanitized `key` + that payload's own tables). `RetransformConverter` keeps the scope
+registry and materializes the UNION of every scope's tables into the existing static fields, so the hot CFT reads stay
+one map lookup. `sidecarInternal(scope, target)` emits `<target>$$Sidecar$<key>` on both the Fabric and the
+`SIDECAR_PKG` (NeoForge) path.
+
+Verified, not assumed:
+
+* **The rename really takes effect.** `-Dmcgraft.agent.dumpDir` writes every class the agent hands to `defineClass`.
+  Same client, same payload, before vs after: `net.minecraft.client.Camera$$Sidecar.class` →
+  `net.minecraft.client.Camera$$Sidecar$zoomify.class` (10 files, identical target set), and a Wurst run produces 90
+  files all carrying `$wurst`.
+* **The id is threaded, not hardcoded** — two different payloads (`zoomify`, `wurst`) each produce their own key, and
+  a probe confirms `fabric-api` → `fabric_api` while a second payload sanitizing onto the same key is disambiguated to
+  `fabric_api_2`.
+* **`$State`/`h$`/`get$`/`set$`/`F$`/`RM$`/`SMH$`/`rmi$`/`smi$`/`ifd$` inherit the scoping for free** — claimed in the
+  plan, checked at every emit site: each is declared on the sidecar (or its `$State`) and every reference reaches it
+  through the sidecar name recorded in `GADDED`/`GFIELD`/`GIFACE`, never by re-deriving it from the target.
+* **The one changed `mcgraft.rt` signature resolves.** `StateReflect.declaredField` takes the scope as a third
+  argument. An executed probe rewrites a real `getDeclaredField(...).getInt(...)` site, confirms the emitted descriptor
+  passes `unresolvedRtCalls`, shows the gate still reports the old 2-arg form as broken, and *runs* the rewritten class
+  (proving the extra `LDC` left a verifiable stack).
+
+Two things found while doing it, neither of which the §1.3/§1.4 reading predicted:
+
+* `LateAttachVerifier.containsRemoved` builds its lookup key as `owner + '\0' + name + ' ' + desc`
+  (LateAttachVerifier.java:174) while the table it is handed is keyed by `gkey`, which used
+  `owner + ' ' + name + ' ' + desc`. The two have never matched, so `REMOVED_FIELD_REF` / `REMOVED_METHOD_REF` have
+  been dead since the first commit. Confirmed by execution with a positive control (the same call fires the error when
+  fed a `'\0'`-shaped key). Scoping `gkey` does not change this either way. **Left unfixed on purpose** — switching it
+  on would arm a broad residual-reference gate at the end of an unrelated refactor; it needs its own change and its own
+  verification run.
+* The pre-publish `unresolvedRtCalls` gate only ever saw calls the CONVERTER emitted (`recordRtCalls` runs on the
+  target'/sidecar ClassNodes). Calls emitted by the CALLER rewrite — i.e. the `StateReflect` shim — were never in
+  `EMITTED_RT_CALLS`, so that part of the runtime contract was unchecked. Now recorded at the emit site, with a second
+  gate sweep after the payload-jar preflight and still before any target' is published.
+
 ### P3 — Byte-source composition (fixes §1.2, §1.6) — the hard one
 
 1. The CFT records what it published per target (`Map<String, byte[]> published`).

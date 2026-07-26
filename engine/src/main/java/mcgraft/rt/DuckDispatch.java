@@ -18,17 +18,21 @@ public final class DuckDispatch {
     // shared interface with many receiver classes doesn't spawn a redundant cache entry per class.
     private static final Map<String,Method> REAL_METHODS = new ConcurrentHashMap<>();
 
-    private record Impl(String targetName, String sidecarName) {}
+    /** One payload's duck implementation of {@code iface} on {@code targetName}. {@code payloadScope} is what makes two
+     *  payloads that both mixin the same interface onto the same target two DISTINCT implementations rather than one. */
+    private record Impl(String targetName, String sidecarName, String payloadScope) {}
     private record Key(Class<?> receiver, String iface, String name, String desc) {}
 
     private DuckDispatch() {}
 
-    public static synchronized void register(String iface, String target, String sidecar) {
+    public static synchronized void register(String iface, String target, String sidecar, String payloadScope) {
         List<Impl> list = new ArrayList<>(IMPLEMENTATIONS.getOrDefault(iface, List.of()));
-        for (Impl i : list) if (i.targetName.equals(target)) return;
+        // Deduplicate within ONE payload only. Skipping on target alone (as this did) meant a second payload's sidecar
+        // for the same target was never registered at all, so that payload's hooks on the interface were inert.
+        for (Impl i : list) if (i.targetName.equals(target) && i.payloadScope.equals(payloadScope)) return;
         // Registration must not load the target: doing so before the CFT sees it would bypass conversion/AW.
-        list.add(new Impl(target, sidecar));
-        list.sort(Comparator.comparing(Impl::targetName));
+        list.add(new Impl(target, sidecar, payloadScope));
+        list.sort(Comparator.comparing(Impl::targetName).thenComparing(Impl::payloadScope));
         IMPLEMENTATIONS.put(iface, List.copyOf(list));
         METHODS.clear();
     }
@@ -86,23 +90,38 @@ public final class DuckDispatch {
 
     private static Method resolve(Key key) {
         try {
-            Impl best = null;
-            for (Impl i : IMPLEMENTATIONS.getOrDefault(key.iface, List.of())) {
+            List<Impl> impls = IMPLEMENTATIONS.getOrDefault(key.iface, List.of());
+            // Pick the most specific TARGET class, exactly as before — the ambiguity error still guards genuinely
+            // unrelated targets. Selection is over target classes, not over Impls, so several payloads implementing the
+            // interface on the SAME target are not mistaken for an ambiguity.
+            Class<?> bestTarget = null;
+            for (Impl i : impls) {
                 Class<?> it = target(i);
                 if (!it.isAssignableFrom(key.receiver)) continue;
-                if (best == null || target(best).isAssignableFrom(it)) best = i;
-                else if (!it.isAssignableFrom(target(best)))
+                if (bestTarget == null || bestTarget.isAssignableFrom(it)) bestTarget = it;
+                else if (!it.isAssignableFrom(bestTarget))
                     throw new IncompatibleClassChangeError("Ambiguous duck interface " + key.iface + " for " + key.receiver.getName());
             }
-            if (best == null) throw new IncompatibleClassChangeError("No duck implementation " + key.iface + " for " + key.receiver.getName());
+            if (bestTarget == null) throw new IncompatibleClassChangeError("No duck implementation " + key.iface + " for " + key.receiver.getName());
             MethodType mt = MethodType.fromMethodDescriptorString(key.desc, SYS);
             Class<?>[] original = mt.parameterArray();
             Class<?>[] params = new Class<?>[original.length + 1];
-            params[0] = target(best); System.arraycopy(original, 0, params, 1, original.length);
-            Class<?> sidecar = Class.forName(best.sidecarName.replace('/','.'), false, SYS);
-            Method m = sidecar.getMethod("h$" + key.name, params);
-            m.setAccessible(true);
-            return m;
+            params[0] = bestTarget; System.arraycopy(original, 0, params, 1, original.length);
+            // Then pick the payload. Each payload's sidecar only carries the methods THAT payload's mixin added, so
+            // "the sidecar that actually declares h$<name>" is the discriminator; a payload that added the interface
+            // but not this method simply doesn't answer.
+            Throwable miss = null;
+            for (Impl i : impls) {
+                if (target(i) != bestTarget) continue;
+                try {
+                    Class<?> sidecar = Class.forName(i.sidecarName.replace('/','.'), false, SYS);
+                    Method m = sidecar.getMethod("h$" + key.name, params);
+                    m.setAccessible(true);
+                    return m;
+                } catch (NoSuchMethodException | ClassNotFoundException e) { miss = e; }
+            }
+            throw miss != null ? miss : new NoSuchMethodException("h$" + key.name + " on any sidecar of " + bestTarget.getName()
+                + " for duck interface " + key.iface);
         } catch (Throwable t) {
             throw re(t);
         }

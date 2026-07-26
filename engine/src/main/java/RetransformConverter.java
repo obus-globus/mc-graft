@@ -87,12 +87,21 @@ public class RetransformConverter {
      *  rewriteRefs automatically route ALL non-public MC access (package-private included) through AwReflect — no other
      *  logic change is needed. Must be a payload-owned package dir ending in '/', e.g. "mcgraft/sc/". */
     public static volatile String SIDECAR_PKG = null;
-    /** Injective-enough mangle: net/a/B$C -> <pkg>net_a_B_C$$Sidecar. Target internal names are a fixed, unique set. */
-    static String sidecarInternal(String internal) {
-        return SIDECAR_PKG == null ? internal + "$$Sidecar"
-                                   : SIDECAR_PKG + internal.replace('/', '_').replace('$', '_') + "$$Sidecar";
+    /** Injective-enough mangle: net/a/B$C -> <pkg>net_a_B_C$$Sidecar$<scope>. Target internal names are a fixed, unique
+     *  set, and the trailing scope key makes the name per-PAYLOAD as well as per-target: two payloads that mixin the
+     *  same Minecraft class each get their own sidecar instead of the second silently colliding with the first.
+     *
+     *  <p>Everything else the converter generates is derived from this name — {@code $State}, and the {@code h$},
+     *  {@code get$/set$}, {@code refGet$/refSet$}, {@code F$}, {@code RM$}, {@code SMH$}, {@code rmi$}, {@code smi$},
+     *  {@code ifd$} members, all of which are emitted ON the sidecar (or its {@code $State}) and referenced through it.
+     *  So they inherit the scoping without needing a scope component of their own. */
+    static String sidecarInternal(PayloadScope scope, String internal) {
+        String base = SIDECAR_PKG == null ? internal + "$$Sidecar"
+                                          : SIDECAR_PKG + internal.replace('/', '_').replace('$', '_') + "$$Sidecar";
+        return base + "$" + scope.key;
     }
 
+    final PayloadScope scope;
     final String targetInternal, targetDesc, sidecar, stateName;
     final Set<String> addedFieldKeys = new HashSet<>();   // name+" "+desc
     final Set<String> addedInstanceFields = new HashSet<>(); // name (instance only)
@@ -100,13 +109,14 @@ public class RetransformConverter {
     final Set<String> addedMethodKeys = new HashSet<>();  // name+" "+desc
     final Map<String,String> fieldDesc = new HashMap<>();
 
-    RetransformConverter(String targetInternal) {
+    RetransformConverter(PayloadScope scope, String targetInternal) {
+        this.scope = scope;
         this.targetInternal = targetInternal;
         this.targetDesc = "L" + targetInternal + ";";
         // Sidecar lives in the TARGET'S OWN PACKAGE so relocated handler bodies keep package-private access to
         // target-package internals (e.g. a package-private inner class like GuiRenderState$Node). Only genuinely
         // PRIVATE members still need the reflective path (B). Defined with the target's ProtectionDomain.
-        this.sidecar = sidecarInternal(targetInternal);
+        this.sidecar = sidecarInternal(scope, targetInternal);
         this.stateName = sidecar + "$State";
     }
 
@@ -250,6 +260,11 @@ public class RetransformConverter {
      *  <p>Recording what was emitted, rather than maintaining a hand-written list of what we THINK is emitted, is the
      *  point: a list would drift from the emit sites, which is the failure mode being defended against. */
     public static final Set<String> EMITTED_RT_CALLS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Record a single emitted {@code mcgraft/rt/*} call site. Used where the emit does NOT go through a ClassNode the
+     *  converter later hands to {@link #recordRtCalls} — i.e. the caller-rewrite path, whose output classes are not
+     *  re-scanned. */
+    static void recordRtCall(String owner, String name, String desc) { EMITTED_RT_CALLS.add(owner + "|" + name + "|" + desc); }
 
     static void recordRtCalls(ClassNode cn) {
         for (MethodNode m : cn.methods) {
@@ -597,14 +612,67 @@ public class RetransformConverter {
         }
     }
 
-    /** GLOBAL table of mixin-ADDED methods across ALL targets, keyed by "owner name desc" -> [owner, sidecar,
+    /** GLOBAL table of mixin-ADDED methods across ALL targets, keyed by "scope owner name desc" -> [owner, sidecar,
      *  isStatic]. Keyed by OWNER (not just name+desc) because the same handler name+desc can be added to multiple
-     *  targets; a call is resolved by walking the receiver's class hierarchy to the declaring target. */
+     *  targets; a call is resolved by walking the receiver's class hierarchy to the declaring target. Keyed by SCOPE as
+     *  well, because two payloads can add the same handler to the same target and each has its own sidecar. */
     // volatile: assigned once by the agent AFTER Phase A completes, then read from many concurrent CFT threads. The
     // volatile write/read gives the happens-before that safely publishes each fully-populated table to those readers.
+    //
+    // These are the UNION over every live PayloadScope, materialized by republish(). Readers keep a single map lookup
+    // on the hot CFT path; the per-payload tables live on the scopes (docs/multi-payload.md §1.4). GADDED/GFIELD keys
+    // carry the scope (see gkey), so the union is a collision-free putAll; GIFACE keys stay the interface name (which
+    // is what every reader asks for) and each entry carries its scope in slot [2].
     public static volatile Map<String,String[]> GADDED, GFIELD;
     public static volatile Map<String,List<String[]>> GIFACE;
-    /** Internal names of classes provided by the staged payload (the mod jar). Lets us tell a mixin-ADDED payload
+
+    /** Every payload injected into this JVM, in injection order. CopyOnWrite: appended rarely, iterated on the CFT
+     *  path. */
+    static final java.util.concurrent.CopyOnWriteArrayList<PayloadScope> SCOPES = new java.util.concurrent.CopyOnWriteArrayList<>();
+    public static List<PayloadScope> scopes() { return SCOPES; }
+
+    /** Register a payload and hand back its scope. The sanitized key is made UNIQUE across live scopes here, because
+     *  {@link PayloadScope#sanitize} is lossy ({@code a-b} and {@code a_b} collapse together) and two payloads sharing
+     *  a key would share every generated class name — the exact collision this phase exists to remove. */
+    public static synchronized PayloadScope newScope(String id) {
+        String base = PayloadScope.sanitize(id), k = base;
+        for (int n = 2; keyTaken(k); n++) k = base + "_" + n;
+        PayloadScope s = new PayloadScope(id, k);
+        SCOPES.add(s);
+        return s;
+    }
+    private static boolean keyTaken(String k) { for (PayloadScope s : SCOPES) if (s.key.equals(k)) return true; return false; }
+
+    /** The scope that owns {@code internal}: the payload whose own classes contain it, else one whose caller-rewrite
+     *  prefix matches. Null when no payload claims it (the caller then falls back to searching every scope). */
+    static PayloadScope scopeFor(String internal) {
+        if (internal == null) return null;
+        for (PayloadScope s : SCOPES) if (s.payloadClasses.contains(internal)) return s;
+        for (PayloadScope s : SCOPES) for (String p : s.callerRewritePrefixes) if (internal.startsWith(p)) return s;
+        return null;
+    }
+
+    /** Recompute the materialized unions from the live scopes. Called by the agent after it fills a scope's tables;
+     *  each union is built fully and then published through the volatile write, so a CFT thread never observes a
+     *  half-built map. GADDED/GFIELD/GIFACE stay NULL until at least one payload has produced them, preserving the
+     *  "not populated yet" contract the converter's early-outs rely on. */
+    public static synchronized void republish() {
+        Map<String,String[]> ga = null, gf = null;
+        Map<String,List<String[]>> gi = null;
+        Set<String> pc = new HashSet<>(), cr = new HashSet<>(), sh = new HashSet<>();
+        for (PayloadScope s : SCOPES) {
+            if (s.gadded != null) { if (ga == null) ga = new HashMap<>(); ga.putAll(s.gadded); }
+            if (s.gfield != null) { if (gf == null) gf = new HashMap<>(); gf.putAll(s.gfield); }
+            if (s.giface != null) { if (gi == null) gi = new HashMap<>();
+                for (var e : s.giface.entrySet()) gi.computeIfAbsent(e.getKey(), k -> new ArrayList<>()).addAll(e.getValue()); }
+            pc.addAll(s.payloadClasses); cr.addAll(s.callerRewritePrefixes); sh.addAll(s.sharedIfaces);
+        }
+        GADDED = ga; GFIELD = gf; GIFACE = gi;
+        PAYLOAD_CLASSES = pc; CALLER_REWRITE_PREFIXES = cr; SHARED_IFACES = sh;
+    }
+    /** Internal names of classes provided by the staged payload (the mod jar) — the UNION over every live payload;
+     *  the per-payload set is {@code PayloadScope.payloadClasses}. Assign through {@link #republish()}, never directly.
+     *  Lets us tell a mixin-ADDED payload
      *  "duck" interface (a real problem when used as a value type - the de-implemented target no longer satisfies it)
      *  from a pre-existing/vanilla interface the mixin merely also implements (whose type still exists and is used
      *  legitimately by real implementors elsewhere, so a descriptor mention of it is fine). */
@@ -613,7 +681,8 @@ public class RetransformConverter {
     public static boolean isPayloadIface(String internal) { return PAYLOAD_CLASSES.contains(internal); }
     /** Internal-name prefixes of DEPENDENCY runtime whose classes must be caller-rewritten too (their own code casts
      *  MC objects to duck interfaces the applied dependency mixins add, e.g. fabric-api's ClientLifecycleEventsImpl ->
-     *  (LoadedChunksCache) clientLevel). Matched by prefix since the classes are not in the payload jar. */
+     *  (LoadedChunksCache) clientLevel). Matched by prefix since the classes are not in the payload jar. UNION over
+     *  every live payload ({@code PayloadScope.callerRewritePrefixes}); assign through {@link #republish()}. */
     public static volatile Set<String> CALLER_REWRITE_PREFIXES = java.util.Collections.emptySet();
     public static boolean isCallerRewrite(String internal) {
         if (PAYLOAD_CLASSES.contains(internal)) return true;
@@ -624,7 +693,8 @@ public class RetransformConverter {
      *  a value of this interface type may be a genuine implementor OR a de-implemented (duck) target. Such interfaces
      *  are NOT erased from descriptors ("phantom": the interface type is legal per JVMS since it verifies like Object);
      *  their cast/instanceof/invokeinterface sites are always routed through DuckDispatch, which discriminates per
-     *  receiver (real interface call for genuine implementors, sidecar for duck targets). */
+     *  receiver (real interface call for genuine implementors, sidecar for duck targets). UNION over every live
+     *  payload ({@code PayloadScope.sharedIfaces}); assign through {@link #republish()}. */
     public static volatile Set<String> SHARED_IFACES = java.util.Collections.emptySet();
     public static boolean isSharedIface(String internal) { return SHARED_IFACES.contains(internal); }
 
@@ -643,48 +713,68 @@ public class RetransformConverter {
         return impls.size() == 1 && isPayloadIface(iface) && !isSharedIface(iface);
     }
 
-    String[] addedFieldTarget(String owner, String name, String desc) {
-        if (GFIELD == null) return null;
-        for (String c = owner; c != null && !c.equals("java/lang/Object"); c = superOf(c)) { String[] g = GFIELD.get(gkey(c, name, desc)); if (g != null) return g; }
+    String[] addedFieldTarget(String owner, String name, String desc) { return gLookup(GFIELD, scope, owner, name, desc); }
+
+    /** Walk {@code owner}'s hierarchy looking for a relocated member, trying {@code preferred}'s entry at each level
+     *  before the other payloads'. Keys are scope-qualified, so a level can carry one entry per payload; preferring the
+     *  asking payload's own means a mixin body relocated for payload A resolves to A's sidecar even when payload B
+     *  added a same-signature member to the same class. A null {@code preferred} searches every scope in order. */
+    static String[] gLookup(Map<String,String[]> table, PayloadScope preferred, String owner, String name, String desc) {
+        if (table == null) return null;
+        String c = owner;
+        for (int guard = 0; c != null && !c.equals("java/lang/Object") && guard++ < 256; c = superOf(c)) {
+            if (preferred != null) { String[] g = table.get(gkey(preferred, c, name, desc)); if (g != null) return g; }
+            for (PayloadScope s : SCOPES) {
+                if (s == preferred) continue;
+                String[] g = table.get(gkey(s, c, name, desc)); if (g != null) return g;
+            }
+        }
         return null;
     }
-    static String gkey(String owner, String name, String desc) { return owner + " " + name + " " + desc; }
-    public static void collectAdded(String internal, byte[] O, byte[] X, Map<String,String[]> gMethods, Map<String,String[]> gFields, Map<String,List<String[]>> gIfaces) {
+    /** Global table key. The scope key leads so that a relocated member is addressed per PAYLOAD as well as per target;
+     *  {@link #gkeyMemberName} is the matching decoder. Neither a scope key, an internal name nor a descriptor can
+     *  contain a space, so the four parts stay unambiguous. */
+    static String gkey(PayloadScope scope, String owner, String name, String desc) { return scope.key + " " + owner + " " + name + " " + desc; }
+    /** Recover the member NAME from a {@link #gkey}, given the owner recorded alongside it. Null if the key does not
+     *  have the expected shape. */
+    static String gkeyMemberName(String key, String owner) {
+        int sc = key.indexOf(' ');
+        if (sc < 0) return null;
+        String rest = key.substring(sc + 1);
+        int sp = rest.lastIndexOf(' ');
+        if (sp <= owner.length()) return null;
+        return rest.substring(owner.length() + 1, sp);
+    }
+    public static void collectAdded(PayloadScope scope, String internal, byte[] O, byte[] X, Map<String,String[]> gMethods, Map<String,String[]> gFields, Map<String,List<String[]>> gIfaces) {
         ClassNode o = read(O), x = read(X); Set<String> om = keysM(o), of = keysF(o);
-        String sc = sidecarInternal(internal);
+        String sc = sidecarInternal(scope, internal);
         for (MethodNode m : x.methods) { String k = m.name + " " + m.desc;
             if (!om.contains(k) && !m.name.equals("<clinit>") && !m.name.equals("<init>"))
-                gMethods.put(gkey(internal, m.name, m.desc), new String[]{internal, sc, (m.access & Opcodes.ACC_STATIC) != 0 ? "1" : "0"}); }
+                gMethods.put(gkey(scope, internal, m.name, m.desc), new String[]{internal, sc, (m.access & Opcodes.ACC_STATIC) != 0 ? "1" : "0"}); }
         for (FieldNode f : x.fields) { if (!of.contains(f.name + " " + f.desc))
-            gFields.put(gkey(internal, f.name, f.desc), new String[]{internal, sc, (f.access & Opcodes.ACC_STATIC) != 0 ? "S" : "I"}); }
+            gFields.put(gkey(scope, internal, f.name, f.desc), new String[]{internal, sc, (f.access & Opcodes.ACC_STATIC) != 0 ? "S" : "I"}); }
         for (String i : x.interfaces) if (!o.interfaces.contains(i)) {
             List<String[]> impls = gIfaces.computeIfAbsent(i, k -> new ArrayList<>());
+            // Dedup within THIS payload only. A second payload adding the same interface to the same target is a
+            // distinct implementation with its own sidecar and must be recorded separately, not swallowed.
             boolean duplicate = false;
-            for (String[] impl : impls) if (impl[0].equals(internal)) { duplicate = true; break; }
-            if (!duplicate) impls.add(new String[]{internal, sc});
+            for (String[] impl : impls) if (impl[0].equals(internal) && scope.key.equals(impl[2])) { duplicate = true; break; }
+            if (!duplicate) impls.add(new String[]{internal, sc, scope.key});
         }
     }
     /** resolve a call to a mixin-added method: walk the receiver type's hierarchy to the target that declared it. */
     String[] addedCall(String owner, String name, String desc, boolean callStatic) {
-        if (GADDED == null) return null;
-        String c = owner;
-        for (int guard = 0; c != null && !c.equals("java/lang/Object") && guard++ < 256; c = superOf(c)) {
-            String[] g = GADDED.get(gkey(c, name, desc));
-            if (g != null) return callStatic == "1".equals(g[2]) ? g : null;
-        }
-        return null;
+        String[] g = gLookup(GADDED, scope, owner, name, desc);
+        return g == null ? null : (callStatic == "1".equals(g[2]) ? g : null);
     }
     String[] addedCallTarget(MethodInsnNode mi) { return addedCall(mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC); }
     /** Static variant of {@link #addedCall} over the global GADDED map, for the live caller-rewrite path
-     *  ({@link #rewriteCaller}). Walks the receiver type's hierarchy to the target that declared the added method. */
-    static String[] addedCallStatic(String owner, String name, String desc, boolean callStatic) {
-        if (GADDED == null || name.equals("<init>") || name.equals("<clinit>")) return null;
-        String c = owner;
-        for (int guard = 0; c != null && !c.equals("java/lang/Object") && guard++ < 256; c = superOf(c)) {
-            String[] g = GADDED.get(gkey(c, name, desc));
-            if (g != null) return callStatic == "1".equals(g[2]) ? g : null;
-        }
-        return null;
+     *  ({@link #rewriteCaller}). Walks the receiver type's hierarchy to the target that declared the added method.
+     *  {@code scope} is the payload the class being rewritten belongs to (null = unknown -> search every payload). */
+    static String[] addedCallStatic(PayloadScope scope, String owner, String name, String desc, boolean callStatic) {
+        if (name.equals("<init>") || name.equals("<clinit>")) return null;
+        String[] g = gLookup(GADDED, scope, owner, name, desc);
+        return g == null ? null : (callStatic == "1".equals(g[2]) ? g : null);
     }
 
     /** SIDECAR-relocation path: can the sidecar legally name this type in a CHECKCAST? Inaccessible iff the type is
@@ -1096,9 +1186,14 @@ public class RetransformConverter {
         return m;
     }
 
-    /** Schema-neutral payload-caller rewrite for interfaces dropped from already-loaded targets. */
-    public static byte[] rewriteCaller(byte[] callerBytes, Map<String,List<String[]>> ifaceMap) {
+    /** Schema-neutral payload-caller rewrite for interfaces dropped from already-loaded targets.
+     *
+     *  <p>{@code scope} is the payload whose class this is. It decides which payload's relocated members an ambiguous
+     *  call site resolves to, and which payload's {@code $State} a reflective added-field access is routed to. Null is
+     *  accepted (no payload claims the class) and falls back to searching every scope. */
+    public static byte[] rewriteCaller(byte[] callerBytes, Map<String,List<String[]>> ifaceMap, PayloadScope scope) {
         ClassNode c = read(callerBytes); int n = 0;
+        String scopeKey = scope == null ? "" : scope.key;
         for (MethodNode m : c.methods) {
             if (m.instructions == null) continue;
             for (AbstractInsnNode p = m.instructions.getFirst(), nx; p != null; p = nx) {
@@ -1129,19 +1224,19 @@ public class RetransformConverter {
                     }
                     n++;
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() != Opcodes.INVOKEINTERFACE
-                        && addedCallStatic(mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC) != null) {
+                        && addedCallStatic(scope, mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC) != null) {
                     // Call to a mixin-ADDED method (relocated to a sidecar) reached via a CONCRETE-class
                     // INVOKEVIRTUAL/INVOKESPECIAL/INVOKESTATIC rather than through a duck interface. the payload routes added
                     // methods through duck interfaces (handled above); clients that OVERRIDE an inherited vanilla
                     // method call the concrete class directly, so redirect those sites to the sidecar static exactly
                     // as rewriteRefs does — preserving the mixin override behavior instead of silently dispatching to
                     // the surviving inherited implementation.
-                    String[] g = addedCallStatic(mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC);
+                    String[] g = addedCallStatic(scope, mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC);
                     String ot = g[0], os = g[1]; boolean gStatic = "1".equals(g[2]);
                     String nd = eraseIfaceDesc(gStatic ? mi.desc : "(L" + ot + ";" + mi.desc.substring(1));
                     m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "h$" + mi.name, nd, false));
                     n++;
-                } else if (p instanceof MethodInsnNode mi && rewriteReflectSite(m, mi)) {
+                } else if (p instanceof MethodInsnNode mi && rewriteReflectSite(m, mi, scopeKey)) {
                     n++;   // route a reflective added-field access (getDeclaredField + Field.get/set) to $State
                 }
             }
@@ -1169,17 +1264,26 @@ public class RetransformConverter {
 
     /** Route a payload's reflective added-field access to mcgraft.rt.StateReflect: {@code Class.getDeclaredField} and
      *  {@code Field.get/set(...)} become static shim calls (Field prepended) so a relocated ($State) field resolves.
-     *  Non-relocated fields pass through the shim unchanged, so this is safe to apply to every such site. */
-    static boolean rewriteReflectSite(MethodNode m, MethodInsnNode mi) {
+     *  Non-relocated fields pass through the shim unchanged, so this is safe to apply to every such site.
+     *
+     *  <p>{@code scopeKey} (pushed as a third argument to {@code declaredField}) says WHICH payload's relocated field
+     *  is meant: {@code StateReflect}'s table is keyed by (payload, target, field), because two payloads can each add a
+     *  field of the same name to the same Minecraft class and each has its own {@code $State}. The {@code Field.get/set}
+     *  variants need no such argument — they discriminate on the {@code $State} class the Field is declared by, and
+     *  that class name already carries the payload. */
+    static boolean rewriteReflectSite(MethodNode m, MethodInsnNode mi, String scopeKey) {
         if (mi.getOpcode() != Opcodes.INVOKEVIRTUAL) return false;
         if (mi.owner.equals("java/lang/Class") && mi.name.equals("getDeclaredField") && mi.desc.equals("(Ljava/lang/String;)Ljava/lang/reflect/Field;")) {
+            m.instructions.insertBefore(mi, new LdcInsnNode(scopeKey));
             m.instructions.set(mi, new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/StateReflect", "declaredField",
-                "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;", false));
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/reflect/Field;", false));
+            recordRtCall("mcgraft/rt/StateReflect", "declaredField", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/reflect/Field;");
             return true;
         }
         if (mi.owner.equals("java/lang/reflect/Field") && REFLECT_FIELD_OPS.contains(mi.name)) {
-            m.instructions.set(mi, new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/StateReflect", mi.name,
-                "(Ljava/lang/reflect/Field;" + mi.desc.substring(1), false));
+            String d = "(Ljava/lang/reflect/Field;" + mi.desc.substring(1);
+            m.instructions.set(mi, new MethodInsnNode(Opcodes.INVOKESTATIC, "mcgraft/rt/StateReflect", mi.name, d, false));
+            recordRtCall("mcgraft/rt/StateReflect", mi.name, d);
             return true;
         }
         return false;
