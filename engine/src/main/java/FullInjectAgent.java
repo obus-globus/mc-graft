@@ -384,6 +384,7 @@ public class FullInjectAgent {
             throw new IllegalStateException("Late-attach sidecar definition gate failed");
         }
         InjectionLogger.info("converted "+conv+" targets ("+eager+" sidecars eager-defined); ifaceMap="+ifaceMap.size()+" interfaces; skipped="+skipped.size()+(skipped.isEmpty()?"":" "+skipped));
+        InjectionLogger.info("type-flow gate: "+TypeFlowGate.cost());
         InjectionLogger.info("ifaceMap keys: " + ifaceMap.keySet());
         for (var ie : ifaceMap.entrySet()) for (String[] impl : ie.getValue())
             mcgraft.rt.DuckDispatch.register(ie.getKey(), impl[0], impl[1], impl[2]);
@@ -1038,7 +1039,11 @@ public class FullInjectAgent {
                 mcCls.getMethod("execute", Runnable.class).invoke(mc, restore);
                 // If the main-thread restore runnable (which releases the gate via restoreAndOpen) never completes,
                 // release the gate here too so a stalled/failed activation cannot leave multiplayer locked out.
-                try{done.get(60,TimeUnit.SECONDS);}
+                // Same terminal line the SYNCHRONOUS path logs. Without it a payload with a readiness probe
+                // (LiquidBounce) never reports completion at all, on any platform — measured on this VM and in the
+                // user's Windows log — so every consumer of that line, the world-join harness included, reads a
+                // healthy async injection as "never completed".
+                try{done.get(60,TimeUnit.SECONDS);if(!LateAttachVerifier.hasFatalErrors())InjectionLogger.info("payload injection complete");}
                 catch(TimeoutException t){LateAttachVerifier.warn("REGISTRY_RESTORE_MAIN_THREAD_TIMEOUT","registries","bootstrap","Main thread did not finish activation/restore within 60 seconds; applying state fallback");if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
                 catch(InterruptedException t){Thread.currentThread().interrupt();if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}
                 catch(ExecutionException t){LateAttachVerifier.error("REGISTRY_RESTORE_TASK_FAILURE","registries","bootstrap",rootMsg(t));if(finalized.compareAndSet(false,true)){closeThaw(thaw);mcgraft.rt.JoinGate.cancelAndOpen();}else closeThaw(thaw);}

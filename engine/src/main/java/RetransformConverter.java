@@ -789,6 +789,50 @@ public class RetransformConverter {
      *  outlive its truth. */
     private static final Set<String> COLLAPSE_DECLINED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** May bytecode written INTO {@code fromClass} name {@code internal} — i.e. can it appear as a CHECKCAST/NEW/
+     *  INSTANCEOF operand or a field/method owner there? Public, or same runtime package. Unknown bytes ({@code -1})
+     *  answer YES: that is the long-standing conservative default of the caller-path Resolver and of
+     *  {@code typeInaccessibleFromSidecar}, and flipping it would erase casts we have no evidence are illegal.
+     *
+     *  <p>Array descriptors are answered by their element type; primitives and unknown shapes are always nameable. */
+    static boolean typeNameableFrom(String internal, String fromClass) {
+        if (internal == null || internal.isEmpty()) return true;
+        if (internal.charAt(0) == '[') {                       // "[[Lfoo/Bar;" -> foo/Bar ; "[I" -> nameable
+            int i = 0; while (i < internal.length() && internal.charAt(i) == '[') i++;
+            if (i >= internal.length() || internal.charAt(i) != 'L') return true;
+            return typeNameableFrom(internal.substring(i + 1, internal.length() - 1), fromClass);
+        }
+        int acc = classAccess(internal);
+        if (acc < 0) return true;
+        if ((acc & Opcodes.ACC_PUBLIC) != 0) return true;
+        return pkg(internal).equals(pkg(fromClass));
+    }
+
+    /** Does {@code desc} (a method descriptor) mention any type {@code fromClass} may not name?
+     *
+     *  <p>This is the SECOND half of the erasure invariant, and the half that was missing. A value whose type
+     *  {@code fromClass} cannot name can never be TYPED as that type inside {@code fromClass}: every producer of one —
+     *  {@link #rewriteAwCtorInline}, {@link #rewriteAwMethodInline}, {@link #rewriteFieldAw} — deliberately omits the
+     *  CHECKCAST that would name it (it would be IllegalAccessError) and leaves {@code java/lang/Object} on the stack.
+     *  So emitting a CALL whose descriptor demands that exact type is a guaranteed {@code VerifyError: Bad type on
+     *  operand stack} at first link — no matter that the descriptor mention is itself legal (JVMS 5.4.4 access control
+     *  covers the referenced class and member, not the descriptor's types, which is why the JVM gets far enough to
+     *  complain about assignability rather than access).
+     *
+     *  <p>MEASURED: LiquidBounce's {@code MixinAbstractContainerScreen.hookDrawSlot} does
+     *  {@code ((MixinMouseHandlerAccessor) mc.mouseHandler).setLastClick(new MouseHandler.LastClick(...))}. The duck
+     *  collapse is CORRECT there (the implementor is the public {@code MouseHandler}), but the resulting
+     *  {@code h$setLastClick(LMouseHandler;LMouseHandler$LastClick;)V} was emitted into
+     *  {@code AbstractContainerScreen$$Sidecar}, in {@code ...gui.screens.inventory}, while {@code LastClick} is
+     *  package-private in {@code net.minecraft.client} — and the argument had just come back from
+     *  {@code AwReflect.newInst} as an Object. Opening the inventory killed the client. */
+    static boolean descHasUnnameable(String desc, String fromClass) {
+        if (desc == null || desc.isEmpty() || desc.charAt(0) != '(') return false;
+        for (Type a : Type.getArgumentTypes(desc)) if (!typeNameableFrom(typeName(a), fromClass)) return true;
+        Type r = Type.getReturnType(desc);
+        return r.getSort() != Type.VOID && !typeNameableFrom(typeName(r), fromClass);
+    }
+
     String[] addedFieldTarget(String owner, String name, String desc) { return gLookup(GFIELD, scope, owner, name, desc); }
 
     /** Walk {@code owner}'s hierarchy looking for a relocated member, trying {@code preferred}'s entry at each level
@@ -939,10 +983,7 @@ public class RetransformConverter {
      *  assume accessible (don't erase), matching the caller-path Resolver's conservative default. */
     boolean typeInaccessibleFromSidecar(String internal) {
         if (internal == null || internal.isEmpty() || internal.charAt(0) == '[') return false;
-        int acc = classAccess(internal);
-        if (acc < 0) return false;
-        if ((acc & Opcodes.ACC_PUBLIC) != 0) return false;
-        return !pkg(internal).equals(pkg(sidecar));
+        return !typeNameableFrom(internal, sidecar);
     }
 
     /** Rewrite references to added members (field->accessor, method->sidecar static, invokedynamic Handle->
@@ -968,7 +1009,17 @@ public class RetransformConverter {
                 }
             } else if (GIFACE != null && p instanceof MethodInsnNode gmi && gmi.getOpcode() == Opcodes.INVOKEINTERFACE && GIFACE.containsKey(gmi.owner)) {
                 List<String[]> impls = GIFACE.get(gmi.owner);
-                if (canCollapse(gmi.owner, impls)) {
+                if (descHasUnnameable(gmi.desc, sidecar)) {
+                    // Neither the collapsed h$ call nor the ifd$ trampoline can be used: both keep the interface
+                    // method's own argument/return types in their descriptor, and this class cannot produce a value of
+                    // one (see descHasUnnameable). The fully-boxed dispatcher names nothing but java/lang/Object, and
+                    // Method.invoke does the type check we cannot express in bytecode here.
+                    if (DUCK_BOXED.add(gmi.owner + "." + gmi.name + gmi.desc + " <- " + sidecar))
+                        InjectionLogger.info("duck call " + gmi.owner + "." + gmi.name + gmi.desc + " routed through the boxed"
+                            + " DuckDispatch.invoke from " + sidecar + ": its descriptor names a type that class may not"
+                            + " name, so no typed call site can be given an argument of it");
+                    rewriteDuckInvokeInline(m, gmi, this::typeInaccessibleFromSidecar);
+                } else if (canCollapse(gmi.owner, impls)) {
                     String[] ts = impls.get(0);
                     m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + gmi.name, "(L" + ts[0] + ";" + gmi.desc.substring(1), false));
                 } else {
@@ -1314,6 +1365,9 @@ public class RetransformConverter {
             || name.equals("STATE") || name.equals("getState") || name.equals("initState");
     }
 
+    /** Log-dedupe for the boxed-duck-call decision (one line per site shape per emitting class). */
+    private static final Set<String> DUCK_BOXED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     static String ifaceTrampName(String iface, String name, String desc) {
         return "ifd$" + mangle(name) + "__" + mangle(iface + "|" + desc);
     }
@@ -1373,11 +1427,13 @@ public class RetransformConverter {
                     n++;
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() == Opcodes.INVOKEINTERFACE && ifaceMap.containsKey(mi.owner)) {
                     List<String[]> impls = ifaceMap.get(mi.owner);
-                    if (canCollapse(mi.owner, impls)) {
+                    // Same rule as the sidecar path in rewriteRefs: a descriptor naming a type THIS class may not name
+                    // cannot be fed from here, because rewritePayloadAw erases exactly those CHECKCASTs to Object.
+                    if (canCollapse(mi.owner, impls) && !descHasUnnameable(mi.desc, c.name)) {
                         String[] ts = impls.get(0);
                         m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, ts[1], "h$" + mi.name, "(L" + ts[0] + ";" + mi.desc.substring(1), false));
                     } else {
-                        rewriteDuckInvokeInline(m, mi);
+                        rewriteDuckInvokeInline(m, mi, t -> !typeNameableFrom(t, c.name));
                     }
                     n++;
                 } else if (p instanceof MethodInsnNode mi && mi.getOpcode() != Opcodes.INVOKEINTERFACE
@@ -1446,8 +1502,10 @@ public class RetransformConverter {
         return false;
     }
 
-    /** Spill an interface invocation to fresh locals and call the generic dispatcher without adding a helper method. */
-    static void rewriteDuckInvokeInline(MethodNode m, MethodInsnNode mi) {
+    /** Spill an interface invocation to fresh locals and call the generic dispatcher without adding a helper method.
+     *  {@code inacc} decides whether the returned Object may be CHECKCAST back to the declared return type — a return
+     *  type the emitting class cannot name has to stay an Object, exactly as at every other erasure site. */
+    static void rewriteDuckInvokeInline(MethodNode m, MethodInsnNode mi, Predicate<String> inacc) {
         Type[] at = Type.getArgumentTypes(mi.desc); Type rt = Type.getReturnType(mi.desc);
         int next = m.maxLocals, receiver = next++;
         int[] slots = new int[at.length];
@@ -1462,7 +1520,7 @@ public class RetransformConverter {
             in.add(new VarInsnNode(at[i].getOpcode(Opcodes.ILOAD),slots[i]));box(in,at[i]);in.add(new InsnNode(Opcodes.AASTORE));}
         in.add(new MethodInsnNode(Opcodes.INVOKESTATIC,"mcgraft/rt/DuckDispatch","invoke",
             "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",false));
-        adaptInlineResult(in,rt,false,NEVER_INACC);
+        adaptInlineResult(in,rt,true,inacc);
         m.instructions.insertBefore(mi,in);m.instructions.remove(mi);m.maxLocals=Math.max(m.maxLocals,next);
     }
 

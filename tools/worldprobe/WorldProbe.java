@@ -81,7 +81,12 @@ public class WorldProbe {
 
         Object level  = fieldVal(mc, mcCls, "level");
         Object player = fieldVal(mc, mcCls, "player");
-        Object screen = fieldVal(mc, mcCls, "screen");
+        // 26.2 moved the current screen off Minecraft onto Gui (Minecraft.gui.screen). Reading Minecraft.screen just
+        // returns null in every state, including the title screen — so every "mc.screen = ..." this probe printed said
+        // "no GUI open", and any assertion built on it was vacuous. Old field kept as a fallback for older versions.
+        Object gui = fieldVal(mc, mcCls, "gui");
+        Object screen = gui == null ? null : fieldVal(gui, gui.getClass(), "screen");
+        if (screen == null) screen = fieldVal(mc, mcCls, "screen");
         s.append("IN_WORLD = ").append(level != null).append('\n');
         s.append("  mc.level  = ").append(level == null ? "null" : level.getClass().getName()).append('\n');
         s.append("  mc.player = ").append(player == null ? "null" : player.getClass().getName()).append('\n');

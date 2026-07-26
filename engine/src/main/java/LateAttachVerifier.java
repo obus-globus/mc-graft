@@ -28,6 +28,10 @@ public final class LateAttachVerifier {
         scan(owner, "target", target, removedMethods, removedFields, droppedIfaces);
         scan(owner, "sidecar", sidecar, removedMethods, removedFields, droppedIfaces);
         scan(owner, "state", state, removedMethods, removedFields, droppedIfaces);
+        // TYPE FLOW, on the sidecar only. It is the class the converter REWRITES most (relocated bodies, reflective
+        // lowerings, erased CHECKCASTs) and the one whose link is deferred to first gameplay use, so it is where a
+        // VerifyError both originates and hides. target' is the class the JVM already accepted, minus members.
+        TypeFlowGate.check(owner, "sidecar", sidecar);
         return localErrors() == before;
     }
 
@@ -43,6 +47,7 @@ public final class LateAttachVerifier {
         verifySchema(owner, "caller", baseline, candidate);
         scan(owner, "caller", candidate, removedMethods, removedFields, droppedIfaces);
         detectAccessorStubs(owner, candidate);
+        TypeFlowGate.check(owner, "caller", candidate, false);   // rewriteCaller + rewritePayloadAw erase casts here too
         return localErrors() == before;
     }
 

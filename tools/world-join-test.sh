@@ -69,6 +69,7 @@ AGENT_DIR="${AGENT_DIR:-/tmp/mcgraft-mp-agents}"
 OUT_ROOT="${OUT_ROOT:-/tmp/mcgraft-world}"
 PROBE_JAR="${PROBE_JAR:-$REPO/tools/worldprobe/worldprobe.jar}"
 ERROR_JAR="${ERROR_JAR:-$REPO/tools/worldprobe/erroragent.jar}"
+LINK_JAR="${LINK_JAR:-$REPO/tools/worldprobe/linkprobe.jar}"
 ATTACH_CP="${ATTACH_CP:-$REPO/tools/worldprobe}"      # dir holding Attach.class
 WORLD_NAME="${WORLD_NAME:-P5Flat}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
@@ -77,6 +78,7 @@ SETTLE_QUIET="${SETTLE_QUIET:-20}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-180}"
 ZOOM_SETTLE="${ZOOM_SETTLE:-3}"      # seconds to hold a zoom key before measuring (Zoomify animates in ~1s)
 SKIP_POSITIVE_CONTROL="${SKIP_POSITIVE_CONTROL:-0}"
+DUMP_DIR="${DUMP_DIR:-}"             # set to a dir to have the agent write every class it defines (sidecars) there
 
 DO_PACK=1
 [ "${1:-}" = "--no-pack" ] && { DO_PACK=0; shift; }
@@ -96,7 +98,7 @@ export DISPLAY="$MC_DISPLAY"
 payload_jar() { case "$1" in
     zoomify) echo "${ZOOMIFY_JAR:-/tmp/zoomify-2.16.126.2.jar}" ;;
     wurst)   echo "${WURST_JAR:-/tmp/wurst/build/libs/Wurst-Client-v7.54-MC26.2.jar}" ;;
-    liquidbounce) echo "${LIQUIDBOUNCE_JAR:-/tmp/lbpay.jar}" ;;
+    liquidbounce) echo "${LIQUIDBOUNCE_JAR:-/tmp/lb-real-0.39.0.jar}" ;;
     *) echo "" ;; esac; }
 payload_cfg() { case "$1" in
     zoomify) echo "${ZOOMIFY_CFG:-/tmp/zoomify.properties}" ;;
@@ -144,14 +146,19 @@ hdr "preflight"
 [ -f "$MC_JAR" ]     || envdie "minecraft client jar not found: $MC_JAR"
 [ -d "$GAME_DIR" ]   || envdie "game dir not found: $GAME_DIR"
 # The probe/attach helpers are tiny single-file agents; build them on demand rather than checking in class files.
-if [ ! -f "$PROBE_JAR" ] || [ ! -f "$ERROR_JAR" ] || [ ! -f "$ATTACH_CP/Attach.class" ]; then
+if [ ! -f "$PROBE_JAR" ] || [ ! -f "$ERROR_JAR" ] || [ ! -f "$LINK_JAR" ] || [ ! -f "$ATTACH_CP/Attach.class" ] \
+   || [ "$REPO/tools/worldprobe/LinkProbe.java"  -nt "$LINK_JAR" ] \
+   || [ "$REPO/tools/worldprobe/WorldProbe.java" -nt "$PROBE_JAR" ] \
+   || [ "$REPO/tools/worldprobe/ErrorAgent.java" -nt "$ERROR_JAR" ]; then
     say "  building the probe agents in $REPO/tools/worldprobe"
     ( cd "$REPO/tools/worldprobe" \
-      && "${JAVA%/java}/javac" -d . WorldProbe.java ErrorAgent.java Attach.java \
+      && "${JAVA%/java}/javac" -d . WorldProbe.java ErrorAgent.java LinkProbe.java Attach.java \
       && printf 'Agent-Class: WorldProbe\nCan-Retransform-Classes: true\n' > manifest.txt \
       && printf 'Agent-Class: ErrorAgent\n' > manifest-err.txt \
+      && printf 'Agent-Class: LinkProbe\n' > manifest-link.txt \
       && "${JAVA%/java}/jar" cfm worldprobe.jar manifest.txt WorldProbe*.class \
-      && "${JAVA%/java}/jar" cfm erroragent.jar manifest-err.txt ErrorAgent*.class ) \
+      && "${JAVA%/java}/jar" cfm erroragent.jar manifest-err.txt ErrorAgent*.class \
+      && "${JAVA%/java}/jar" cfm linkprobe.jar manifest-link.txt LinkProbe*.class ) \
       > "$OUT/build-probes.log" 2>&1 || { cat "$OUT/build-probes.log"; envdie "could not build the probe agents"; }
 fi
 [ -f "$PROBE_JAR" ]  || envdie "world probe jar not built: $PROBE_JAR"
@@ -209,6 +216,7 @@ pkill -9 -f "knot.KnotClient" 2>/dev/null; pkill -9 -f jcef_helper 2>/dev/null; 
 mkdir -p "$XDG_RT"
 nohup env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u XAUTHORITY DISPLAY="$MC_DISPLAY" XDG_RUNTIME_DIR="$XDG_RT" \
     "$JAVA" -Xmx2G --enable-native-access=ALL-UNNAMED -Djava.awt.headless=false \
+    ${DUMP_DIR:+-Dmcgraft.agent.dumpDir=$DUMP_DIR} \
     -Dfabric.gameJarPath="$MC_JAR" \
     -cp "$(cat "$MC_CP_FILE")" net.fabricmc.loader.impl.launch.knot.KnotClient \
     --username Dev --version "$MC_VERSION" --gameDir "$GAME_DIR" --assetsDir "$ASSETS_DIR" --assetIndex "$ASSET_INDEX" \
@@ -283,13 +291,23 @@ inject_and_assert() {
     local rc=$?
     say "  mcgraft inject exit=$rc  (cli: $cli)"
 
+    # 'payload injection complete' is not universal: a payload whose bootstrap is ASYNC (LiquidBounce runs off a
+    # ClientStartEvent) never reaches that line, on this VM or on the user's Windows client. Waiting for it alone
+    # burns the whole INJECT_TIMEOUT on every such run, so the payload's own bootstrap marker also ends the wait,
+    # followed by a quiet-period settle because that marker fires before the post-activation resource reload.
     local d=$((SECONDS + INJECT_TIMEOUT))
     while [ $SECONDS -lt $d ]; do
-        [ -f "$log" ] && grep -qE "payload injection complete|re-injection refused|\[ERROR\]" "$log" && break
+        [ -f "$log" ] && grep -qE "payload injection complete|re-injection refused|\[ERROR\]${marker:+|$marker}" "$log" && break
         kill -0 "$MC_PID" 2>/dev/null || break
         sleep 3
     done
-    sleep 3
+    local iprev="" istable=0 iend=$((SECONDS + 90))
+    while [ $istable -lt 3 ] && [ $SECONDS -lt $iend ]; do
+        sleep 5
+        kill -0 "$MC_PID" 2>/dev/null || break
+        local icur; icur=$(wc -c < "$log" 2>/dev/null || echo 0)
+        if [ "$icur" = "$iprev" ]; then istable=$((istable+1)); else istable=0; fi; iprev=$icur
+    done
 
     if [ ! -s "$log" ]; then
         bad "$slot/ATTACH_ACCEPTED" "no injection log was written at all — the agent never ran"; sed 's/^/        /' "$cli"; return
@@ -338,15 +356,57 @@ fi
 POST_INJECT_OFF=$(( $(logsize) + 1 ))
 shot 01-title-injected
 
+# ---- SIDECAR LINKAGE --------------------------------------------------------------------------------------------
+# The broadest test in this file, and the one whose absence let a VerifyError ship. Every sidecar is DEFINED at
+# attach but VERIFIED only on FIRST USE, and "first use" is a different piece of gameplay for each one — so a
+# malformed sidecar is invisible until somebody happens to perform that interaction. LinkProbe initializes every
+# defined sidecar, which forces verification of all of them at once, from the title screen. See its header for what
+# this does and does not prove (it finds VERIFY-time faults; IllegalAccessError still needs the instruction to run).
+hdr "sidecar linkage (forces verification of every defined sidecar)"
+if [ ! -f "$LINK_JAR" ]; then
+    bad "SIDECAR_LINKAGE" "linkprobe.jar not built"
+elif ! kill -0 "$MC_PID" 2>/dev/null; then
+    bad "SIDECAR_LINKAGE" "client is not alive"
+else
+    "$JAVA" -cp "$ATTACH_CP" Attach "$MC_PID" "$LINK_JAR" "$OUT/linkprobe.txt" > "$OUT/linkprobe.attach.log" 2>&1
+    LINKED="$(grep -m1 -oE 'LINKED_OK = [0-9]+'        "$OUT/linkprobe.txt" 2>/dev/null | grep -oE '[0-9]+$')"
+    VFAIL="$( grep -m1 -oE 'VERIFY_FAILURES = [0-9]+'  "$OUT/linkprobe.txt" 2>/dev/null | grep -oE '[0-9]+$')"
+    IFAIL="$( grep -m1 -oE 'INIT_FAILURES = [0-9]+'    "$OUT/linkprobe.txt" 2>/dev/null | grep -oE '[0-9]+$')"
+    if [ -z "$LINKED" ]; then
+        bad "SIDECAR_LINKAGE" "the link probe produced no report; see $OUT/linkprobe.attach.log"
+    elif [ "$VFAIL" != 0 ] || [ "$IFAIL" != 0 ]; then
+        bad "SIDECAR_LINKAGE" "$VFAIL sidecar(s) failed VERIFICATION, $IFAIL failed <clinit> (${LINKED} linked cleanly):"
+        grep -E '^  (VERIFY|INIT) ' "$OUT/linkprobe.txt" | head -5 | cut -c1-300 | sed 's/^/      /'
+    elif [ "$LINKED" -lt 1 ]; then
+        bad "SIDECAR_LINKAGE" "0 sidecars were linked — nothing was tested, so a clean verdict is meaningless"
+    else
+        ok "SIDECAR_LINKAGE" "$LINKED sidecars initialized (= verified) with 0 VerifyError/LinkageError"
+    fi
+fi
+
 # ---- JOIN THE WORLD ---------------------------------------------------------------------------------------------
 # This is the step no run in this repo's history had ever taken.
 hdr "joining world '$WORLD_NAME'"
 kill -0 "$MC_PID" 2>/dev/null || envdie "client died before the world join"
+# Taken HERE, not after the gamerule commands. POST_JOIN_OFF used to be sampled after them, so a client that died
+# DURING the join wrote its whole crash report before the window even opened and the scan then reported "0 lines" —
+# measured on the 20260726-161400 run, which crashed with a NoSuchFieldError on the first entity tick and still
+# passed NO_INWORLD_LINK_FAILURE.
+JOIN_START_OFF=$(( $(logsize) + 1 ))
 xdotool windowactivate "$WID"; sleep 1
-xdotool mousemove $((WX + 426)) $((WY + 235)); sleep 0.4; xdotool click 1; sleep 4    # Singleplayer
+# LiquidBounce REPLACES the title screen with its own layout, so the vanilla Singleplayer button is not where
+# vanilla puts it. Measured off shots/02-world-list.png of the 20260726-155745-liquidbounce run: LB's button is at
+# window-relative (138,113), vanilla's at (426,235). A run that clicks the wrong spot reports "IN_WORLD = false"
+# and every in-world assertion after it becomes meaningless, so this is per-payload data, not a guess.
+SP_XY="426 235"; WORLD_XY="349 136"
+# LB also replaces the world-select screen: its search box is NOT auto-focused and the first world row sits lower
+# and wider than vanilla's. Both pairs were read off the shots of runs 20260726-155745 / 20260726-161019.
+for _id in "$A_ID" ${B_ID:+$B_ID}; do [ "$_id" = liquidbounce ] && { SP_XY="138 113"; WORLD_XY="806 159"; }; done
+read -r SP_X SP_Y <<< "$SP_XY"; read -r W_X W_Y <<< "$WORLD_XY"
+xdotool mousemove $((WX + SP_X)) $((WY + SP_Y)); sleep 0.4; xdotool click 1; sleep 4    # Singleplayer
 xdotool type --delay 60 "$WORLD_NAME"; sleep 2                                        # search box is auto-focused
 shot 02-world-list
-xdotool mousemove $((WX + 349)) $((WY + 136)); sleep 0.4; xdotool click --repeat 2 --delay 120 1
+xdotool mousemove $((WX + W_X)) $((WY + W_Y)); sleep 0.4; xdotool click --repeat 2 --delay 120 1
 
 d=$((SECONDS + JOIN_TIMEOUT)); joined=0
 while [ $SECONDS -lt $d ]; do
@@ -379,7 +439,7 @@ mc_cmd "/weather clear"
 mc_cmd "/kill @e[type=!player]"
 sleep 12   # let the chat lines fade out, or they would differ between the baseline and later frames
 
-POST_JOIN_OFF=$(( $(logsize) + 1 ))
+POST_JOIN_OFF="$JOIN_START_OFF"   # see JOIN_START_OFF above: the window must cover the join itself, not start after it
 
 probe 10-inworld-base
 shot  10-inworld-base
@@ -523,6 +583,59 @@ if [ "$A_ID" = wurst ] || [ "$B_ID" = wurst ]; then
     else
         bad "WURST_SIDE_EFFECT" "sensitivity did not move (base=$SENS_BASE zoom=$SW release=$SR)"
     fi
+fi
+
+# ---- INVENTORY SCREEN -------------------------------------------------------------------------------------------
+# The step whose absence let a VerifyError ship.
+#
+# A sidecar is DEFINED at attach but VERIFIED and LINKED only on FIRST USE. AbstractContainerScreen's sidecar is
+# reached from AbstractContainerScreen.extractContents, i.e. only while a container screen is on screen — so the
+# title screen, the world join and every zoom measurement above leave it untouched. A real Windows client with
+# LiquidBounce injected died the instant the inventory opened:
+#
+#   VerifyError: Bad type on operand stack
+#     net/minecraft/client/gui/screens/inventory/AbstractContainerScreen$$Sidecar$liquidbounce
+#       .h$handler$bgo000$hookDrawSlot ... @224: invokestatic
+#     Reason: Type 'java/lang/Object' is not assignable to 'net/minecraft/client/MouseHandler$LastClick'
+#     at AbstractContainerScreen.extractContents -> InventoryScreen.extractRenderState
+#
+# Survival, not creative, so the screen is InventoryScreen (via AbstractRecipeBookScreen) — the exact chain in
+# the report. Restored to creative afterwards so the fixture is left as it was found.
+hdr "inventory screen (first use of AbstractContainerScreen's sidecar)"
+INV_OFF=$(( $(logsize) + 1 ))
+if kill -0 "$MC_PID" 2>/dev/null; then
+    mc_cmd "/gamemode survival"
+    xdotool windowactivate "$WID"; sleep 0.5
+    xdotool key e
+    # A VerifyError surfaces within a frame or two, but the crash report takes a moment to be written; give the
+    # scanner a chance to see it rather than racing it.
+    for _ in $(seq 1 6); do sleep 2; [ -n "$(scan_from "$INV_OFF")" ] && break; done
+    shot  40-inventory
+    probe 40-inventory
+    INV_SCREEN="$(grep -m1 'mc.screen' "$OUT/probe-40-inventory.txt" 2>/dev/null | sed 's/.*= //')"
+else
+    INV_SCREEN=""
+    note "client was already dead before the inventory step"
+fi
+INV_HITS="$(scan_from "$INV_OFF")"
+printf '%s' "$INV_HITS" > "$OUT/scan-inventory.txt"
+
+# Evidence the screen actually came up. Without it, "no errors while the inventory was open" would also be the
+# verdict for a run where E did nothing at all.
+if printf '%s' "$INV_SCREEN" | grep -q 'ContainerScreen\|InventoryScreen'; then
+    ok "INVENTORY_OPENED" "mc.screen = $INV_SCREEN"
+else
+    bad "INVENTORY_OPENED" "E did not put a container screen up (mc.screen = ${INV_SCREEN:-<no probe output>}); INVENTORY_RENDERS below therefore proves nothing"
+fi
+if [ -z "$INV_HITS" ]; then
+    ok "INVENTORY_RENDERS" "0 lines matching the linkage-failure pattern while the inventory rendered"
+else
+    bad "INVENTORY_RENDERS" "$(printf '%s' "$INV_HITS" | wc -l) line(s):"
+    printf '%s\n' "$INV_HITS" | head -5 | sed 's/^/        /'
+fi
+if kill -0 "$MC_PID" 2>/dev/null; then
+    xdotool key Escape; sleep 1
+    mc_cmd "/gamemode creative"
 fi
 
 # ---- log scan over the in-world window --------------------------------------------------------------------------
