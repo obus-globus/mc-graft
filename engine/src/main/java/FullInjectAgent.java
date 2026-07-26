@@ -1070,11 +1070,48 @@ public class FullInjectAgent {
                 byte[] rw=AccessorBridgeRewriter.rewrite(n.substring(0,n.length()-6),b);
                 if(!ifaces.isEmpty())rw=RetransformConverter.rewriteCaller(rw,ifaces,scope);
                 rw=RetransformConverter.rewritePayloadAw(rw,resolver);
+                if(RESIDUAL_PROBE)rw=spliceResidualProbe(rw);
                 if(!LateAttachVerifier.verifyCaller(n.substring(0,n.length()-6),b,rw,gadded,gfield,ifaces))failed++;
                 if(!Arrays.equals(b,rw))changed++;
             }catch(Throwable t){failed++;LateAttachVerifier.error("CALLER_PREFLIGHT_FAILURE",n,"caller",rootMsg(t));}
         }}catch(Throwable t){LateAttachVerifier.error("CALLER_PREFLIGHT_IO_FAILURE",String.valueOf(lbJar),"caller",rootMsg(t));failed++;}
         InjectionLogger.info("payload caller preflight: "+total+" classes, "+changed+" rewritten, "+failed+" failed");
+    }
+
+    // ---- in-situ POSITIVE CONTROL for the residual-reference gate ----------------------------------------------------
+    /** {@code -Dmcgraft.test.residualProbe=true}: splice ONE reference to a member the converter ACTUALLY relocated for
+     *  THIS payload (read straight out of {@link RetransformConverter#GADDED}) into one preflighted payload class, so a
+     *  real run can demonstrate that REMOVED_METHOD_REF fires on real converter output rather than only on a synthetic
+     *  unit fixture. A gate that has never fired proves nothing about a clean report.
+     *
+     *  <p>Safe by construction: {@code preflightPayloadClasses} DISCARDS the bytes it verifies (nothing is published
+     *  from there), so the spliced instruction can never reach the JVM. Off unless the property is set. */
+    static final boolean RESIDUAL_PROBE = Boolean.getBoolean("mcgraft.test.residualProbe");
+    private static boolean residualProbeDone;
+    static byte[] spliceResidualProbe(byte[] b) {
+        if (residualProbeDone) return b;
+        Map<String,String[]> g = RetransformConverter.GADDED;
+        if (g == null || g.isEmpty()) return b;
+        var e = g.entrySet().iterator().next();
+        String key = e.getKey(); String[] v = e.getValue();
+        String owner = v[0], name = RetransformConverter.gkeyMemberName(key, owner), desc = key.substring(key.lastIndexOf(' ')+1);
+        if (name == null) return b;
+        boolean isStatic = "1".equals(v[2]);
+        org.objectweb.asm.tree.ClassNode c = new org.objectweb.asm.tree.ClassNode();
+        new ClassReader(b).accept(c, 0);
+        for (org.objectweb.asm.tree.MethodNode m : c.methods) {
+            if (m.instructions == null || m.instructions.size() == 0) continue;
+            org.objectweb.asm.tree.InsnList in = new org.objectweb.asm.tree.InsnList();
+            if (!isStatic) in.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.ACONST_NULL));
+            in.add(new org.objectweb.asm.tree.MethodInsnNode(isStatic ? org.objectweb.asm.Opcodes.INVOKESTATIC
+                : org.objectweb.asm.Opcodes.INVOKEVIRTUAL, owner, name, desc, false));
+            m.instructions.insert(in);
+            residualProbeDone = true;
+            InjectionLogger.warn("residual probe: spliced a reference to the RELOCATED "+owner+"."+name+desc
+                +" into "+c.name+"."+m.name+m.desc+" (preflight-only; these bytes are discarded)");
+            org.objectweb.asm.ClassWriter w = new org.objectweb.asm.ClassWriter(0); c.accept(w); return w.toByteArray();
+        }
+        return b;
     }
     /** Pre-publish ACCESS gate — see {@link LateAttachVerifier#verifyMemberAccess}. Checks every member reference the
      *  emitted SIDECAR bytes actually contain against the LIVE class, i.e. the modifiers the JVM will enforce, and

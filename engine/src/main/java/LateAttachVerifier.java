@@ -139,7 +139,12 @@ public final class LateAttachVerifier {
                         scanDesc(owner,artifact,m.name,mi.desc,droppedIfaces);
                         if(droppedIfaces.containsKey(mi.owner) && mi.getOpcode()==Opcodes.INVOKEINTERFACE)
                             add("ERROR","DROPPED_INTERFACE_INVOKE",owner,artifact,m.name,mi.owner+"."+mi.name+mi.desc);
-                        checkMethod(owner,artifact,m.name,mi.owner,mi.name,mi.desc,removedMethods);
+                        // INVOKEINTERFACE passes callStatic=null: neither rewriter routes an interface call through the
+                        // added-method table (interfaces go through GIFACE/DuckDispatch), so there is no staticness
+                        // predicate to agree with — and a relocated interface DEFAULT method reached this way is a
+                        // genuine residual whatever the flags say.
+                        checkMethod(owner,artifact,m.name,mi.owner,mi.name,mi.desc,removedMethods,
+                            mi.getOpcode()==Opcodes.INVOKEINTERFACE?null:mi.getOpcode()==Opcodes.INVOKESTATIC);
                     } else if(p instanceof TypeInsnNode ti && droppedIfaces.containsKey(ti.desc)) {
                         String code=ti.getOpcode()==Opcodes.INSTANCEOF?"DROPPED_INTERFACE_INSTANCEOF":"DROPPED_INTERFACE_CAST";
                         add("ERROR",code,owner,artifact,m.name,ti.desc);
@@ -160,7 +165,7 @@ public final class LateAttachVerifier {
         if(x instanceof Handle h) {
             scanDesc(owner,artifact,method,h.getDesc(),di);
             if(h.getTag()>=Opcodes.H_GETFIELD&&h.getTag()<=Opcodes.H_PUTSTATIC)checkField(owner,artifact,method,h.getOwner(),h.getName(),h.getDesc(),rf);
-            else checkMethod(owner,artifact,method,h.getOwner(),h.getName(),h.getDesc(),rm);
+            else checkMethod(owner,artifact,method,h.getOwner(),h.getName(),h.getDesc(),rm,h.getTag()==Opcodes.H_INVOKESTATIC);
             // A handle onto a SHARED interface method (a method-ref like IFoo::m) resolves against the real interface,
             // which still exists; only a PURE-duck interface handle is a genuine residual. (A method-ref invoked on a
             // de-implemented duck receiver would still ICCE at runtime — a known gap for pure method-refs.)
@@ -173,17 +178,42 @@ public final class LateAttachVerifier {
     }
 
     private static void checkField(String owner,String artifact,String method,String o,String n,String d,Map<String,String[]> removed) {
-        if(containsRemoved(removed,o,n,d))add("ERROR","REMOVED_FIELD_REF",owner,artifact,method,o+"."+n+" "+d);
+        // No staticness constraint: the field REWRITER (addedFieldTarget) applies none either — it reads S/I off the
+        // table entry and emits the matching form — so the gate must not be stricter than the rewrite it audits.
+        if(containsRemoved(removed,RetransformConverter.GFIELD,o,n,d,null))add("ERROR","REMOVED_FIELD_REF",owner,artifact,method,o+"."+n+" "+d);
     }
-    private static void checkMethod(String owner,String artifact,String method,String o,String n,String d,Map<String,String[]> removed) {
-        if(containsRemoved(removed,o,n,d))add("ERROR","REMOVED_METHOD_REF",owner,artifact,method,o+"."+n+d);
+    private static void checkMethod(String owner,String artifact,String method,String o,String n,String d,Map<String,String[]> removed,Boolean callStatic) {
+        if(containsRemoved(removed,RetransformConverter.GADDED,o,n,d,callStatic))add("ERROR","REMOVED_METHOD_REF",owner,artifact,method,o+"."+n+d);
     }
-    private static String key(String o,String n,String d){return o+'\0'+n+' '+d;}
-    private static boolean containsRemoved(Map<String,String[]> removed,String owner,String name,String desc){
-        String c=owner;for(int guard=0;c!=null&&!c.equals("java/lang/Object")&&guard++<64;){
-            if(removed.containsKey(key(c,name,desc)))return true;
-            try{c=RetransformConverter.superOf(c);}catch(Throwable t){break;}
-        }return false;
+    /** Is {@code owner.name desc} a member some payload RELOCATED off an already-loaded target (so a direct reference to
+     *  it would NoSuchMethodError/NoSuchFieldError the first time that instruction executes)?
+     *
+     *  <p>The lookup MUST go through {@link RetransformConverter#gLookup} rather than a hand-rolled key: the tables are
+     *  keyed by {@link RetransformConverter#gkey} ({@code "scope owner name desc"}), and gLookup is also what the
+     *  caller-REWRITER ({@code addedCallStatic}/{@code addedFieldTarget}) resolves with. Same resolver on both sides is
+     *  what keeps this gate from flagging a site the rewriter would never have rewritten. It walks the superclass chain
+     *  (a caller can reference an inherited member) and every live payload scope.
+     *
+     *  <p>This used to build {@code owner+'\0'+name+' '+desc}, which could never match a gkey, so REMOVED_METHOD_REF /
+     *  REMOVED_FIELD_REF never fired at all — since the first commit, and not only since gkey grew its scope prefix.
+     *
+     *  <p>{@code union} is the materialized cross-payload table ({@code GADDED}/{@code GFIELD}). Call sites hand us the
+     *  INJECTING payload's own table, but a caller referencing a member ANOTHER payload relocated is just as residual —
+     *  and the rewriter resolves against the union — so both are consulted.
+     *
+     *  <p>{@code callStatic} keeps this gate from being STRICTER than the rewriter it audits: {@code addedCall} only
+     *  redirects a site whose INVOKE form matches the relocated member's staticness, so a mismatch is a name+descriptor
+     *  COLLISION with some other member (an added static on a superclass vs a surviving instance method of the same
+     *  signature on a subclass, say), not a reference to the relocated one. Such a site was already ICCE before we
+     *  touched anything, so flagging it would abort a working injection over a defect that is not ours. Null means "do
+     *  not constrain". */
+    private static boolean containsRemoved(Map<String,String[]> removed,Map<String,String[]> union,String owner,String name,String desc,Boolean callStatic){
+        return removedHit(removed,owner,name,desc,callStatic)
+            || (union!=removed&&removedHit(union,owner,name,desc,callStatic));
+    }
+    private static boolean removedHit(Map<String,String[]> table,String owner,String name,String desc,Boolean callStatic){
+        String[] g=RetransformConverter.gLookup(table,null,owner,name,desc);
+        return g!=null&&(callStatic==null||callStatic.booleanValue()=="1".equals(g[2]));
     }
 
     private static void scanDesc(String owner,String artifact,String method,String desc,Map<String,List<String[]>> dropped) {
