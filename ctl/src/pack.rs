@@ -562,6 +562,17 @@ fn report_resource_needs(
     log("    pass these with  --config <file.properties>  (see examples/liquidbounce/bootstrap.properties)");
 }
 
+/// The `MC-Graft-Commit` the base jar's manifest was stamped with by the Gradle build, if any.
+fn base_engine_commit(zin: &mut zip::ZipArchive<std::fs::File>) -> Option<String> {
+    let mut e = zin.by_name("META-INF/MANIFEST.MF").ok()?;
+    let mut s = String::new();
+    e.read_to_string(&mut s).ok()?;
+    // Main section only: it ends at the first blank line, and a per-entry section below must not be mistaken for it.
+    let main = s.split("\r\n\r\n").next().unwrap_or(&s).split("\n\n").next().unwrap_or(&s).to_string();
+    main.lines()
+        .find_map(|l| l.strip_prefix("MC-Graft-Commit:").map(|v| v.trim().to_string()))
+}
+
 /// Add `MC-Graft-Engine: <id>` to a manifest's MAIN section.
 ///
 /// A jar manifest's main section ends at the first blank line; everything after that belongs to a per-entry section
@@ -629,6 +640,9 @@ fn assemble(
         let digest = Sha256::digest(&bytes);
         digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
     };
+    // Name the ENGINE going into this agent, not just the packer that assembled it — the engine is what runs inside
+    // the client, and the two can drift (a freshly downloaded binary packing against a stale base jar in a repo).
+    eprintln!("  engine {} (build {})", base_engine_commit(&mut zin).as_deref().unwrap_or("commit unknown"), engine_id);
 
     for i in 0..zin.len() {
         let mut e = zin.by_index(i).map_err(|err| format!("read base entry {i}: {err}"))?;

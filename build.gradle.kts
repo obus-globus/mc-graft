@@ -36,6 +36,25 @@ repositories {
     }
 }
 
+/** Short git commit for the agent manifest, with a `+dirty` marker for uncommitted work.
+ *
+ *  This exists because "which build is this?" was for a long time only answerable by recognising the wording of a log
+ *  message. Deliberately NO build timestamp: the packer identifies an engine by hashing this jar, so a timestamp would
+ *  give every rebuild a fresh identity and make two agents built from identical source look like different engines. */
+val gitCommit: String = run {
+    fun git(vararg args: String): String? = try {
+        val p = ProcessBuilder(listOf("git") + args).directory(rootDir).start()
+        val out = p.inputStream.bufferedReader().readText().trim()
+        if (p.waitFor() == 0 && out.isNotEmpty()) out else null
+    } catch (_: Exception) { null }
+    val sha = git("rev-parse", "--short=12", "HEAD")
+    when {
+        sha == null -> "unknown"
+        git("status", "--porcelain").isNullOrEmpty() -> sha
+        else -> "$sha+dirty"
+    }
+}
+
 val asmVersion = "9.10.1"
 val spongeMixin = "net.fabricmc:sponge-mixin:0.17.3+mixin.0.8.7"
 val mixinExtras = "io.github.llamalad7:mixinextras-common:0.5.4"
@@ -133,9 +152,12 @@ tasks.register<Jar>("agentJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
     val asmVer = asmVersion
+    val commit = gitCommit
     manifest {
         // Agent-Class ONLY -> dynamic attach only (never usable as an on-load -javaagent).
         attributes("Agent-Class" to "FullInjectAgent", "Can-Retransform-Classes" to "true", "Can-Redefine-Classes" to "true")
+        // Identify the engine build in the injection log. See gitCommit.
+        attributes("MC-Graft-Commit" to commit)
         // Mixin's CompatibilityLevel check reads ASM's manifest Implementation-Version; pin it.
         attributes(mapOf("Implementation-Title" to "ASM", "Implementation-Version" to asmVer), "org/objectweb/asm/")
     }
@@ -211,8 +233,10 @@ tasks.register<Jar>("agentBase") {
     destinationDirectory.set(layout.buildDirectory.dir("agent"))
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     val asmVer = asmVersion
+    val commit = gitCommit
     manifest {
         attributes("Agent-Class" to "FullInjectAgent", "Can-Retransform-Classes" to "true", "Can-Redefine-Classes" to "true")
+        attributes("MC-Graft-Commit" to commit)
         attributes(mapOf("Implementation-Title" to "ASM", "Implementation-Version" to asmVer), "org/objectweb/asm/")
     }
     from(agentInfra.map { zipTree(it) }) {

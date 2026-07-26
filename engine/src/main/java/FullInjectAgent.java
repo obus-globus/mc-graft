@@ -62,6 +62,8 @@ public class FullInjectAgent {
 
     /** Manifest attribute identifying the ENGINE build an agent jar carries, stamped by the packer. */
     private static final String ENGINE_ATTR = "MC-Graft-Engine";
+    /** Manifest attribute carrying the source commit the engine was built from (stamped by the Gradle agent tasks). */
+    private static final String COMMIT_ATTR = "MC-Graft-Commit";
 
     /** Locate the jar this injection was requested with.
      *
@@ -123,12 +125,40 @@ public class FullInjectAgent {
         catch (Throwable t) { return null; }
     }
 
-    private static String engineId(File jar) {
+    private static String engineId(File jar) { return manifestValue(jar, ENGINE_ATTR); }
+
+    private static String manifestValue(File jar, String attr) {
         try (JarFile jf = new JarFile(jar)) {
             Manifest m = jf.getManifest();
-            return m == null ? null : m.getMainAttributes().getValue(ENGINE_ATTR);
+            return m == null ? null : m.getMainAttributes().getValue(attr);
         } catch (Throwable t) { return null; }
     }
+
+    /** Announce which build is actually running, before anything else can fail.
+     *
+     *  <p>Reports the RUNNING engine rather than only the attaching jar, because the two differ exactly when it
+     *  matters. The JVM resolves {@code Agent-Class} to the copy already defined by an EARLIER agent jar, so attaching
+     *  a freshly built agent to a client that already took an older one silently runs the OLD engine. Without this line
+     *  that situation is diagnosable only by recognising the wording of some later log message. */
+    private static void logBuildInfo(File attaching) {
+        File running = engineJar();
+        InjectionLogger.info("mc-graft engine " + orUnknown(running == null ? null : manifestValue(running, COMMIT_ATTR))
+            + " (build " + orUnknown(running == null ? null : engineId(running)) + ")"
+            + (running == null ? "" : " from " + running));
+        try { if (running != null && running.getCanonicalFile().equals(attaching.getCanonicalFile())) return; }
+        catch (IOException e) { /* fall through and report both */ }
+        String aid = orUnknown(engineId(attaching)), rid = orUnknown(running == null ? null : engineId(running));
+        // A second payload always arrives in its own jar, so "different jar" is the NORMAL multi-payload case and must
+        // not read as a fault. Only a differing engine BUILD deserves a warning: then the already-loaded engine is not
+        // the one this jar was built against, and nothing but a restart can change which engine runs.
+        if (aid.equals(rid)) { InjectionLogger.info("payload supplied by " + attaching + " (same engine build)"); return; }
+        InjectionLogger.warn("engine build mismatch: this JVM is running engine " + rid + ", but " + attaching
+            + " was built against " + aid + " (commit " + orUnknown(manifestValue(attaching, COMMIT_ATTR)) + "). The "
+            + "engine named above is the one that RUNS — the JVM cannot define a second copy of it, so this jar's own "
+            + "engine is inert. Restart the client to use it.");
+    }
+
+    private static String orUnknown(String s) { return s == null || s.isBlank() ? "unknown" : s; }
 
     /** Read a resource from a specific agent jar, bypassing the shared classpath. */
     static byte[] agentResource(File jar, String path) throws IOException {
@@ -142,6 +172,7 @@ public class FullInjectAgent {
     public static void agentmain(String a, Instrumentation inst) throws Exception {
         InjectionLogger.configure(a);
         File self = resolveAgentJar(a);
+        logBuildInfo(self);
         verifyEngineIdentity(self);
         // A SECOND, DIFFERENT payload is supported (docs/multi-payload.md). Re-injecting the SAME payload is not, and
         // is refused here: its mixin config is already selected in the live Mixin, so a second pass would apply its

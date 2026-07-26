@@ -258,6 +258,7 @@ fn cmd_pack(a: PackArgs) {
     if !a.payload.is_file() {
         die(&format!("payload jar not found: {}", a.payload.display()));
     }
+    eprintln!("{}", version_line());
 
     // Resolve inputs that don't depend on the patched jar first, so a failure here can't leak a patched temp file.
     let base = a.base.clone().unwrap_or_else(|| {
@@ -315,6 +316,7 @@ fn cmd_inject(a: InjectArgs) {
 
     // Build the agent option string (key=value pairs, ARG_SEP-joined).
     let log_path = a.log.clone().unwrap_or_else(|| default_log(pid));
+    eprintln!("{}", version_line());
     // Tell the agent which jar it was attached from. It cannot work this out for itself: the engine lives in the
     // default package, so on a second attach into the same JVM the JVM resolves `Agent-Class` to jar #1's
     // already-loaded class, and both routes the engine would otherwise use — its own ProtectionDomain CodeSource and
@@ -457,6 +459,14 @@ fn strip_ansi(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// One line identifying this binary, printed by every pack and inject.
+///
+/// A bug report is only as useful as the build it names. Until this existed, telling an old binary from a new one meant
+/// recognising the phrasing of a log message — which is how a stale exe went unnoticed for an entire debugging session.
+pub fn version_line() -> String {
+    format!("mcgraft {} ({})", env!("CARGO_PKG_VERSION"), env!("MCGRAFT_COMMIT"))
 }
 
 fn die(msg: &str) -> ! {
