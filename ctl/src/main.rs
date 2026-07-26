@@ -410,14 +410,25 @@ fn follow_log(file: &Path, start_off: u64, follow: bool, deadline: Instant) -> R
 }
 
 /// Log lines that mean "injection finished" (success or failure) so `--follow` can stop instead of hanging.
+/// Has the agent finished, successfully or not?
+///
+/// Only genuinely FINAL lines belong here. This list used to be inherited from when the tool injected nothing but
+/// LiquidBounce, and it was wrong in both directions at once:
+///
+///   - it did not contain the engine's own generic completion line, so a payload that never says LiquidBounce's words
+///     (Wurst, say) left the GUI spinning long after the injection had finished, until the user pressed Stop;
+///   - and "restored original state" / "has been successfully initialized" are MID-injection steps, so on a payload
+///     that did emit them the tail stopped early and truncated the log before the final line was ever written.
+///
+/// Every agent built from this engine ends with `payload injection complete`; the failure lines below are the other
+/// ways it can stop. A jar too old to emit any of them is bounded by the tail's own liveness check and deadline.
 fn is_terminal_marker(l: &str) -> bool {
-    l.contains("initialization completed")
-        || l.contains("has been successfully initialized")
-        || l.contains("restored original state")
-        || l.contains("initialization incomplete")
-        || l.contains("kick error")
-        || l.contains("preflight failed")
+    l.contains("payload injection complete")
         || l.contains("re-injection refused")
+        || l.contains("engine build mismatch")
+        || l.contains("preflight failed")
+        || l.contains("kick error")
+        || l.contains("initialization incomplete")
         || l.contains("=== UNINJECT complete")
 }
 
