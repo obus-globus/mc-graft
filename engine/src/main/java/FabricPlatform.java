@@ -326,8 +326,16 @@ final class FabricPlatform implements LoaderPlatform {
         // it deliberately via the setInt(0) in transform(). No-op on an active host (count already > 0).
         int tc0 = fTransformedCount.getInt(processor);
         if (tc0 == 0) { fTransformedCount.setInt(processor, 1); InjectionLogger.info("baseline: forced transformedCount 0 -> 1 (idle host; keeps payload config unvisited during X_others capture)"); }
-        int n = 0;
+        int n = 0, reused = 0;
         for (String internal : internalTargets) {
+            // REUSE, never recapture, a baseline an earlier injection already established for this target. The capture
+            // below only yields X_others while OUR payloads are unvisited — true for the first injection, false for
+            // every later one, because an earlier payload's config stays selected in the live Mixin once promoted and
+            // is therefore re-applied here. Recapturing would hand the converter X_others+A as the "original" schema,
+            // which is neither what the loaded class has nor what a later payload should diff against; both publish
+            // failures measured in the P3 spike came from exactly that. See FullInjectAgent.SCHEMA_BASELINE.
+            byte[] kept = FullInjectAgent.SCHEMA_BASELINE.get(internal);
+            if (kept != null) { baseline.put(internal, kept); reused++; continue; }
             byte[] pre = getPreMixinClassBytes(internal); if (pre == null) continue;
             byte[] xOthers;
             try { xOthers = driveTransform(internal.replace('/','.'), pre); } // the payload unvisited -> other mods only
@@ -348,10 +356,13 @@ final class FabricPlatform implements LoaderPlatform {
                 InjectionLogger.warn("baseline capture skipped (tolerated) for "+head);
                 continue;
             }
-            baseline.put(internal, xOthers == null ? pre : xOthers); n++;
-
+            byte[] captured = xOthers == null ? pre : xOthers;
+            baseline.put(internal, captured);
+            FullInjectAgent.SCHEMA_BASELINE.put(internal, captured);   // the plane every later injection diffs against
+            n++;
         }
-        InjectionLogger.info("captured "+n+" non-payload mod baselines (X_others)");
+        InjectionLogger.info("captured "+n+" non-payload mod baselines (X_others)"
+            +(reused > 0 ? "; reused "+reused+" established by an earlier injection" : ""));
     }
 
     // ---- §1c: X for an already-loaded target = X_all (X_others + LB) after forcing the payload's config to select --------------

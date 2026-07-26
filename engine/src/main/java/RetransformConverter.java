@@ -24,6 +24,9 @@ public class RetransformConverter {
         public byte[] target, sidecar; public String sidecarName;
         public List<String> droppedInterfaces = new ArrayList<>();
         public List<String> relocatedFields = new ArrayList<>(), relocatedMethods = new ArrayList<>();
+        /** Members an EARLIER payload had already relocated off this target, which this conversion stripped from
+         *  target' without re-relocating (docs/multi-payload.md §1.2). Non-empty only from the second injection on. */
+        public List<String> foreignMembers = new ArrayList<>();
         public List<String> notes = new ArrayList<>();
     }
 
@@ -107,6 +110,11 @@ public class RetransformConverter {
     final Set<String> addedInstanceFields = new HashSet<>(); // name (instance only)
     final Set<String> addedStaticFields = new HashSet<>();
     final Set<String> addedMethodKeys = new HashSet<>();  // name+" "+desc
+    // Members an EARLIER payload already relocated off this target: removed from target' like our own, but never
+    // relocated into THIS payload's sidecar (they belong to the other payload's). See the block in run().
+    final Set<String> foreignFieldKeys = new HashSet<>();
+    final Set<String> foreignMethodKeys = new HashSet<>();
+    final Set<String> foreignIfaces = new HashSet<>();
     final Map<String,String> fieldDesc = new HashMap<>();
 
     RetransformConverter(PayloadScope scope, String targetInternal) {
@@ -156,18 +164,36 @@ public class RetransformConverter {
         Result r = new Result(); r.sidecarName = sidecar;
 
         Set<String> oF = keysF(O), oM = keysM(O); Set<String> oI = new HashSet<>(O.interfaces);
+        // O is the TRUE original schema — the plane the loaded class is actually at, captured before ANY payload was
+        // injected and deliberately kept stable across injections (FullInjectAgent.SCHEMA_BASELINE). For injection N>1
+        // the mixin output X therefore carries every EARLIER payload's added members too, because their configs stay
+        // selected in the live Mixin and one transformClassBytes re-derives all of them together.
+        //
+        // Those members are FOREIGN: strip them from target' (the loaded class does not have them, so keeping them is
+        // exactly the "extra methods" schema failure) but do NOT relocate them here. They already live on THEIR
+        // payload's sidecar holding that payload's state, and rewriteRefs redirects every reference to them there for
+        // free through gLookup, which searches all scopes. Relocating a second copy would fork the state.
+        // See docs/multi-payload.md §1.2.
         List<FieldNode> addedFields = new ArrayList<>();
         for (FieldNode f : X.fields) if (!oF.contains(f.name + " " + f.desc)) {
+            PayloadScope fo = foreignFieldOwner(scope, targetInternal, f.name, f.desc);
+            if (fo != null) { foreignFieldKeys.add(f.name + " " + f.desc); r.foreignMembers.add(fo.id + ": field " + f.name); continue; }
             addedFields.add(f); addedFieldKeys.add(f.name + " " + f.desc); fieldDesc.put(f.name, f.desc);
             if ((f.access & Opcodes.ACC_STATIC) != 0) addedStaticFields.add(f.name); else addedInstanceFields.add(f.name);
             r.relocatedFields.add(((f.access & Opcodes.ACC_STATIC) != 0 ? "static " : "") + f.name + " " + f.desc);
         }
         List<MethodNode> addedMethods = new ArrayList<>();
         for (MethodNode m : X.methods) if (!oM.contains(m.name + " " + m.desc)) {
+            PayloadScope mo = foreignMethodOwner(scope, targetInternal, m.name, m.desc);
+            if (mo != null) { foreignMethodKeys.add(m.name + " " + m.desc); r.foreignMembers.add(mo.id + ": " + m.name); continue; }
             addedMethods.add(m); addedMethodKeys.add(m.name + " " + m.desc);
             r.relocatedMethods.add(m.name + " " + m.desc);
         }
-        for (String i : X.interfaces) if (!oI.contains(i)) r.droppedInterfaces.add(i);
+        for (String i : X.interfaces) if (!oI.contains(i)) {
+            PayloadScope io = foreignIfaceOwner(scope, targetInternal, i);
+            if (io != null) { foreignIfaces.add(i); r.foreignMembers.add(io.id + ": iface " + i); }
+            else r.droppedInterfaces.add(i);
+        }
 
         // ---- build sidecar ----
         ClassNode S = new ClassNode();
@@ -207,9 +233,9 @@ public class RetransformConverter {
         }
 
         // ---- rewrite target' ----
-        X.interfaces.removeIf(i -> r.droppedInterfaces.contains(i));
-        X.fields.removeIf(f -> addedFieldKeys.contains(f.name + " " + f.desc));
-        X.methods.removeIf(m -> addedMethodKeys.contains(m.name + " " + m.desc));
+        X.interfaces.removeIf(i -> r.droppedInterfaces.contains(i) || foreignIfaces.contains(i));
+        X.fields.removeIf(f -> addedFieldKeys.contains(f.name + " " + f.desc) || foreignFieldKeys.contains(f.name + " " + f.desc));
+        X.methods.removeIf(m -> addedMethodKeys.contains(m.name + " " + m.desc) || foreignMethodKeys.contains(m.name + " " + m.desc));
         for (MethodNode m : X.methods) rewriteRefs(m, false);
         for (var e : ifaceDispatchTramps.entrySet()) {
             Object[] v = e.getValue();
@@ -642,6 +668,9 @@ public class RetransformConverter {
         return s;
     }
     private static boolean keyTaken(String k) { for (PayloadScope s : SCOPES) if (s.key.equals(k)) return true; return false; }
+    /** The live scope for a payload id, or null. Used to refuse a re-injection of the SAME payload (which would apply
+     *  its still-selected mixin config a second time) while allowing a different one. */
+    public static PayloadScope scopeForId(String id) { for (PayloadScope s : SCOPES) if (s.id.equals(id)) return s; return null; }
 
     /** The scope that owns {@code internal}: the payload whose own classes contain it, else one whose caller-rewrite
      *  prefix matches. Null when no payload claims it (the caller then falls back to searching every scope). */
@@ -735,6 +764,82 @@ public class RetransformConverter {
      *  {@link #gkeyMemberName} is the matching decoder. Neither a scope key, an internal name nor a descriptor can
      *  contain a space, so the four parts stay unambiguous. */
     static String gkey(PayloadScope scope, String owner, String name, String desc) { return scope.key + " " + owner + " " + name + " " + desc; }
+
+    // ---- cross-payload member ownership (docs/multi-payload.md §1.2) ------------------------------------------------
+    /** The scope OTHER than {@code self} that has already relocated method {@code name+desc} off {@code target}, or
+     *  null when no earlier payload claims it. Reads each scope's OWN table rather than the union, so the answer is
+     *  "who owns this" rather than "does anyone own this". */
+    static PayloadScope foreignMethodOwner(PayloadScope self, String target, String name, String desc) {
+        for (PayloadScope s : SCOPES) {
+            if (s == self) continue;
+            Map<String,String[]> t = s.gadded; if (t == null) continue;
+            String[] v = t.get(gkey(s, target, name, desc));
+            if (v != null && target.equals(v[0])) return s;
+        }
+        return null;
+    }
+    /** Field equivalent of {@link #foreignMethodOwner}. */
+    static PayloadScope foreignFieldOwner(PayloadScope self, String target, String name, String desc) {
+        for (PayloadScope s : SCOPES) {
+            if (s == self) continue;
+            Map<String,String[]> t = s.gfield; if (t == null) continue;
+            String[] v = t.get(gkey(s, target, name, desc));
+            if (v != null && target.equals(v[0])) return s;
+        }
+        return null;
+    }
+    /** Interface equivalent: the scope that already dropped {@code iface} from {@code target} and registered its own
+     *  sidecar as the duck implementation. Keeps a second payload from registering a rival DuckDispatch entry for an
+     *  interface it did not add. */
+    static PayloadScope foreignIfaceOwner(PayloadScope self, String target, String iface) {
+        for (PayloadScope s : SCOPES) {
+            if (s == self) continue;
+            Map<String,List<String[]>> m = s.giface; if (m == null) continue;
+            List<String[]> impls = m.get(iface); if (impls == null) continue;
+            for (String[] v : impls) if (target.equals(v[0])) return s;
+        }
+        return null;
+    }
+
+    /** The scope key encoded in a sidecar's internal name ({@code <target>$$Sidecar$<key>}, and its {@code $State}),
+     *  or null when the name is not one of ours. Scope keys never contain {@code $} (PayloadScope.sanitize), so the
+     *  first {@code $} after the marker terminates the key. */
+    public static String scopeKeyOfSidecar(String internal) {
+        if (internal == null) return null;
+        int i = internal.lastIndexOf("$$Sidecar$");
+        if (i < 0) return null;
+        String rest = internal.substring(i + "$$Sidecar$".length());
+        int d = rest.indexOf('$');
+        return d < 0 ? rest : rest.substring(0, d);
+    }
+
+    /** For each method of {@code classBytes}, which payloads' sidecars its body actually calls into.
+     *
+     *  <p>This is the direct measurement of sequential composition: a method appearing here with TWO scope keys is a
+     *  Minecraft method that two different payloads both hooked, with both hooks present in the bytes we published.
+     *  That case is precisely what used to break silently (docs/multi-payload.md §1.2), so it is reported rather than
+     *  assumed. Reads the emitted bytes, not our own bookkeeping, so it cannot agree with a wrong table. */
+    public static Map<String,Set<String>> sidecarScopesByMethod(byte[] classBytes) {
+        Map<String,Set<String>> out = new LinkedHashMap<>();
+        if (classBytes == null) return out;
+        try {
+            ClassNode cn = new ClassNode();
+            new ClassReader(classBytes).accept(cn, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            for (MethodNode m : cn.methods) {
+                if (m.instructions == null) continue;
+                Set<String> keys = new java.util.TreeSet<>();
+                for (AbstractInsnNode p = m.instructions.getFirst(); p != null; p = p.getNext()) {
+                    String owner = p instanceof MethodInsnNode mi ? mi.owner
+                                 : p instanceof FieldInsnNode fi ? fi.owner
+                                 : p instanceof TypeInsnNode ti ? ti.desc : null;
+                    String k = scopeKeyOfSidecar(owner);
+                    if (k != null && !k.isEmpty()) keys.add(k);
+                }
+                if (!keys.isEmpty()) out.put(m.name + m.desc, keys);
+            }
+        } catch (Throwable ignored) {}
+        return out;
+    }
     /** Recover the member NAME from a {@link #gkey}, given the owner recorded alongside it. Null if the key does not
      *  have the expected shape. */
     static String gkeyMemberName(String key, String owner) {
@@ -748,12 +853,17 @@ public class RetransformConverter {
     public static void collectAdded(PayloadScope scope, String internal, byte[] O, byte[] X, Map<String,String[]> gMethods, Map<String,String[]> gFields, Map<String,List<String[]>> gIfaces) {
         ClassNode o = read(O), x = read(X); Set<String> om = keysM(o), of = keysF(o);
         String sc = sidecarInternal(scope, internal);
+        // Members an EARLIER payload already claimed on this target are skipped: from the second injection on, O is
+        // the true original and X carries every payload's additions, so the raw diff would re-record the earlier
+        // payload's members under THIS scope and point them at the wrong sidecar. run() strips them the same way.
         for (MethodNode m : x.methods) { String k = m.name + " " + m.desc;
-            if (!om.contains(k) && !m.name.equals("<clinit>") && !m.name.equals("<init>"))
+            if (!om.contains(k) && !m.name.equals("<clinit>") && !m.name.equals("<init>")
+                    && foreignMethodOwner(scope, internal, m.name, m.desc) == null)
                 gMethods.put(gkey(scope, internal, m.name, m.desc), new String[]{internal, sc, (m.access & Opcodes.ACC_STATIC) != 0 ? "1" : "0"}); }
-        for (FieldNode f : x.fields) { if (!of.contains(f.name + " " + f.desc))
+        for (FieldNode f : x.fields) { if (!of.contains(f.name + " " + f.desc)
+                    && foreignFieldOwner(scope, internal, f.name, f.desc) == null)
             gFields.put(gkey(scope, internal, f.name, f.desc), new String[]{internal, sc, (f.access & Opcodes.ACC_STATIC) != 0 ? "S" : "I"}); }
-        for (String i : x.interfaces) if (!o.interfaces.contains(i)) {
+        for (String i : x.interfaces) if (!o.interfaces.contains(i) && foreignIfaceOwner(scope, internal, i) == null) {
             List<String[]> impls = gIfaces.computeIfAbsent(i, k -> new ArrayList<>());
             // Dedup within THIS payload only. A second payload adding the same interface to the same target is a
             // distinct implementation with its own sidecar and must be recorded separately, not swallowed.

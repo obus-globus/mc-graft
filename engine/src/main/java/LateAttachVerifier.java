@@ -55,6 +55,10 @@ public final class LateAttachVerifier {
     }
 
     public static boolean hasErrors() { return errorCount() > 0; }
+    /** Clear the accumulated issue list so a SECOND injection is gated on its OWN findings. The list is static and was
+     *  never reset, so injection A's residue would abort injection B at the conversion gate for reasons that have
+     *  nothing to do with B. A's report has already been written by the time this runs. */
+    public static synchronized void reset() { ISSUES.clear(); DEDUP.clear(); LOCAL_ERRORS.get()[0] = 0; }
     public static int issueMark(){ return ISSUES.size(); }
     public static java.util.List<String> issuesSince(int mark){ java.util.List<String> out=new java.util.ArrayList<>();
         for(int i=Math.max(0,mark);i<ISSUES.size();i++){ Issue is=ISSUES.get(i); out.add(is.code()+"/"+is.artifact()+": "+is.message()); } return out; }
@@ -63,7 +67,10 @@ public final class LateAttachVerifier {
      *  e.g. ChatComponent's field-adding mixin, or an incidental on-load transform miss). These are recorded and
      *  logged but must NOT abort injection or permanently gate multiplayer — the client keeps running minus that hook. */
     private static final Set<String> SOFT_ERROR_CODES = Set.of(
-        "TARGET_RETRANSFORM_FAILURE", "CALLER_RETRANSFORM_FAILURE", "TRANSFORM_FAILURE");
+        // TARGET_PUBLISH_FAILURE is soft for the same reason: it is only reachable AFTER the payload has bootstrapped
+        // on the game thread, so aborting undoes nothing and would only leave the join gate shut. It is still an
+        // ERROR line naming every payload involved — see FullInjectAgent.publishFailed.
+        "TARGET_RETRANSFORM_FAILURE", "CALLER_RETRANSFORM_FAILURE", "TRANSFORM_FAILURE", "TARGET_PUBLISH_FAILURE");
     /** True only if a FATAL error was recorded (any ERROR whose code is not in {@link #SOFT_ERROR_CODES}). Bootstrap/
      *  activation/gate decisions use this so tolerable residue does not block init or lock the join gate closed. */
     public static boolean hasFatalErrors() { for(Issue i:ISSUES) if(i.severity.equals("ERROR")&&!SOFT_ERROR_CODES.contains(i.code)) return true; return false; }

@@ -60,9 +60,18 @@ HOST_LOG="$OUT/client.log"
 # NOTE on liquidbounce: /tmp/lbpay.jar is a THIN LiquidBounce jar — it carries no bundled runtime libs, and
 # `mcgraft pack` only resolves the two coordinates in payload.dependencies (fabric-api, fabric-language-kotlin).
 # LB's own init then dies with `NoClassDefFoundError: net/ccbluex/liquidbounce/authlib/account/MinecraftAccount`
-# and the readiness probe never passes, so LB cannot COMPLETE as payload A here. It is fine as payload B (which is
-# refused long before that matters). To use LB as payload A, point MC_CP_FILE at a launch classpath that already
-# carries LB's ~140 bundled libs (e.g. /tmp/lbi-cp.txt), or pack from a fat LB jar.
+# (and `org/graalvm/polyglot/Engine`), so the readiness probe never passes.
+#
+# This note used to add "it is fine as payload B (which is refused long before that matters)". MEASURED FALSE once
+# P3 admitted a second injection (2026-07-26): as payload B, LB injects, converts 145 targets and bootstraps, then
+# dies at exactly the same NoClassDefFoundError — the readiness probe times out, so its target retransforms are
+# never published. /tmp/lbpay.jar is unusable in EITHER slot here. That is a jar-contents/environment limit and has
+# nothing to do with sequential injection.
+#
+# To use LB here at all, point MC_CP_FILE at a launch classpath that already carries LB's ~140 bundled libs
+# (e.g. /tmp/lbi-cp.txt), or pack from a fat LB jar. Otherwise use `wurst`: it is a fat jar that completes, and it
+# overlaps zoomify on Camera.calculateFov / calculateHudFov / extractRenderState, so the pair still exercises the
+# co-hooked-method regression that P3 exists for.
 payload_jar() { case "$1" in
     zoomify)      echo "${ZOOMIFY_JAR:-/tmp/zoomify-2.16.126.2.jar}" ;;
     liquidbounce) echo "${LIQUIDBOUNCE_JAR:-/tmp/lbpay.jar}" ;;
@@ -270,6 +279,36 @@ inject_and_assert B "$B_ID"
 hdr "post-state (both payloads should be live in one JVM)"
 if kill -0 "$MC_PID" 2>/dev/null; then ok "CLIENT_ALIVE" "pid $MC_PID still running after both injections"
 else bad "CLIENT_ALIVE" "client died; tail of $HOST_LOG:"; tail -5 "$HOST_LOG" | sed 's/^/        /'; fi
+
+# COMPOSITION — the assertion P3 exists for, and the one that used to break SILENTLY (docs/multi-payload.md §1.2).
+# The agent reads back the bytes it actually published and reports, per target, which payloads' sidecars they call
+# into; `co-hooked methods:` names a single Minecraft method carrying hooks from more than one payload. Anything less
+# than that is not evidence: two payloads can both "inject successfully" while the second silently erases the first
+# on every target they share. Read from payload B's log — it is B's activation that composes them.
+B_LOG="$OUT/inject-B-$B_ID.log"
+COMPO="$(grep -m1 "composition: .*co-hooked methods:" "$B_LOG" 2>/dev/null)"
+if [ -z "$COMPO" ]; then
+    if grep -q "composition: 0 target(s)" "$B_LOG" 2>/dev/null; then
+        bad "COMPOSITION" "no target carries hooks from both payloads — they may not overlap, or B erased A"
+    else
+        bad "COMPOSITION" "the agent published no composition report; sequential composition is unproven"
+    fi
+else
+    # Every co-hooked line must name BOTH payload scope keys, else only one payload is really on that method.
+    A_KEY="$(printf '%s' "$A_ID" | tr -c 'A-Za-z0-9_' '_')"
+    B_KEY="$(printf '%s' "$B_ID" | tr -c 'A-Za-z0-9_' '_')"
+    if printf '%s' "$COMPO" | grep -q "$A_KEY" && printf '%s' "$COMPO" | grep -q "$B_KEY"; then
+        ok "COMPOSITION" "$(printf '%s' "$COMPO" | sed 's/^\[mc-graft\] \[INFO\] //' | cut -c1-160)"
+    else
+        bad "COMPOSITION" "a co-hooked method was reported but it does not name both '$A_KEY' and '$B_KEY':"
+        printf '%s\n' "$COMPO" | sed 's/^/        /'
+    fi
+fi
+if grep -q "composition INCOMPLETE" "$B_LOG" 2>/dev/null; then
+    bad "COMPOSITION_COMPLETE" "$(grep -m1 -o 'composition INCOMPLETE.*' "$B_LOG" | cut -c1-200)"
+else
+    ok "COMPOSITION_COMPLETE" "no target failed to take the second payload's hooks"
+fi
 
 # Payload A must not have been torn down by B. This only checks for a new hard failure in the client log after B
 # attached — it is NOT a functional check that A's hooks still fire (that needs a real client; see P5).

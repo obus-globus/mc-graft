@@ -13,11 +13,34 @@ public class FullInjectAgent {
     static final Set<String> definedSynth = ConcurrentHashMap.newKeySet();
     static final Set<String> definingSynth = ConcurrentHashMap.newKeySet();
     static final Map<String,Conv> convMap = new ConcurrentHashMap<>();             // internal -> conversion holder
+    /** internal -> the exact bytes the CFT last successfully handed the JVM for this target. Two uses, both about
+     *  sequential injection: it is what a later injection FALLS BACK TO when its own conversion cannot be published
+     *  (so a payload that is already working is not erased), and it is what the composition report is read from. */
+    static final Map<String,byte[]> PUBLISHED = new ConcurrentHashMap<>();
+    /** internal -> the schema plane every FUTURE injection must diff against: the target as the JVM actually loaded
+     *  it — every other mod's mixins applied, none of ours.
+     *
+     *  <p>Captured once, by the first injection that touches the target, and never recomputed, because it cannot be:
+     *  a later {@code prepareBaselines} runs with the earlier payload's mixin config still SELECTED in the live
+     *  Mixin, so it yields X_others+A rather than X_others. Diffing against that produced two distinct publish
+     *  failures, both measured — "extra methods" (the earlier payload's members land in target', which the loaded
+     *  class does not have) and "missing method mixinextras$bridge$…$43" (MixinExtras renumbers other mods' synthetic
+     *  bridges once another payload's members sit in the class, and alignSynthetics then realigns to the wrong
+     *  plane). See docs/multi-payload.md §1.2. */
+    static final Map<String,byte[]> SCHEMA_BASELINE = new ConcurrentHashMap<>();
+    /** internal -> scope key of the payload that converted this target WHOLE (mixin-added members kept ON the class
+     *  instead of moved to a sidecar). Once such a target has LOADED its schema is frozen with those members on it,
+     *  and no later payload's conversion can be published over it — see the guard in phase B. */
+    static final Map<String,String> WHOLE_PUBLISHED = new ConcurrentHashMap<>();
     static final Map<String,List<String[]>> ifaceMap = new ConcurrentHashMap<>();  // iface -> all [target, sidecar]; read by concurrent CFT threads
     static final Set<String> targetSet = new HashSet<>();                          // internal names of mixin targets
     static Instrumentation INST;
     static volatile RetransformConverter.Resolver AW_RES;   // AW resolver (for the caller-rewrite diagnostic)
-    static volatile boolean everInjected;                                         // true once injected; a second inject in the same JVM is refused — the payload can't be re-staged onto the already-populated loader. volatile: successive attaches may land on different attach-listener threads.
+    /** The single live ClassFileTransformer. Each injection installs its own (it closes over that payload's access
+     *  resolver) and REMOVES the previous one. Leaving both installed made every class run the whole conversion twice
+     *  and reported every failure twice, since the conversion tables they read are static and shared. */
+    static volatile ClassFileTransformer INSTALLED_CFT;
+    static volatile boolean everInjected;                                         // true once a payload has been injected into this JVM. No longer a refusal by itself (a second payload is supported); it selects the cross-injection code paths, and a re-inject of the SAME payload id is still refused. volatile: successive attaches may land on different attach-listener threads.
     static boolean tolerateBaselineFailures;                                      // agent arg tolerateBaselineFailures=true: on modded loaders, skip an other-mod target whose baseline transform throws instead of aborting the whole inject. Default OFF (fail-fast). Set once in agentmain before prepareBaselines, read on the same thread.
     static final Set<String> preLoaded = ConcurrentHashMap.newKeySet();            // MC classes loaded at attach (can't be AW-widened)
     static final Map<String,Boolean> npField = new ConcurrentHashMap<>();          // owner#name -> non-public?
@@ -120,8 +143,29 @@ public class FullInjectAgent {
         InjectionLogger.configure(a);
         File self = resolveAgentJar(a);
         verifyEngineIdentity(self);
-        if (everInjected) { InjectionLogger.error("re-injection refused: a payload was already injected into this JVM. Re-injecting is not supported (its runtime cannot be re-staged onto the already-populated loader). Restart the client to inject again.");
-            throw new IllegalStateException("re-injection is not supported in the same JVM; restart the client"); }
+        // A SECOND, DIFFERENT payload is supported (docs/multi-payload.md). Re-injecting the SAME payload is not, and
+        // is refused here: its mixin config is already selected in the live Mixin, so a second pass would apply its
+        // injectors a second time on top of bytes that already carry them — silently doubling every hook rather than
+        // failing. The id is read from the attaching jar before anything is staged, so the refusal costs nothing.
+        final byte[] selfProps = agentResource(self, "graft.properties");
+        final String selfId = PayloadConfig.peekId(selfProps);
+        PayloadScope already = RetransformConverter.scopeForId(selfId);
+        if (already != null) {
+            InjectionLogger.error("re-injection refused: payload '" + selfId + "' is already injected into this JVM (scope "
+                + already + "). Its mixin configs stay selected in the live Mixin, so injecting it again would apply "
+                + "every one of its hooks a second time. Restart the client to inject it afresh; a DIFFERENT payload "
+                + "can be injected into this JVM without restarting.");
+            throw new IllegalStateException("payload '" + selfId + "' is already injected in this JVM; restart the client");
+        }
+        final boolean reinjection = everInjected;
+        if (reinjection) {
+            // The verifier's issue list is static and was never cleared, so the previous payload's residue would gate
+            // this injection at the conversion barrier for reasons that have nothing to do with it. That payload's
+            // report has already been written.
+            LateAttachVerifier.reset();
+            InjectionLogger.info("sequential injection: this JVM already holds " + RetransformConverter.scopes()
+                + "; adding '" + selfId + "' alongside them");
+        }
         INST = inst;
         PLATFORM = detectPlatform(inst);
         SYS = PLATFORM.targetLoader();
@@ -150,7 +194,7 @@ public class FullInjectAgent {
         // Read the payload's own config out of the ATTACHING jar, not off the classpath. Both agent jars are appended
         // to the same system loader, so a classpath lookup returns whichever jar was appended first — i.e. a second
         // injection would silently run with the first payload's config. See resolveAgentJar.
-        final PayloadConfig cfg = PayloadConfig.init(agentResource(self, "graft.properties"));
+        final PayloadConfig cfg = PayloadConfig.init(selfProps);
         // Everything this payload generates or records is scoped by its id, so a later payload targeting the same
         // Minecraft class gets its own sidecar/state/table entries instead of colliding (docs/multi-payload.md §1.3/§1.4).
         final PayloadScope scope = RetransformConverter.newScope(cfg.id);
@@ -211,6 +255,19 @@ public class FullInjectAgent {
             //                         that one is a real failure and still aborts.
             byte[] O = PLATFORM.originalBytes(internal);
             if (O == null) { InjectionLogger.warn("mixin target not present in this installation, skipping: "+internal); continue; }
+            // A target an EARLIER payload converted WHOLE keeps that payload's mixin members ON the class. While it is
+            // still unloaded that composes (its baseline below is the whole output, so this payload's members are
+            // simply added to it). Once it has LOADED, its schema is frozen WITH those members, and retransform can
+            // neither remove them nor add ours — so there is nothing this payload can publish over it. Say so and skip
+            // rather than emitting a conversion that fails at publish time.
+            // UNTESTED: no measured instance of this exists; the overlap pairs run so far are all pre-loaded targets.
+            String wholeBy = WHOLE_PUBLISHED.get(internal);
+            if (wholeBy != null && !wholeBy.equals(scope.key) && loadedMap.containsKey(internal)) {
+                InjectionLogger.warn("target "+internal+" was converted WHOLE by payload '"+wholeBy+"' and has since loaded; "
+                    +"its schema is frozen with that payload's members on it, so '"+scope.id+"' hooks on this target are "
+                    +"inert this session (restart the client and inject '"+scope.id+"' first to get them)");
+                continue;
+            }
             byte[] X = PLATFORM.transform(internal.replace('/','.'), O);
             if (X == null) { phaseFailures.add(internal); LateAttachVerifier.error("MIXIN_TARGET_MISSING",internal,"target","mixin transformer returned null"); InjectionLogger.error("transform returned null for "+internal); continue; }
             txMap.put(internal, new byte[][]{O, X}); RetransformConverter.collectAdded(scope, internal, O, X, gadded, gfield, giface);
@@ -242,6 +299,14 @@ public class FullInjectAgent {
             gadded.values().removeIf(v -> wholeTargets.contains(v[0]));
             gfield.values().removeIf(v -> wholeTargets.contains(v[0]));
             InjectionLogger.info("future-loaded targets defined WHOLE (added members kept on the class): " + wholeTargets);
+        }
+        // A whole target's members stay ON the class, so the plane a LATER payload must diff against is this payload's
+        // whole output, not the pre-payload baseline — otherwise that payload would try to strip these members back
+        // off. Overwrite the persisted baseline accordingly, and record who did it.
+        for (String t : wholeTargets) {
+            byte[][] ox = txMap.get(t);
+            if (ox != null) SCHEMA_BASELINE.put(t, ox[1]);
+            WHOLE_PUBLISHED.put(t, scope.key);
         }
         // Publish this payload's tables into the (union) globals the converter and the CFT read. Deliberately AFTER the
         // wholeTargets pruning above: republish() COPIES each scope's tables into the union, so a later in-place
@@ -336,14 +401,19 @@ public class FullInjectAgent {
                     byte[] t = ifaceMap.isEmpty() ? cv.target : RetransformConverter.rewriteCaller(cv.target, ifaceMap, cv.scope);
                     if(connect) t = JoinGateRewriter.rewrite(n, t);
                     byte[] w = awApply(n, t); if (w != null) t = w;
+                    PUBLISHED.put(n, t); PUBLISH_FAILED.remove(n);
                     return t;
                 }
                 if (cv!=null) {
                     byte[] t;
                     if (c==null) t = cv.target;
-                    else { long s=System.nanoTime(); t = RetransformConverter.rebase(cv.target, b); tRebase += System.nanoTime()-s; nRebase++; }
+                    else { long s=System.nanoTime();
+                        try { t = RetransformConverter.rebase(cv.target, b); }
+                        catch (Throwable rebaseFailed) { return publishFailed(n, cv, rebaseFailed); }
+                        finally { tRebase += System.nanoTime()-s; nRebase++; } }
                     if(connect)t=JoinGateRewriter.rewrite(n,t);
-                    if (c!=null) { long s=System.nanoTime(); boolean ok=LateAttachVerifier.verifyRetransform(n, b, t); tVerify += System.nanoTime()-s; if(!ok) return null; }
+                    if (c!=null) { long s=System.nanoTime(); boolean ok=LateAttachVerifier.verifyRetransform(n, b, t); tVerify += System.nanoTime()-s;
+                        if(!ok) return publishFailed(n, cv, null); }
                     if(!cv.define(p)){
                         // Future-loaded target (c==null) can hit this AFTER the join gate opened; the JVM then defines the
                         // pristine original with NO the payload hooks, so the feature backing this target is silently inert for the
@@ -352,6 +422,7 @@ public class FullInjectAgent {
                         return null;
                     }
                     if (c==null) { byte[] w=awApply(n,t); if(w!=null) t=w; }
+                    PUBLISHED.put(n, t); PUBLISH_FAILED.remove(n);   // this target is composed; clear any earlier failure
                     return t; }
                 if (RetransformConverter.isCallerRewrite(n)) {
                     byte[] rw = AccessorBridgeRewriter.rewrite(n, b);
@@ -376,8 +447,17 @@ public class FullInjectAgent {
                 if (n.startsWith("net/minecraft/")||n.startsWith("com/mojang/")) return PLATFORM.cftAppliesAw()? awApply(n,b) : null;  // widen future MC classes (on-load) + AW-class retransforms (modded loaders widen future classes themselves)
             } catch(Throwable x){ LateAttachVerifier.error("TRANSFORM_FAILURE",n,"cft",rootMsg(x)); InjectionLogger.error("CFT fail "+n, x); }
             return null; } };
+        // Install THIS payload's transformer and retire the previous one. Add-then-remove, so no class can slip
+        // through an unhooked window; the brief overlap is harmless because the second pass rebases an already-rebased
+        // candidate onto the same schema. Leaving both installed (the old behaviour when a second injection got in)
+        // ran every conversion twice and duplicated every failure, since convMap and the conversion tables are static.
+        ClassFileTransformer previous = INSTALLED_CFT;
         inst.addTransformer(cft, true);
-        everInjected = true;   // committed: payload staged + targets converted + transformer live -> refuse any re-inject
+        INSTALLED_CFT = cft;
+        if (previous != null && inst.removeTransformer(previous))
+            InjectionLogger.info("retired the previous payload's class transformer; one transformer now serves all "
+                +RetransformConverter.scopes().size()+" payload scope(s)");
+        everInjected = true;   // committed: payload staged + targets converted + transformer live
         refreshLoadedAccessState(inst,aw);
 
         // Payload classes loaded early (e.g. pulled in during mixin-config processing, before the CFT existed) missed
@@ -609,6 +689,42 @@ public class FullInjectAgent {
     }
 
     static long tRebase, tVerify; static int nRebase;   // per-class CFT cost instrumentation (retransform window)
+    /** Targets whose latest conversion could not be published, and the payload that could not publish it. */
+    static final Map<String,String> PUBLISH_FAILED = new ConcurrentHashMap<>();
+
+    /** A conversion could not be published over the live class. FAIL CLOSED and be loud.
+     *
+     *  <p>Returning {@code null} here — which is what this used to do — does NOT leave the class as it is. A
+     *  retransform restarts from the bytes the JVM was originally handed at define time, so if every transformer
+     *  declines, the class reverts to that PRE-INJECTION state: the failure silently tears out the hooks of payloads
+     *  that were already installed and working, on top of dropping the new one's. Returning the last bytes we
+     *  successfully published instead keeps the earlier payloads exactly as they were.
+     *
+     *  <p>Recorded as a SOFT error: by the time a target is published the payload has already bootstrapped on the
+     *  game thread, so aborting cannot undo anything and would only leave the join gate shut. It is an ERROR line and
+     *  a report entry naming both the payload that failed and the payloads still live on that target. */
+    static byte[] publishFailed(String internal, Conv cv, Throwable cause) {
+        String failing = cv.scope == null ? "?" : cv.scope.id;
+        byte[] keep = PUBLISHED.get(internal);
+        PUBLISH_FAILED.put(internal, failing);
+        String live = keep == null ? "" : String.join(", ", RetransformConverter.sidecarScopesByMethod(keep)
+            .values().stream().flatMap(java.util.Set::stream).distinct().sorted().toList());
+        String detail = cause == null ? "post-retransform verification rejected the candidate" : rootMsg(cause);
+        if (keep != null) {
+            InjectionLogger.error("PUBLISH FAILED for "+internal+": payload '"+failing+"' could not be composed onto this "
+                +"class ("+detail+"). Keeping the bytes already published"+(live.isEmpty()?"":" (hooks from: "+live+")")
+                +" so the payload(s) already running are not torn out — but '"+failing+"' has NO hooks on "+internal
+                +" this session.");
+        } else {
+            InjectionLogger.error("PUBLISH FAILED for "+internal+": payload '"+failing+"' could not be composed onto this "
+                +"class ("+detail+"), and there are no previously published bytes to fall back to, so this class reverts "
+                +"to its pre-injection state and EVERY payload's hooks on it are inert this session.");
+        }
+        LateAttachVerifier.error("TARGET_PUBLISH_FAILURE", internal, "target",
+            "payload '"+failing+"' could not be published over the live class ("+detail+")"
+            +(keep!=null ? "; kept previously published bytes, hooks live from ["+live+"]" : "; NO fallback bytes, class reverted"));
+        return keep;   // null only when nothing was ever published for this target
+    }
 
     /** Publish all already-loaded target/caller rewrites from the Minecraft thread after bootstrap readiness. */
     static void activateLoadedTargets(Instrumentation inst) throws Exception {
@@ -623,9 +739,41 @@ public class FullInjectAgent {
         List<Class<?>> callers=new ArrayList<>();
         for (Class<?> c : inst.getAllLoadedClasses()) if (preBootstrapPayload.contains(c.getName())&&inst.isModifiableClass(c)) callers.add(c);
         batchRetransform(inst, callers, "caller");
+        reportComposition();
         LateAttachVerifier.writeReport();
         // Only a FATAL error aborts here; tolerable per-target/caller residue must not force the join gate closed.
         if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("Late-attach verification failed during target activation; see report");
+    }
+
+    /** Report which payloads' hooks are actually present in the bytes we published, for every target more than one
+     *  payload hooks — read back out of those bytes, not out of our own tables.
+     *
+     *  <p>This is the observable for sequential injection. A Minecraft method that two payloads both hook is exactly
+     *  the case that used to break silently: the second injection's conversion would either erase the first's hooks
+     *  or fail to publish, and nothing said so (docs/multi-payload.md §1.2). A `co-hooked` line naming two payloads on
+     *  one method IS the evidence that both survived; its absence is the regression. Single-payload injections print
+     *  nothing here, so this costs a running client nothing until a second payload arrives. */
+    static void reportComposition() {
+        if (RetransformConverter.scopes().size() < 2) return;
+        List<String> multi = new ArrayList<>();
+        int shared = 0;
+        for (var e : PUBLISHED.entrySet()) {
+            Map<String,java.util.Set<String>> byMethod = RetransformConverter.sidecarScopesByMethod(e.getValue());
+            java.util.Set<String> all = new java.util.TreeSet<>();
+            List<String> coHooked = new ArrayList<>();
+            for (var m : byMethod.entrySet()) {
+                all.addAll(m.getValue());
+                if (m.getValue().size() > 1) coHooked.add(m.getKey()+" -> "+m.getValue());
+            }
+            if (all.size() < 2) continue;
+            shared++;
+            multi.add(e.getKey()+" hooks from "+all+(coHooked.isEmpty() ? "" : "; co-hooked methods: "+coHooked));
+        }
+        InjectionLogger.info("composition: "+shared+" target(s) carry hooks from more than one payload"
+            +(PUBLISH_FAILED.isEmpty() ? "" : "; "+PUBLISH_FAILED.size()+" target(s) FAILED to compose "+PUBLISH_FAILED));
+        for (String line : multi) InjectionLogger.info("composition: "+line);
+        if (!PUBLISH_FAILED.isEmpty())
+            InjectionLogger.error("composition INCOMPLETE — these targets could not take the newest payload's hooks: "+PUBLISH_FAILED);
     }
 
     /** Retransform the whole set in ONE VM op (one safepoint, not N). retransformClasses is all-or-nothing, so if a

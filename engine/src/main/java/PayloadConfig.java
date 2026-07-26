@@ -149,6 +149,20 @@ public final class PayloadConfig {
         return c;
     }
 
+    /** Read just {@code payload.id} out of a graft.properties, WITHOUT parsing or installing the config.
+     *
+     *  <p>The duplicate-payload check must run before anything is staged onto the loader, which is well before
+     *  {@link #init} — and init publishes a process-wide INSTANCE, so calling it early to peek would swap the live
+     *  config out from under an injection that is still in progress. Uses the same default as the real parse, so the
+     *  two can never disagree about what "no id declared" means. */
+    public static String peekId(byte[] props) {
+        try {
+            Properties p = new Properties();
+            if (props != null) p.load(new ByteArrayInputStream(props));
+            return p.getProperty("payload.id", "payload").trim();
+        } catch (Throwable t) { return "payload"; }
+    }
+
     public static PayloadConfig get() {
         PayloadConfig c = INSTANCE;
         if (c == null) throw new IllegalStateException("PayloadConfig not initialized (graft.properties not loaded)");

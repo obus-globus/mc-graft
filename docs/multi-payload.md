@@ -3,15 +3,30 @@
 Goal: inject payload A into a running client, then later inject payload B into the **same** JVM
 (e.g. Zoomify now, LiquidBounce ten minutes later), with both live and neither corrupting the other.
 
-Today this is refused outright: `FullInjectAgent.everInjected` (FullInjectAgent.java:42) rejects a
-second attach. The guard is correct — everything below is what it is guarding against.
+~~Today this is refused outright: `FullInjectAgent.everInjected` (FullInjectAgent.java:42) rejects a
+second attach. The guard is correct — everything below is what it is guarding against.~~
+
+**As of P3 this works.** Two different payloads inject into one JVM, in either order, with both live on
+targets they share — asserted per method, from the bytes actually published. What remains refused is
+re-injecting the **same** payload, which would double its own hooks.
+
+The blanket guard's stated reason ("its runtime cannot be re-staged onto the already-populated loader")
+was **false**, and was never tested. Staging a second payload onto the live Knot loader is additive and
+works: measured `staged onto Knot: pushed 1 jar(s)`, `payload packages exposed to Knot: [net.wurstclient]`,
+and the second payload's entrypoint then ran on the game thread.
 
 Findings here were established by reading the code, and each is marked VERIFIED (traced to a
 mechanism) or INFERRED (read but not executed). Nothing in this document has been run yet.
 
+> **Update after P3.** That last sentence is the important one. §1 was written entirely from reading,
+> and "VERIFIED" in it meant "traced to a mechanism", not "observed". Three of its claims have since
+> been falsified by execution — §1.6's `Mixins.addConfiguration` hypothesis (P0), §1.6's
+> `payloadActivated` claim and §1.2's central conclusion (P3). Each falsified claim is struck through
+> in place rather than deleted. Read §1 as a hypothesis list.
+
 ---
 
-## 1. Why a second attach cannot work today
+## 1. Why a second attach could not work (pre-P3)
 
 ### 1.1 Agent identity — the engine has no per-jar identity (VERIFIED)
 
@@ -32,30 +47,72 @@ Consequence: **the agent cannot read its own payload's config.** This is a corre
 own right, independent of sequential injection — it makes a second attach behave as something other
 than what the user asked for. Today `everInjected` masks it by refusing first.
 
-### 1.2 Byte-source composition — payload B would silently erase payload A (VERIFIED)
+### 1.2 Byte-source composition — the real break, and the conclusion that was wrong
 
-The `ClassFileTransformer` is registered with `canRetransform=true` and left installed
-(FullInjectAgent.java:276). `retransformClasses` restarts from the class's **original** bytes and
-runs every retransform-capable transformer in registration order, so A's transformer output becomes
-B's transformer input. That much composes for free and is the one piece of good news.
+**The symptom was real; the diagnosis and the prescription were both wrong.** This section originally
+concluded "payload B's mixins must be applied to the current bytes, not the pristine ones". That is
+**FALSIFIED by execution** (P3 spike, 2026-07-26). Corrected account below.
 
-The break is at FullInjectAgent.java:240-241:
+Two claims did survive:
 
-```java
-if (c==null) t = cv.target;                                  // future-loaded: use conversion as-is
-else        t = RetransformConverter.rebase(cv.target, b);   // already-loaded: rebase onto current
-```
+* The CFT is registered with `canRetransform=true` and left installed (FullInjectAgent.java:276), and
+  `retransformClasses` restarts from the class's **original** bytes.
+* `rebase(candidate, actualBaseline)` (RetransformConverter.java:1444) keeps `candidate`'s method
+  bodies and restores `actualBaseline`'s schema via `restoreOriginalSchema`.
 
-`rebase(candidate, actualBaseline)` (RetransformConverter.java:1340) keeps **`candidate`'s method
-bodies** and only restores `actualBaseline`'s *schema* (field modifiers, method ordering, exception
-lists) via `restoreOriginalSchema`. Meanwhile payload B's `cv.target` is computed in Phase A from
-**pristine** bytes — `originalBytes()` → baseline / `getRawClassBytes()` (FullInjectAgent.java:123).
+What was wrong:
 
-So for any Minecraft method that **both** payloads modify, B's conversion never saw A's edits, and
-rebase re-emits B's bodies over them. Payload A's hook on that method is lost, silently.
+**(a) "A's transformer output becomes B's transformer input… composes for free" — WRONG, and the
+opposite of free.** The retransform baseline is the bytes the JVM was handed at *define* time, not any
+transformer's later output. Measured with a standalone JVMTI harness (`Target.v()` returning 1 vs 2, a
+retransform-capable transformer, positive control showing the transform does apply): once the
+transformer returns `null` — or throws — the class **reverts to the pre-transformer bytes**. So a
+transformer that fails during a second injection does not "leave things as they are"; it silently tears
+out the hooks of a payload that was already installed and working. Observed live: with a naive second
+injection, Camera / Hud / MouseHandler each logged `CFT fail`, `retransformed 47/47` still reported
+success, and all three went back to their pre-injection state.
 
-This is the core of the work: **payload B's mixins must be applied to the current bytes, not the
-pristine ones.**
+**(b) "B's conversion never saw A's edits" — WRONG. Mixin already composes for free.** Payload A's
+mixin config stays permanently selected in the live Mixin once promoted (P0 established that it stays
+in `MixinProcessor.configs`). So a *single* `transformClassBytes` on **pristine** bytes during
+injection B re-derives every registered payload together and yields X_others+A+B. Measured: on
+injection B, Camera's freshly captured baseline contains exactly Zoomify's three handlers, which the
+pristine pre-mixin bytes do not.
+
+**(c) "Apply B's mixins to the current bytes" — FALSIFIED as a prescription.** Handing
+`IMixinTransformer.transformClassBytes` payload A's published `target'` was tested directly:
+
+* `net/minecraft/client/Camera` — **succeeds, and that is the bad case.** The output contains
+  `modifyReturnValue$beb000$modifyFovWithZoom` again: Mixin **re-applied payload A's mixins** on top of
+  bytes whose woven call sites already carry them. Zoomify's `@ModifyReturnValue` on `calculateFov`
+  would run twice. Silent double-application of every already-injected payload, on every later injection.
+* `net/minecraft/client/MouseHandler` — **hard failure.** `InvalidMixinException:
+  wrapOperation$zfi000$fabric-events-interaction-v0$wrapSelectedSlot … cannot overwrite method in
+  net.minecraft.client.MouseHandler because @Overwrite is required` — re-applying a config whose method
+  is already present collides with it.
+
+There is no supported way to deselect a config, so this is wrong by construction, not merely risky.
+
+**The corrected finding.** Mixin needs no help and must keep receiving pristine bytes. The entire defect
+is in the converter's **baseline** and **publish** path:
+
+* The converter's schema baseline `O` must stay the **true original** — the plane the loaded class is
+  actually at, captured before any payload of ours. `FabricPlatform.baseline` (:35) was a per-instance
+  field on a platform rebuilt every injection (`PLATFORM = detectPlatform(inst)`,
+  FullInjectAgent.java:129), so injection B recaptured it *with A's config selected* and got X_others+A.
+  Two distinct measured publish failures followed from that single cause:
+  `Cannot restore original schema for net/minecraft/client/Camera: extra methods [Zoomify's three
+  handlers]`, and `… missing method mixinextras$bridge$mouseClicked$43` — MixinExtras numbers its
+  synthetic bridges by `methods.size()`, so another payload's members shift every other mod's bridge
+  suffix and `alignSynthetics` then realigned to the wrong plane.
+* With `O` correct, `diff(O, X)` contains **every** payload's added members. The earlier payloads' are
+  *foreign*: strip them from `target'` (the loaded class does not have them) but do **not** relocate
+  them — they already live on their own payload's sidecar holding that payload's state, and `gLookup`
+  redirects every reference to them there for free, because it searches all scopes.
+
+Net effect: one `target'` carrying both payloads' woven bodies at the original schema. The observable is
+`RetransformConverter.sidecarScopesByMethod`, read back out of the bytes actually published and reported
+as the `composition:` / `co-hooked methods:` log lines, which `tools/multi-payload-test.sh` asserts.
 
 ### 1.3 Generated names collide on shared targets (VERIFIED)
 
@@ -97,13 +154,35 @@ the interface has a single implementation (RetransformConverter.java:1109-1129).
 second implementation, A's already-rewritten callers keep the collapsed form and will reject B's
 instances. Classes rewritten during injection A are not revisited when the `ifaceMap` grows.
 
-### 1.6 Mixin/loader state assumes one activation (VERIFIED)
+### 1.6 Mixin/loader state assumes one activation — two of four claims falsified
 
-* `FabricPlatform.payloadActivated` (:36) makes `prepareBaselines` throw if called twice (:321).
+This section was labelled VERIFIED but was written **from reading, not from running**, and two of its
+four bullets did not survive contact. Treat the remaining two as read-only findings too.
+
+* ~~`FabricPlatform.payloadActivated` (:36) makes `prepareBaselines` throw if called twice (:321).~~
+  **WRONG.** `payloadActivated` is a **non-static instance field**, and `agentmain` does
+  `PLATFORM = detectPlatform(inst)` (FullInjectAgent.java:129) — a **fresh `FabricPlatform` per
+  injection**. It can never be `true` on entry to a second `prepareBaselines`. VERIFIED by execution:
+  the second injection logs `captured 63 non-payload mod baselines (X_others)` and proceeds. Nothing
+  in the engine was blocking a second `prepareBaselines`; the blanket `everInjected` guard was.
+
+  Same shape in `NeoForgePlatform` (:163-164), also per-instance, also therefore inert.
+
+  The *real* problem in that area was the opposite of a block: the second `prepareBaselines` ran
+  happily and returned the **wrong plane** (X_others+A), because the earlier payload's config is still
+  selected — see §1.2.
 * `reconcileClassInfoWithAw` (:260-312) mutates cached `ClassInfo.Member` access flags in place —
   deliberately *not* eviction, because eviction was measured to drop 7 of 8 registered `MixinInfo`s.
   It syncs **access flags only**, not member lists, so after injection A the cache does not describe
   A's added members.
+
+  **Measured, and it does not matter.** `ClassInfo` for `Camera` after a Zoomify injection holds 3
+  members the published `target'` does not have — exactly Zoomify's handlers — so the cache is
+  genuinely stale *relative to the published class*. But it is stale in precisely the direction Mixin
+  needs: Mixin never reads published bytes, it re-derives from `getPreMixinClassBytes` with A's config
+  still selected, and that output *does* contain those members. **P3 needed no `ClassInfo` refresh at
+  all**, and the plan's step 3 ("refresh `ClassInfo` for those targets") was dropped as unnecessary
+  rather than implemented.
 * An AccessWidener only affects classes loaded *after* it registers; already-loaded classes keep
   their original access permanently. A second payload's AW inherits that constraint.
 * `Mixins.addConfiguration` writes to a **process-global** registry, and the `transformedCount` reset
@@ -243,18 +322,77 @@ Two things found while doing it, neither of which the §1.3/§1.4 reading predic
   `EMITTED_RT_CALLS`, so that part of the runtime contract was unchecked. Now recorded at the emit site, with a second
   gate sweep after the payload-jar preflight and still before any target' is published.
 
-### P3 — Byte-source composition (fixes §1.2, §1.6) — the hard one
+### P3 — Byte-source composition (fixes §1.2) — the hard one
 
-1. The CFT records what it published per target (`Map<String, byte[]> published`).
-2. For injection N>1, `originalBytes(target)` returns the published bytes when present, so Mixin
-   applies B on top of A's `target'` rather than on pristine bytes.
-3. Refresh Mixin's `ClassInfo` for those targets so it describes the current shape — extending the
-   existing in-place mutation (§1.6), **not** eviction, for the measured reason.
-4. Replace `payloadActivated` / `everInjected` with per-scope state.
+**Status: DONE.** `tools/multi-payload-test.sh` passes both payloads in **both orders** (Zoomify → Wurst
+and Wurst → Zoomify), including the `COMPOSITION` assertion that a single Minecraft method carries hooks
+from both. Each order also serves as that payload's single-injection regression (all six payload-A
+assertions), so Zoomify and Wurst are both covered as a lone payload. The measured composition, identical
+in both orders:
 
-Known limitation to document rather than solve: payload A's *added* members live on A's sidecar, not
-on `target'`, so a mixin in B that tried to inject into a method A added would not see it. Two mods
-hooking each other's additions is not a case we need.
+```
+composition: 3 target(s) carry hooks from more than one payload
+composition: net/minecraft/client/Camera hooks from [wurst, zoomify]; co-hooked methods:
+  [calculateFov(F)F -> [wurst, zoomify], calculateHudFov(F)F -> [wurst, zoomify],
+   extractRenderState(...)V -> [wurst, zoomify]]
+composition: net/minecraft/client/MouseHandler hooks from [wurst, zoomify]; co-hooked methods:
+  [onScroll(JDD)V -> [wurst, zoomify], turnPlayer(D)V -> [wurst, zoomify]]
+composition: net/minecraft/client/gui/Hud hooks from [wurst, zoomify]
+```
+
+**What that does and does not establish.** It is read from the bytes the CFT actually handed the JVM, so
+both payloads' hooks are demonstrably woven into the same method. It is **not** evidence that either hook
+executed: every co-hooked method here needs a world, and the harness stops at the title screen. See P5.
+
+**The plan below was written before the spike and its central step was wrong.** Kept for the record,
+struck through, with what actually shipped underneath.
+
+1. ~~The CFT records what it published per target (`Map<String, byte[]> published`).~~ Kept, but for a
+   different purpose (see 1' below).
+2. ~~For injection N>1, `originalBytes(target)` returns the published bytes when present, so Mixin
+   applies B on top of A's `target'` rather than on pristine bytes.~~ **FALSIFIED** — feeding Mixin
+   converted bytes silently double-applies every already-injected payload, and hard-fails where
+   re-application collides. §1.2(c) has the measurements.
+3. ~~Refresh Mixin's `ClassInfo`.~~ **Not needed.** §1.6 bullet 2 has the measurement.
+4. Replace `payloadActivated` / `everInjected` with per-scope state. — Kept.
+
+**What shipped instead.** Mixin keeps receiving pristine bytes and composes all registered payloads by
+itself; the fix is entirely in the converter's baseline and publish path.
+
+1'. **Persistent schema baseline.** `FullInjectAgent.SCHEMA_BASELINE` holds, per target, the plane the
+    JVM actually loaded (other mods' mixins, none of ours). `FabricPlatform.prepareBaselines` reuses an
+    established entry instead of recapturing, because a recapture runs with the earlier payload's config
+    selected and yields the wrong plane. This one change fixes both measured publish failures.
+2'. **Foreign members.** `diff(O, X)` now contains every payload's additions. Members an earlier scope
+    already claimed (`RetransformConverter.foreignMethodOwner` / `foreignFieldOwner` /
+    `foreignIfaceOwner`) are stripped from `target'` but not relocated and not re-registered; `gLookup`
+    already routes their references to the owning payload's sidecar. `collectAdded` skips them too.
+3'. **One transformer, not N.** Each injection installs its own CFT and retires the previous one
+    (`FullInjectAgent.INSTALLED_CFT`). Leaving both installed ran every conversion twice and duplicated
+    every failure, since `convMap` and the conversion tables are static.
+4'. **Fail closed and loud on a publish failure** (`FullInjectAgent.publishFailed`). Returning `null`
+    reverts the class to its pre-injection state — §1.2(a) — so a failure used to erase a *working*
+    payload silently. It now falls back to the last successfully published bytes, logs an ERROR naming
+    both the payload that failed and the payloads still live on that target, and records
+    `TARGET_PUBLISH_FAILURE`.
+5'. **Observability.** `RetransformConverter.sidecarScopesByMethod` reads the published bytes back and
+    reports which payloads' sidecars each method calls into; a `co-hooked methods:` line is the direct
+    evidence that two payloads survived on one method. Asserted by `tools/multi-payload-test.sh`
+    (`COMPOSITION`, `COMPOSITION_COMPLETE`).
+6'. **Duplicate-payload refusal.** `everInjected` no longer refuses a second payload; re-injecting the
+    **same** payload id is refused instead (`RetransformConverter.scopeForId`), because its config is
+    still selected and a second pass would double every one of its hooks.
+
+Known limitations, documented rather than solved:
+
+* Payload A's *added* members live on A's sidecar, not on `target'`, so a mixin in B that injected into
+  a method A added would not see it. Two mods hooking each other's additions is not a case we need.
+* **WHOLE targets (UNTESTED).** A target an earlier payload converted WHOLE keeps that payload's members
+  on the class. While it is still unloaded this composes (its baseline becomes that whole output). Once
+  it has loaded, its schema is frozen with those members and no later payload's conversion can be
+  published over it; phase A detects this and skips the target with a warning naming both payloads.
+  **No measured instance of this exists** — every overlapping target in the zoomify×wurst pair is
+  pre-loaded, so this path has never executed. It is defensive code, not tested behaviour.
 
 ### P4 — Caller re-adaptation (fixes §1.5)
 
@@ -267,24 +405,54 @@ single-implementation collapse once more than one payload is registered, and alw
 
 On a real client, not a harness:
 
-* Zoomify → LiquidBounce, and LiquidBounce → Zoomify (order matters; both must pass).
+* ~~Zoomify → LiquidBounce, and LiquidBounce → Zoomify.~~ **Not runnable in this environment**, and not
+  for a multi-payload reason: `/tmp/lbpay.jar` is a thin LiquidBounce jar whose init dies on
+  `NoClassDefFoundError: net/ccbluex/liquidbounce/authlib/account/MinecraftAccount` in **either** slot.
+  Measured as payload B once P3 admitted a second injection: LB converts 145 targets and bootstraps,
+  then dies at the same missing class, so its retransforms are never published. The harness header
+  previously claimed LB was "fine as payload B"; that is corrected.
+
+  Substituted: **Zoomify ↔ Wurst**, which is a stronger pair for this purpose — both hook
+  `Camera.calculateFov`, `Camera.calculateHudFov` and `Camera.extractRenderState`, so the overlap is
+  natural rather than constructed. Both orders pass.
 * A deliberately overlapping pair — both payloads hooking the same target method — asserting **both**
   hooks fire. This is the §1.2 regression test and the one that actually matters.
-* Payload A still functional after B lands (zoom still zooms; LB UI still renders).
+
+  Now automated as the `COMPOSITION` assertion, measured from the bytes actually published:
+  `Camera.calculateFov(F)F -> [wurst, zoomify]`, in both orders. **Scope of that evidence:** it proves
+  both payloads' hooks are woven into the published method, not that the method executed. Every
+  co-hooked method here (`Camera.calculateFov`, `MouseHandler.turnPlayer`, …) needs a world, and this
+  harness stops at the title screen — the same structural gap the 2026-07-25 session notes flag. Do not
+  read `COMPOSITION` as "both hooks fired".
+* Payload A still functional after B lands (zoom still zooms; LB UI still renders). — **Still open** for
+  the same reason: unverified beyond "A's hooks are present in the published bytes, A's own classes were
+  re-rewritten, and no fault appeared on a game thread".
 * Both orders re-run after P4 to confirm duck dispatch survives a growing `ifaceMap`.
 
 ---
 
 ## 3. Risks
 
-* **P3 is the phase that can fail on contact.** Mixin applying to already-converted bytes is not a
-  path the library was designed for; if `ClassInfo` cannot be made to describe `target'` accurately,
-  the fallback is to re-derive the full mixin output for *all* registered payloads from pristine bytes
-  on every injection and publish the combined result — more work per injection, but it keeps Mixin on
-  its intended path. Decide this with a spike, before building on top of it.
+* ~~**P3 is the phase that can fail on contact.**~~ It did, and the spike caught it before anything was
+  built on top — which is what the spike was for.
+
+  The stated fallback ("re-derive the full mixin output for *all* registered payloads from pristine
+  bytes on every injection and publish the combined result") was **the right shape for the wrong
+  reason**. It was proposed as a costly retreat for when `ClassInfo` could not be made to describe
+  `target'`. In fact `ClassInfo` never needed to describe `target'` at all (§1.6), and the re-derivation
+  is not a retreat and costs nothing extra: Mixin performs it **automatically** in a single
+  `transformClassBytes`, because every earlier payload's config stays selected. What actually replaced
+  it is the same idea minus the imagined cost — keep feeding Mixin pristine bytes, and fix the
+  converter's baseline and publish path instead (P3 items 1'–6').
+
+  The real trap was in the opposite direction from the one this risk anticipated: the *primary* plan
+  (feed Mixin the converted bytes) is the one that silently double-applies. See §1.2(c).
 * **Mixin version drift.** The `transformedCount` reset and the pending-config queue are internal
   behaviour, already asserted to fail loud. More injections means more exposure to it.
-* **Memory.** Retaining published bytes per target for the session is bounded by target count
-  (~151 for LiquidBounce), so it is small — but it is a new retention, worth measuring.
+* **Memory.** Two retentions now, not one: `PUBLISHED` (the last bytes handed to the JVM per target)
+  and `SCHEMA_BASELINE` (the original plane per target). Both are bounded by target count. Measured
+  per-class sizes on this client: `Camera` 22.8 KB, `MouseHandler` 30.1 KB. At ~25 KB average that is
+  ~1.6 MB per map for Wurst's 63 targets and ~3.6 MB for LiquidBounce's 145 — so single-digit MB for a
+  two-payload session (INFERRED from the measured per-class sizes; the totals were not measured).
 * **A single-payload regression is the worst outcome.** Every phase must keep the existing
   single-injection path working; P1 and P2 are refactors under a working test, not rewrites.
