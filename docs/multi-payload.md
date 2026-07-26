@@ -107,9 +107,41 @@ instances. Classes rewritten during injection A are not revisited when the `ifac
 * An AccessWidener only affects classes loaded *after* it registers; already-loaded classes keep
   their original access permanently. A second payload's AW inherits that constraint.
 * `Mixins.addConfiguration` writes to a **process-global** registry, and the `transformedCount` reset
-  (FabricPlatform.java:362) forces `checkSelect → select → prepareConfigs`, promoting *all* pending
-  configs — including any left from an earlier injection. (This is the leading explanation for the
-  unexplained `wurst.mixins.json` report; it needs a local repro to confirm.)
+  (FabricPlatform.java:362) forces `checkSelect → select → prepareConfigs`.
+
+  This was proposed as the explanation for the unexplained `wurst.mixins.json` report and is
+  **FALSIFIED**. A probe agent (its own `Agent-Class`, so the re-injection guard does not apply)
+  dumped the live Mixin state after a complete Wurst injection: `pendingConfigs count=0`,
+  `Mixins.getUnvisitedCount() = 0`, and `wurst.mixins.json` already in `MixinProcessor.configs`.
+  There is no leftover *pending* config for a later injection to promote. Positive control: the same
+  probe detects the config appearing (61 → 62), so it is not blind. What remains true is weaker —
+  the config stays permanently in the live `configs` list.
+
+  Only the "leftover from an earlier injection" precondition was tested. Whether the reset
+  re-promotes configs *within* a single injection is still untested.
+
+### 1.7 What actually produces the `wurst.mixins.json` symptom (VERIFIED)
+
+The real mechanism is §1.1, and it is worse than §1.1 as first stated: it does not need a second
+*injection*, only a second *jar on the classpath*.
+
+A refused or failed attach still leaves its jar there — the JVM calls
+`appendToSystemClassLoaderSearch` **before** `agentmain`, so even an injection that dies at the
+`everInjected` guard permanently adds its `graft.properties` to the classpath.
+
+Reproduced end-to-end: attach a decoy jar (a copy of the Wurst agent with `Agent-Class: NoopAgent`,
+modelling that residue), then run `mcgraft inject --agent liquidbounce-agent.jar` as the **first**
+real injection on a fresh client:
+
+```
+[mc-graft] [INFO] payload 'wurst': mixins=[wurst.mixins.json] aw=wurst.accesswidener ...
+[Attach Listener/ERROR]: Critical problem: wurst.mixins.json:BlockMixin ... was loaded too early.
+```
+
+The user asked for LiquidBounce and got Wurst, on a client with no Wurst installed — the reported
+symptom exactly. VERIFIED as a mechanism. That this is what happened *historically* remains
+INFERRED: it fits (injections were failing constantly in that era, and every failure leaves this
+residue) but was not measured at the time.
 
 ---
 
@@ -138,6 +170,24 @@ announces A's mixin config. Confirms or kills §1.6's hypothesis cheaply.
    rather than as a side effect.
 
 Correct on its own merits: today a second attach reads the wrong config.
+
+**Status: DONE and verified on a live client.** The §1.7 decoy reproduction was re-run against the
+P1 engine and flips from `payload 'wurst'` to `payload 'liquidbounce'`, logging
+`attaching jar ... is not the jar that defined this engine ... — reading the payload config from the
+attaching jar` and `attaching jar carries the same engine build`. Single-injection regression: all
+six payload-A assertions in `tools/multi-payload-test.sh` still pass.
+
+Two limits, stated because they are easy to over-read:
+
+* **P1 fixes the config source, not the runtime-class source.** `mcgraft.rt.*` is still staged from
+  the jar that *defined* the engine — which is correct, since those helpers must match the engine
+  that is actually running. In the decoy scenario that jar never exposed them to Knot, so the
+  injection now fails loudly at the pre-publish contract gate instead of silently injecting the
+  wrong mod. Strictly better, not "works".
+* **A pre-P1 residue jar is still unprotectable.** If the already-loaded engine predates P1, its
+  code runs and does the old thing; nothing shipped later can change that. The first decoy run
+  demonstrated exactly this — the fix appeared not to work until the decoy was rebuilt on the P1
+  engine.
 
 ### P2 — Per-payload scoping (fixes §1.3, §1.4)
 

@@ -562,6 +562,36 @@ fn report_resource_needs(
     log("    pass these with  --config <file.properties>  (see examples/liquidbounce/bootstrap.properties)");
 }
 
+/// Add `MC-Graft-Engine: <id>` to a manifest's MAIN section.
+///
+/// A jar manifest's main section ends at the first blank line; everything after that belongs to a per-entry section
+/// (the base jar has one, pinning ASM's Implementation-Version for Mixin's compatibility check). Appending at the end
+/// of the file would therefore attach the attribute to that entry section instead, where nothing reads it. Insert
+/// before the first blank line, or append when there is no per-entry section at all.
+fn stamp_engine_id(manifest: &[u8], id: &str) -> Vec<u8> {
+    let line = format!("MC-Graft-Engine: {id}\r\n");
+    let text = String::from_utf8_lossy(manifest);
+    // A blank line is "\r\n\r\n" in a spec-conformant manifest, but tolerate bare LF rather than silently appending to
+    // the wrong section if some writer emitted Unix line endings.
+    let split = text.find("\r\n\r\n").map(|i| i + 2).or_else(|| text.find("\n\n").map(|i| i + 1));
+    let mut out = Vec::with_capacity(manifest.len() + line.len());
+    match split {
+        Some(at) => {
+            out.extend_from_slice(&manifest[..at]);
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(&manifest[at..]);
+        }
+        None => {
+            out.extend_from_slice(manifest);
+            if !text.ends_with('\n') {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+    out
+}
+
 fn assemble(
     base: &Path,
     payload: &Path,
@@ -588,6 +618,18 @@ fn assemble(
     let opts: zip::write::SimpleFileOptions =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
+    // Identify the ENGINE this agent carries, independently of the payload spliced into it. Two agent jars attached to
+    // one JVM share a class loader and the engine lives in the default package, so jar #2's `FullInjectAgent` never
+    // gets defined — jar #1's already-loaded class runs instead. That is survivable when both jars carry the same
+    // engine and fatal when they do not, and the engine cannot tell the difference without something to compare.
+    // Hash the base jar (engine + its libs, no payload), so agents built from one base agree by construction.
+    let engine_id = {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(base).map_err(|e| format!("read base {}: {e}", base.display()))?;
+        let digest = Sha256::digest(&bytes);
+        digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
     for i in 0..zin.len() {
         let mut e = zin.by_index(i).map_err(|err| format!("read base entry {i}: {err}"))?;
         let name = e.name().to_string();
@@ -597,6 +639,9 @@ fn assemble(
         }
         let mut buf = Vec::new();
         e.read_to_end(&mut buf).map_err(|err| err.to_string())?;
+        if name.eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
+            buf = stamp_engine_id(&buf, &engine_id);
+        }
         zout.start_file(name, opts).map_err(|err| err.to_string())?;
         zout.write_all(&buf).map_err(|err| err.to_string())?;
     }

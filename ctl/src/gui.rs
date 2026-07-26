@@ -330,7 +330,12 @@ impl App {
         // Assemble agent args (ARG_SEP-joined), then a temp log path we tail.
         let log_path = std::env::temp_dir().join(format!("mcgraft-inject-{pid}.log"));
         let _ = std::fs::write(&log_path, b""); // truncate so we tail only this run
-        let mut parts = vec![format!("logFile={}", log_path.display())];
+        // See the same argument in main.rs: on a second attach the engine resolves to jar #1's already-loaded class,
+        // so it cannot locate its own jar and would read jar #1's payload config.
+        let mut parts = vec![
+            format!("logFile={}", log_path.display()),
+            format!("agentJar={}", std::fs::canonicalize(&agent).unwrap_or_else(|_| agent.clone()).display()),
+        ];
         match self.game_dir {
             GameDir::ClientDir => {}
             GameDir::WorkingDir => parts.push("gameDir=.".into()),

@@ -315,7 +315,15 @@ fn cmd_inject(a: InjectArgs) {
 
     // Build the agent option string (key=value pairs, ARG_SEP-joined).
     let log_path = a.log.clone().unwrap_or_else(|| default_log(pid));
-    let mut parts: Vec<String> = vec![format!("logFile={}", log_path.display())];
+    // Tell the agent which jar it was attached from. It cannot work this out for itself: the engine lives in the
+    // default package, so on a second attach into the same JVM the JVM resolves `Agent-Class` to jar #1's
+    // already-loaded class, and both routes the engine would otherwise use — its own ProtectionDomain CodeSource and
+    // a classpath `getResourceAsStream("graft.properties")` — then point at jar #1. Without this the second injection
+    // silently runs with the FIRST payload's config.
+    let mut parts: Vec<String> = vec![
+        format!("logFile={}", log_path.display()),
+        format!("agentJar={}", std::fs::canonicalize(&a.agent).unwrap_or_else(|_| a.agent.clone()).display()),
+    ];
     if a.here {
         parts.push("gameDir=.".into());
     } else if let Some(dir) = &a.game_dir {

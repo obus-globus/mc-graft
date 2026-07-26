@@ -37,8 +37,89 @@ public class FullInjectAgent {
             else LateAttachVerifier.error("SIDECAR_DEFINE_FAILURE",sidecarName,"sidecar","One or more synthetic/state/sidecar definitions failed");
             return ok; } } }
 
+    /** Manifest attribute identifying the ENGINE build an agent jar carries, stamped by the packer. */
+    private static final String ENGINE_ATTR = "MC-Graft-Engine";
+
+    /** Locate the jar this injection was requested with.
+     *
+     *  <p>The engine cannot answer this from its own class. It lives in the default package, and every agent jar is
+     *  appended to the SAME system class loader, so on a second attach the JVM resolves {@code Agent-Class} to the
+     *  copy already defined from jar #1 — jar #2's classes are never defined. Both of the routes the engine could use
+     *  to find "its" jar then point at jar #1: {@code getProtectionDomain().getCodeSource()} is fixed at
+     *  class-definition time, and a classpath resource lookup returns the earliest jar on the path.
+     *
+     *  <p>So the injector passes the path explicitly ({@code agentJar=}). Fall back to the CodeSource when it is
+     *  absent, which keeps a hand-rolled attach (or an older injector) working for the single-injection case. */
+    private static File resolveAgentJar(String args) throws Exception {
+        File loaded = engineJar();
+        String arg = InjectionLogger.argValue(args, "agentJar");
+        if (arg == null || arg.isBlank()) {
+            if (loaded == null) throw new IllegalStateException(
+                "cannot locate the agent jar: no agentJar= argument was passed and this class has no CodeSource");
+            return loaded;
+        }
+        File given = new File(arg);
+        if (!given.isFile()) {
+            InjectionLogger.warn("agentJar=" + arg + " is not a readable file; falling back to the jar that defined this engine");
+            if (loaded == null) throw new IllegalStateException("cannot locate the agent jar: " + arg + " is not readable");
+            return loaded;
+        }
+        if (loaded != null && !loaded.getCanonicalFile().equals(given.getCanonicalFile()))
+            InjectionLogger.info("attaching jar " + given + " is not the jar that defined this engine (" + loaded
+                + ") — reading the payload config from the attaching jar");
+        return given;
+    }
+
+    /** Refuse when the attaching jar carries a DIFFERENT engine build than the one already running.
+     *
+     *  <p>Only reachable on a second attach, where jar #2's engine classes are never defined and jar #1's code runs in
+     *  their place. Identical builds make that harmless; differing builds mean the running engine is being asked to
+     *  honour a contract it may not implement, and failing loudly beats behaving subtly wrongly. */
+    private static void verifyEngineIdentity(File attaching) {
+        File loaded = engineJar();
+        if (loaded == null) return;
+        try { if (loaded.getCanonicalFile().equals(attaching.getCanonicalFile())) return; }   // same jar: nothing to compare
+        catch (IOException e) { return; }
+        String running = engineId(loaded), requested = engineId(attaching);
+        if (running == null || requested == null) {
+            InjectionLogger.warn("cannot compare engine builds (" + loaded + " -> " + running + ", " + attaching + " -> "
+                + requested + "); proceeding with the engine already loaded in this JVM");
+            return;
+        }
+        if (running.equals(requested)) { InjectionLogger.info("attaching jar carries the same engine build (" + running + ")"); return; }
+        InjectionLogger.error("engine mismatch: this JVM already loaded engine " + running + " (from " + loaded
+            + "), but " + attaching + " carries engine " + requested + ". The JVM cannot define a second copy of the "
+            + "engine's classes, so the ALREADY-LOADED engine would run against this jar's payload. Refusing rather "
+            + "than injecting with an engine this agent was not built for — restart the client to use this jar.");
+        throw new IllegalStateException("agent engine " + requested + " does not match the engine already loaded in this JVM (" + running + ")");
+    }
+
+    /** The jar that defined this class, or null when it has no usable CodeSource. */
+    private static File engineJar() {
+        try { return new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI()); }
+        catch (Throwable t) { return null; }
+    }
+
+    private static String engineId(File jar) {
+        try (JarFile jf = new JarFile(jar)) {
+            Manifest m = jf.getManifest();
+            return m == null ? null : m.getMainAttributes().getValue(ENGINE_ATTR);
+        } catch (Throwable t) { return null; }
+    }
+
+    /** Read a resource from a specific agent jar, bypassing the shared classpath. */
+    static byte[] agentResource(File jar, String path) throws IOException {
+        try (JarFile jf = new JarFile(jar)) {
+            JarEntry e = jf.getJarEntry(path);
+            if (e == null) throw new IOException(path + " not found in " + jar);
+            try (InputStream in = jf.getInputStream(e)) { return in.readAllBytes(); }
+        }
+    }
+
     public static void agentmain(String a, Instrumentation inst) throws Exception {
         InjectionLogger.configure(a);
+        File self = resolveAgentJar(a);
+        verifyEngineIdentity(self);
         if (everInjected) { InjectionLogger.error("re-injection refused: a payload was already injected into this JVM. Re-injecting is not supported (its runtime cannot be re-staged onto the already-populated loader). Restart the client to inject again.");
             throw new IllegalStateException("re-injection is not supported in the same JVM; restart the client"); }
         INST = inst;
@@ -65,9 +146,11 @@ public class FullInjectAgent {
         RetransformConverter.ALREADY_LOADED = preLoaded::contains;   // ...which is exactly this set. See RetransformConverter's "ENFORCED access" block
         RetransformConverter.TYPE_INACCESSIBLE = INACC::contains;    // the class-level equivalent, computed just below
         InjectionLogger.info("staging payload bundle ("+preLoaded.size()+" classes already loaded)");
-        File self = new File(FullInjectAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         Path payloadBundle = PLATFORM.stageBundle(inst, self);
-        final PayloadConfig cfg = PayloadConfig.init(PLATFORM.bundleResource("graft.properties"));
+        // Read the payload's own config out of the ATTACHING jar, not off the classpath. Both agent jars are appended
+        // to the same system loader, so a classpath lookup returns whichever jar was appended first — i.e. a second
+        // injection would silently run with the first payload's config. See resolveAgentJar.
+        final PayloadConfig cfg = PayloadConfig.init(agentResource(self, "graft.properties"));
         RetransformConverter.PAYLOAD_CLASSES = readPayloadClasses(payloadBundle, cfg.callerRewritePackages);
         GENUINE_IFACES = scanGenuineImplementors(payloadBundle, cfg.callerRewritePackages);
         // Also caller-rewrite the applied dependency (fabric-api) runtime: its own classes cast MC objects to duck
@@ -96,7 +179,7 @@ public class FullInjectAgent {
         } catch(Throwable t){ InjectionLogger.warn("INACC compute failed -> "+rootMsg(t)); }
 
         List<String> targets = new ArrayList<>();
-        try (var r = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(PLATFORM.bundleResource("mixin-targets.txt")), java.nio.charset.StandardCharsets.UTF_8))) { String l; while ((l=r.readLine())!=null) if(!l.isBlank()) targets.add(l.trim().replace('.','/')); }
+        try (var r = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(agentResource(self, "mixin-targets.txt")), java.nio.charset.StandardCharsets.UTF_8))) { String l; while ((l=r.readLine())!=null) if(!l.isBlank()) targets.add(l.trim().replace('.','/')); }
         targetSet.addAll(targets);
         PLATFORM.prepareBaselines(targets);   // Fabric: capture the non-payload baseline before the payload's config is selected
 
