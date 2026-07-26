@@ -480,6 +480,11 @@ pub fn version_line() -> String {
     format!("mcgraft {} ({})", env!("CARGO_PKG_VERSION"), env!("MCGRAFT_COMMIT"))
 }
 
+/// The commit this binary was built from, for comparison against the base jar it packs against.
+pub fn version_line_commit() -> &'static str {
+    env!("MCGRAFT_COMMIT")
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     exit(1);

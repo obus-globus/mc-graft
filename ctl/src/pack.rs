@@ -640,9 +640,27 @@ fn assemble(
         let digest = Sha256::digest(&bytes);
         digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
     };
-    // Name the ENGINE going into this agent, not just the packer that assembled it — the engine is what runs inside
-    // the client, and the two can drift (a freshly downloaded binary packing against a stale base jar in a repo).
-    eprintln!("  engine {} (build {})", base_engine_commit(&mut zin).as_deref().unwrap_or("commit unknown"), engine_id);
+    // Name the ENGINE going into this agent, not just the packer that assembled it. The engine is what actually runs
+    // inside the client, and the two drift trivially: this binary embeds no base jar, it PICKS one off disk (next to
+    // the exe, or a config dir), so downloading a new binary alone changes nothing. That cost an hour of testing
+    // against a fix that was never in the agent, so a mismatch is called out rather than merely printed.
+    let base_commit = base_engine_commit(&mut zin);
+    eprintln!("  engine {} (build {})", base_commit.as_deref().unwrap_or("commit unknown"), engine_id);
+    match base_commit.as_deref() {
+        Some(c) if c != crate::version_line_commit() => eprintln!(
+            "  WARNING: this engine was built from {c}, but mcgraft itself is {}.\n  \
+             The ENGINE is what runs in the client — replace {} with the one matching this binary,\n  \
+             or the agent you are building will not contain this binary's engine changes.",
+            crate::version_line_commit(),
+            base.display()
+        ),
+        None => eprintln!(
+            "  WARNING: {} carries no build stamp, so it predates version stamping. It is almost certainly older \n  \
+             than this binary; replace it if you expect recent engine fixes.",
+            base.display()
+        ),
+        _ => {}
+    }
 
     for i in 0..zin.len() {
         let mut e = zin.by_index(i).map_err(|err| format!("read base entry {i}: {err}"))?;
