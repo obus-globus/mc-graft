@@ -342,7 +342,8 @@ composition: net/minecraft/client/gui/Hud hooks from [wurst, zoomify]
 
 **What that does and does not establish.** It is read from the bytes the CFT actually handed the JVM, so
 both payloads' hooks are demonstrably woven into the same method. It is **not** evidence that either hook
-executed: every co-hooked method here needs a world, and the harness stops at the title screen. See P5.
+executed: every co-hooked method here needs a world, and `tools/multi-payload-test.sh` stops at the title
+screen. Execution is established separately by `tools/world-join-test.sh` — see P5.
 
 **The plan below was written before the spike and its central step was wrong.** Kept for the record,
 struck through, with what actually shipped underneath.
@@ -419,15 +420,81 @@ On a real client, not a harness:
   hooks fire. This is the §1.2 regression test and the one that actually matters.
 
   Now automated as the `COMPOSITION` assertion, measured from the bytes actually published:
-  `Camera.calculateFov(F)F -> [wurst, zoomify]`, in both orders. **Scope of that evidence:** it proves
-  both payloads' hooks are woven into the published method, not that the method executed. Every
-  co-hooked method here (`Camera.calculateFov`, `MouseHandler.turnPlayer`, …) needs a world, and this
-  harness stops at the title screen — the same structural gap the 2026-07-25 session notes flag. Do not
-  read `COMPOSITION` as "both hooks fired".
-* Payload A still functional after B lands (zoom still zooms; LB UI still renders). — **Still open** for
-  the same reason: unverified beyond "A's hooks are present in the published bytes, A's own classes were
-  re-rewritten, and no fault appeared on a game thread".
+  `Camera.calculateFov(F)F -> [wurst, zoomify]`, in both orders. ~~**Scope of that evidence:** it proves
+  both payloads' hooks are woven into the published method, not that the method executed.~~ **Closed
+  2026-07-26 — see "In a live world" below.** The scope caveat stood until then, and `COMPOSITION` on
+  its own still does not mean "both hooks fired"; it is `tools/world-join-test.sh` that shows that.
+* Payload A still functional after B lands (zoom still zooms; LB UI still renders). — **DONE**, below.
 * Both orders re-run after P4 to confirm duck dispatch survives a growing `ifaceMap`.
+
+#### In a live world (2026-07-26) — `tools/world-join-test.sh`
+
+The structural gap the 2026-07-25 notes flag ("zero world joins across 20 archived session logs") is
+closed. Every co-hooked method needs a world, and a sidecar is only *linked* on first use, so nothing
+before this had ever executed one. `tools/world-join-test.sh` boots one client, injects, drives itself
+into a deterministic superflat creative world with xdotool, and measures.
+
+Three runs, all PASS: `zoomify` alone (single-payload control), `zoomify wurst`, `wurst zoomify`.
+Console output and screenshots for each are in `notes/p5-evidence/`.
+
+**`Camera.calculateFov(F)F`, invoked on the live camera, published bytes, two payloads woven in:**
+
+| held | measured FOV | expected |
+|---|---|---|
+| nothing | 70.0 | vanilla default |
+| Zoomify's key (C) | 17.5 | 70 / 4 — Zoomify `initialZoom: 4` |
+| Wurst's key (V) | 23.333334 | 70 / 3 — Wurst `ZoomOtf` level 3.0 |
+| **both at once** | **5.8333335** | **70 / 12 — the two hooks composing multiplicatively** |
+
+Identical in both injection orders. That number is the whole point: a single `@ModifyReturnValue` from
+each payload, on one method, both running in one invocation. If either had been erased the value would
+be 17.5 or 23.33, not 5.83.
+
+What each piece of evidence is, precisely:
+
+* **VERIFIED — the method executes.** `WorldProbe` (its own `Agent-Class`, read-only) reflectively calls
+  `Camera.calculateFov` / `calculateHudFov` on the live camera from the game thread and gets a float
+  back. Returning at all means the published body linked and ran: no `VerifyError`, `NoClassDefFoundError`,
+  `IllegalAccessError`, `AbstractMethodError`, no duck-dispatch failure.
+* **VERIFIED — the GAME LOOP executes it, not just the probe.** Holding a zoom key changes ~300k of the
+  409,920 viewport pixels (`compare -metric AE -fuzz 5%`); releasing returns the frame to within ~2–4k of
+  the un-zoomed baseline. Nothing but `calculateFov` sets the render FOV. Independently, Wurst's
+  `ZoomOtf.changeFovBasedOnZoom` writes `Options.sensitivity` (0.5 → 0.1667 while zooming, 0.5 after
+  release) and is reachable *only* from Wurst's `Camera.calculateFov`/`calculateHudFov` mixins.
+* **VERIFIED — `MouseHandler.onScroll(JDD)V`, the other co-hooked target class, executes.** Wheel-up
+  while zooming deepens the zoom: Zoomify 17.5 → 2.30, Wurst 23.33 → 14.49.
+* **VERIFIED — `Hud` (third co-hooked target) renders under both payloads:** Wurst's HUD overlay draws
+  in-world while Zoomify is live (`notes/p5-evidence/04-both-zooms-at-once.png`).
+* **VERIFIED — no linkage failure in world.** The scanner over the post-join window of the client log is
+  empty in all three runs. It is **not** blind: the run ends by attaching `ErrorAgent`, which throws a
+  `NoClassDefFoundError` on the game thread, and the same scanner catches it. A run whose positive
+  control does not fire is reported as a FAIL, because the clean verdict would be worthless.
+* **Attribution.** The single-payload `zoomify` run is the control: same world, same late attach, same
+  numbers (70.0 → 17.5 → 70.0; 306728 px held, 1568 px released; sidecars 21 vs 116 with both payloads).
+  So nothing seen in the two-payload runs is attributable to late attach in general.
+
+Two measurement traps found while building this, both of which would have produced confident nonsense:
+
+* **`pxdiff` needs `-fuzz 5%`.** Under Mesa llvmpipe two frames of an identical scene differ in ~217k of
+  409,920 pixels by a channel step. Raw `AE` scored released-zoom 217216 against held-zoom 381693 — a 1.8x
+  separation that proves nothing. With the fuzz: 1527 vs 307165.
+* **The daylight cycle was running and darkening every successive frame.** The first `zoomify wurst` run
+  failed `BOTH_RELEASE` with 305997 px still differing after release. Diagnosed with a **zero-payload
+  control**: boot, join, wait 150 s, nothing injected — `level.getSkyDarken` 2 → 11 and 358057 of 409920
+  pixels changed. Drift of the same order as the zoom signal, and it would have been read as a payload
+  effect. Root cause: 26.2 renamed the gamerules to snake_case (`advance_time`, not `doDaylightCycle`), so
+  the world's setup commands had been silently rejected in chat, where nothing reaches the log. The harness
+  now issues them every run and asserts `SCENE_FROZEN` (`getSkyDarken` identical between the baseline and
+  the last in-world probe), so a frozen-scene claim can never be assumed again.
+
+Known confound, measured and then removed: Zoomify binds zoom to **C** and Wurst's own keybind system
+binds **C** to Fullbright, so one keypress drove both. Measured harmless (Fullbright is a no-op in a noon
+superflat world — the released frame still returned to within 2398 px of baseline), but the harness now
+strips that binding in preflight, and the `wurst`→`zoomify` run is clean of it.
+
+Still not covered: `Camera.extractRenderState` and `MouseHandler.turnPlayer` are asserted co-hooked and
+run every frame / on every look input, but no assertion isolates *them* specifically. WHOLE-target
+composition remains untested for the reason given under P3.
 
 ---
 

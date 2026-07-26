@@ -8,6 +8,10 @@
 # This exists BEFORE any fix, so later phases have a real pass/fail signal. Today it is expected to FAIL at payload B's
 # ATTACH_ACCEPTED assertion (FullInjectAgent.everInjected refuses a second attach).
 #
+# SCOPE: this harness stops at the TITLE SCREEN. Its COMPOSITION assertion proves both payloads' hooks are WOVEN into
+# one method; it proves nothing about whether that method ever EXECUTES, because every co-hooked method needs a world
+# and a sidecar is only linked on first use. For that, run tools/world-join-test.sh, which actually enters a world.
+#
 # Usage:
 #   tools/multi-payload-test.sh <payloadA> <payloadB>
 #   tools/multi-payload-test.sh zoomify liquidbounce
