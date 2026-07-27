@@ -388,12 +388,104 @@ Known limitations, documented rather than solved:
 
 * Payload A's *added* members live on A's sidecar, not on `target'`, so a mixin in B that injected into
   a method A added would not see it. Two mods hooking each other's additions is not a case we need.
-* **WHOLE targets (UNTESTED).** A target an earlier payload converted WHOLE keeps that payload's members
-  on the class. While it is still unloaded this composes (its baseline becomes that whole output). Once
-  it has loaded, its schema is frozen with those members and no later payload's conversion can be
-  published over it; phase A detects this and skips the target with a warning naming both payloads.
-  **No measured instance of this exists** — every overlapping target in the zoomify×wurst pair is
-  pre-loaded, so this path has never executed. It is defensive code, not tested behaviour.
+* **WHOLE targets published by an EARLIER payload, since loaded (still UNTESTED).** A target an earlier
+  payload converted WHOLE keeps that payload's members on the class. While it is still unloaded this
+  composes (its baseline becomes that whole output). Once it has loaded, its schema is frozen with those
+  members and no later payload's conversion can be published over it; phase A detects this and skips the
+  target with a warning naming both payloads. **No measured instance of this exists** — every overlapping
+  target in the zoomify×wurst pair is pre-loaded, so this path has never executed. It is defensive code,
+  not tested behaviour. (The *single-payload* WHOLE hazard immediately below is a different edge, and that
+  one has now been measured.)
+
+#### WHOLE vs relocated across an INHERITANCE EDGE — measured and fixed, 2026-07-27
+
+The dangerous thing about WHOLE is not that it is a second strategy; it is that the choice is made **per
+target**, so two classes in one inheritance chain can take opposite branches within a *single* payload.
+They are not interchangeable across that edge, and nothing checked it.
+
+**Measured, on LiquidBounce 0.39.0 alone, first entity tick after a world join (VERIFIED):**
+
+```
+java.lang.NoSuchFieldError: Class net.minecraft.client.player.KeyboardInput
+    does not have member field 'net.minecraft.world.entity.player.Input initial'
+  at net.minecraft.client.player.KeyboardInput.modifyExpressionValue$bfb000$modifyInput(...)
+  at net.minecraft.client.player.KeyboardInput.tick -> LocalPlayer.aiStep -> ... -> Minecraft.tick
+```
+
+Every piece of the mechanism, and how each was established:
+
+| | |
+|---|---|
+| `MixinKeyboardInput extends MixinClientInput`; `initial` is declared on the SUPER-mixin and written by `modifyInput` in the SUB-mixin | VERIFIED — `javap -c` on both classes out of the LB jar |
+| `ClientInput` was **converted**: `initial`/`untransformed` relocated to `ClientInput$$Sidecar$liquidbounce$State`, reached through `get$`/`set$` statics | VERIFIED — dumped via `-Dmcgraft.agent.dumpDir` |
+| `KeyboardInput` was **defined WHOLE** | VERIFIED — injection log, `future-loaded targets defined WHOLE (…): [… net/minecraft/client/player/KeyboardInput …]` |
+| the WHOLE bytes carried a raw `PUTFIELD net/minecraft/client/player/KeyboardInput.initial` | VERIFIED — constant pool of the published bytes, `#200 = Fieldref net/minecraft/client/player/KeyboardInput.initial:Lnet/…/Input;` |
+
+**Why the split is not symmetric.** `ClientInput` can *never* be WHOLE whatever its load state: its mixin
+adds the duck interface `ClientInputAddition`, and an added interface disqualifies a target
+(FullInjectAgent, the `addsIface` check) so the value dispatches uniformly. So the relocation side of the
+edge is fixed by construction; only the **subclass** side varies.
+
+**What the variable actually is.** `KeyboardInput` is WHOLE only because it was not loaded when we attached
+— `preLoaded.contains(t) → continue`. Measured at the title screen of a fresh client: unloaded (the preload
+agent reports `FORCE-LOADED`, not `ALREADY-LOADED`). Measured in the crash: reached as
+`LocalPlayer.aiStep → KeyboardInput.tick`. That it is *first* loaded by `LocalPlayer` construction, and so
+that any prior world join in the same JVM would have loaded it, is **INFERRED** from those two facts — it
+was not measured by playing into a world and then attaching. So:
+
+* attach at the title screen of a freshly started client → `KeyboardInput` unloaded → WHOLE → crash on the
+  first tick after joining (VERIFIED, both directions, below);
+* `KeyboardInput` already loaded → converted like any other target, its `PUTFIELD` rewritten by
+  `rewriteRefs`, no crash (VERIFIED via the forced preload; that ordinary play produces the same state is
+  the inferred step).
+
+Established by execution, not by reading. The control runs the **same pre-fix agent jar** (engine
+`f5fd36055ae8`, build `a3ee40e99b3c9add` — the identical build that produced the crash above) and changes
+exactly one thing: `PRELOAD_CLASSES=net.minecraft.client.player.KeyboardInput`, which attaches
+`tools/worldprobe/PreloadAgent.java` at the title screen and does `Class.forName` on that one class before
+mc-graft attaches. Measured, A/B on the same build:
+
+| | crash run | + KeyboardInput preloaded |
+|---|---|---|
+| preload agent says | (not run) | `FORCE-LOADED` — i.e. it really was unloaded before |
+| targets defined WHOLE | 31, incl. `KeyboardInput` | 30, `KeyboardInput` **absent** |
+| sidecars eager-defined | 110 | 112 |
+| `NoSuchFieldError` in the client log | 2 | **0** |
+| harness verdict | `RESULT: FAIL` (ticking entity) | `RESULT: PASS`, world reached |
+
+So the pre-fix engine is not broken for LiquidBounce; it is broken for LiquidBounce *injected before the
+JVM has ever built a `LocalPlayer`*. That is why the same build crashes on a fresh client here and did not
+on the user's, and why it is absent from their logs: "how far you had played before injecting" is the whole
+of the variable.
+
+**The fix** is `RetransformConverter.rewriteWholeTarget`: a WHOLE target's references to members ANOTHER
+class relocated are redirected to that class's sidecar, which is exactly what `run()`/`rewriteRefs` already
+does for every *converted* target. `gLookup` walks the superclass chain, so the inheritance edge resolves
+for free once the site is visited; it also searches every payload scope, so the cross-payload form of the
+same edge (a WHOLE target of payload A referencing a member payload B relocated) should be covered by the
+identical code — **INFERRED, no such case exists to measure.** A member the WHOLE class declares itself is
+skipped (JVMS 5.4.3.2: a declaration on the referenced class wins over anything inherited), the same guard
+`LateAttachVerifier.scan` already applied, deliberately identical so the gate cannot flag a site the
+rewriter would not touch. Measured on LB: exactly **2** redirected references, both
+`KeyboardInput.modifyExpressionValue$bfb000$modifyInput` → `set$initial` / `set$untransformed`.
+
+**Verification.** `tools/world-join-test.sh liquidbounce` goes `RESULT: FAIL` (this exact `NoSuchFieldError`,
+ticking entity) on the pre-fix engine and `RESULT: PASS` on the fixed one — world reached, `COHOOKED_EXECUTES`,
+inventory, `SIDECAR_LINKAGE` 234/234, positive control firing. Non-regression, on the same fixed engine:
+`tools/world-join-test.sh zoomify wurst` PASS (FOV 70 → 17.5 / 23.333334 / **5.8333335** with both held,
+identical to the pre-change numbers) and `tools/multi-payload-test.sh` PASS in both orders. Wurst defines 17
+WHOLE targets in that run (Zoomify none) and the redirect changed **nothing** in any of them — zero sites,
+so `rewriteWholeTarget` returns the input array unmodified and those classes are byte-identical to before.
+That is the non-regression evidence and also the limit of it: outside LiquidBounce this code path has no
+measured effect.
+
+**The reason it went unseen is worth more than the fix.** A WHOLE target has no sidecar, no `$State` and no
+schema delta, so it never entered `verifyConversion` — and the residual-reference gate that exists precisely
+to catch "a reference to a member that was relocated off its class" (`REMOVED_FIELD_REF`) was therefore
+never run over the one artifact that had one. WHOLE bytes were also invisible to `-Dmcgraft.agent.dumpDir`,
+because they are returned from the CFT rather than handed to `defineClass`. Both are now closed:
+`LateAttachVerifier.verifyWhole` scans every WHOLE target before publication and fails the gate closed, and
+the dump writes `<target>.whole-in.class` / `.whole-out.class` so the redirect is inspectable offline.
 
 ### P4 — Caller re-adaptation (fixes §1.5)
 

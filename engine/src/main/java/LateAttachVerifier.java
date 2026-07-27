@@ -35,6 +35,23 @@ public final class LateAttachVerifier {
         return localErrors() == before;
     }
 
+    /** A future-loaded target published WHOLE has no sidecar/state and no schema change to check, so it never went
+     *  through {@link #verifyConversion} — which is why a raw reference to a member ANOTHER target relocated could
+     *  reach the JVM unexamined and only surface as a {@code NoSuchFieldError} in gameplay (LiquidBounce's
+     *  {@code KeyboardInput.initial}, inherited from the relocated {@code ClientInput}). What IS checkable is the same
+     *  residual-reference scan every other emitted artifact gets, run over the bytes after
+     *  {@link RetransformConverter#rewriteWholeTarget} has redirected them.
+     *
+     *  <p>{@code droppedIfaces} is deliberately EMPTY: a whole target's duck-interface sites are rewritten later, in
+     *  the CFT, once {@code ifaceMap} is complete, so flagging them here would abort on work that has not happened
+     *  yet. This checks the two classes of residual the rewrite above is responsible for, and no more. */
+    public static boolean verifyWhole(String owner, byte[] whole, Map<String,String[]> removedMethods,
+            Map<String,String[]> removedFields) {
+        int before = localErrors();
+        scan(owner, "whole", whole, removedMethods, removedFields, Map.of());
+        return localErrors() == before;
+    }
+
     public static boolean verifyRetransform(String owner, byte[] actualBaseline, byte[] candidate) {
         int before = localErrors();
         verifySchema(owner, "retransform", actualBaseline, candidate);

@@ -70,6 +70,7 @@ OUT_ROOT="${OUT_ROOT:-/tmp/mcgraft-world}"
 PROBE_JAR="${PROBE_JAR:-$REPO/tools/worldprobe/worldprobe.jar}"
 ERROR_JAR="${ERROR_JAR:-$REPO/tools/worldprobe/erroragent.jar}"
 LINK_JAR="${LINK_JAR:-$REPO/tools/worldprobe/linkprobe.jar}"
+PRELOAD_JAR="${PRELOAD_JAR:-$REPO/tools/worldprobe/preloadagent.jar}"   # force-loads classes before injection (PRELOAD_CLASSES=)
 ATTACH_CP="${ATTACH_CP:-$REPO/tools/worldprobe}"      # dir holding Attach.class
 WORLD_NAME="${WORLD_NAME:-P5Flat}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
@@ -146,19 +147,22 @@ hdr "preflight"
 [ -f "$MC_JAR" ]     || envdie "minecraft client jar not found: $MC_JAR"
 [ -d "$GAME_DIR" ]   || envdie "game dir not found: $GAME_DIR"
 # The probe/attach helpers are tiny single-file agents; build them on demand rather than checking in class files.
-if [ ! -f "$PROBE_JAR" ] || [ ! -f "$ERROR_JAR" ] || [ ! -f "$LINK_JAR" ] || [ ! -f "$ATTACH_CP/Attach.class" ] \
-   || [ "$REPO/tools/worldprobe/LinkProbe.java"  -nt "$LINK_JAR" ] \
-   || [ "$REPO/tools/worldprobe/WorldProbe.java" -nt "$PROBE_JAR" ] \
-   || [ "$REPO/tools/worldprobe/ErrorAgent.java" -nt "$ERROR_JAR" ]; then
+if [ ! -f "$PROBE_JAR" ] || [ ! -f "$ERROR_JAR" ] || [ ! -f "$LINK_JAR" ] || [ ! -f "$PRELOAD_JAR" ] || [ ! -f "$ATTACH_CP/Attach.class" ] \
+   || [ "$REPO/tools/worldprobe/LinkProbe.java"    -nt "$LINK_JAR" ] \
+   || [ "$REPO/tools/worldprobe/WorldProbe.java"   -nt "$PROBE_JAR" ] \
+   || [ "$REPO/tools/worldprobe/PreloadAgent.java" -nt "$PRELOAD_JAR" ] \
+   || [ "$REPO/tools/worldprobe/ErrorAgent.java"   -nt "$ERROR_JAR" ]; then
     say "  building the probe agents in $REPO/tools/worldprobe"
     ( cd "$REPO/tools/worldprobe" \
-      && "${JAVA%/java}/javac" -d . WorldProbe.java ErrorAgent.java LinkProbe.java Attach.java \
+      && "${JAVA%/java}/javac" -d . WorldProbe.java ErrorAgent.java LinkProbe.java PreloadAgent.java Attach.java \
       && printf 'Agent-Class: WorldProbe\nCan-Retransform-Classes: true\n' > manifest.txt \
       && printf 'Agent-Class: ErrorAgent\n' > manifest-err.txt \
       && printf 'Agent-Class: LinkProbe\n' > manifest-link.txt \
+      && printf 'Agent-Class: PreloadAgent\n' > manifest-preload.txt \
       && "${JAVA%/java}/jar" cfm worldprobe.jar manifest.txt WorldProbe*.class \
       && "${JAVA%/java}/jar" cfm erroragent.jar manifest-err.txt ErrorAgent*.class \
-      && "${JAVA%/java}/jar" cfm linkprobe.jar manifest-link.txt LinkProbe*.class ) \
+      && "${JAVA%/java}/jar" cfm linkprobe.jar manifest-link.txt LinkProbe*.class \
+      && "${JAVA%/java}/jar" cfm preloadagent.jar manifest-preload.txt PreloadAgent*.class ) \
       > "$OUT/build-probes.log" 2>&1 || { cat "$OUT/build-probes.log"; envdie "could not build the probe agents"; }
 fi
 [ -f "$PROBE_JAR" ]  || envdie "world probe jar not built: $PROBE_JAR"
@@ -332,6 +336,22 @@ inject_and_assert() {
     if [ -n "$marker" ] && grep -qE "$marker" "$log"; then ok "$slot/BOOTSTRAP_RAN" "entrypoint ran"
     else bad "$slot/BOOTSTRAP_RAN" "no line matching /$marker/"; fi
 }
+
+# PRELOAD_CLASSES=<comma-separated dotted names> — force those classes into the client BEFORE injecting.
+#
+# Whether a mixin target is already loaded at attach decides which of two INCOMPATIBLE publish strategies it gets:
+# loaded -> converted (mixin-added instance fields relocated to $State); not loaded -> defined WHOLE (added members
+# kept on the class). Without this hook that is decided by how far the client happened to have played, so a load-order
+# bug can only be observed by luck. With it, load state is an input.
+#
+#   PRELOAD_CLASSES=net.minecraft.client.player.KeyboardInput tools/world-join-test.sh liquidbounce
+if [ -n "${PRELOAD_CLASSES:-}" ]; then
+    hdr "pre-loading classes (load-order control)"
+    "$JAVA" -cp "$ATTACH_CP" Attach "$MC_PID" "$PRELOAD_JAR" "$PRELOAD_CLASSES" \
+        > "$OUT/preload.log" 2>&1 || envdie "could not attach the preload agent; see $OUT/preload.log"
+    sleep 3
+    grep -E "FORCE-LOADED|ALREADY-LOADED|FAILED" "$HOST_LOG" | sed 's/^/  /' || true
+fi
 
 inject_and_assert A "$A_ID"
 [ -n "$B_ID" ] && inject_and_assert B "$B_ID"
@@ -642,13 +662,25 @@ fi
 # ---- scene stability: did anything OTHER than the payloads change the frame during the run? ---------------------
 hdr "scene stability"
 skyd() { grep -m1 -oE 'level\.getSkyDarken = [0-9]+' "$OUT/probe-$1.txt" 2>/dev/null | grep -oE '[0-9]+$'; }
-LAST_PROBE="31-release-both"; [ -n "$B_ID" ] || LAST_PROBE="21-release-$A_ID"
-[ -f "$OUT/probe-$LAST_PROBE.txt" ] || LAST_PROBE="21-release-${B_ID:-$A_ID}"
-SD0="$(skyd 10-inworld-base)"; SD1="$(skyd "$LAST_PROBE")"
-if [ -n "$SD0" ] && [ "$SD0" = "$SD1" ]; then
-    ok "SCENE_FROZEN" "level.getSkyDarken stayed $SD0 from the baseline frame to $LAST_PROBE — the pixel deltas above are the zoom, not the daylight cycle"
+# The last in-world probe that was actually TAKEN. The zoom probes only exist for a payload with a known zoom key, so
+# naming one unconditionally made this assertion report "0 -> ?" — a hard FAIL — for any payload that has none
+# (LiquidBounce). That is a hole in the harness, not drift in the world, and it must not read as the latter.
+LAST_PROBE=""
+# Ordered so the window still BRACKETS the pixel deltas where zoom probes exist (that is what the assertion is for);
+# 40-inventory is only the fallback for a payload with no zoom key, where there are no pixel deltas to contaminate.
+for cand in 31-release-both "21-release-${B_ID:-$A_ID}" "21-release-$A_ID" 40-inventory; do
+    [ -f "$OUT/probe-$cand.txt" ] && { LAST_PROBE="$cand"; break; }
+done
+SD0="$(skyd 10-inworld-base)"; SD1="${LAST_PROBE:+$(skyd "$LAST_PROBE")}"
+if [ -z "$LAST_PROBE" ]; then
+    skip "SCENE_FROZEN" "no in-world probe after the baseline was taken, so there is nothing to compare against"
+elif [ -n "$SD0" ] && [ "$SD0" = "$SD1" ]; then
+    case "$LAST_PROBE" in
+      40-inventory) ok "SCENE_FROZEN" "level.getSkyDarken stayed $SD0 from the baseline frame to $LAST_PROBE (no zoom probe was taken for this payload, so this brackets the in-world window, not a pixel delta)" ;;
+      *)            ok "SCENE_FROZEN" "level.getSkyDarken stayed $SD0 from the baseline frame to $LAST_PROBE — the pixel deltas above are the zoom, not the daylight cycle" ;;
+    esac
 else
-    bad "SCENE_FROZEN" "level.getSkyDarken moved ${SD0:-?} -> ${SD1:-?} during the run; every pixel delta above is contaminated by world lighting drift"
+    bad "SCENE_FROZEN" "level.getSkyDarken moved ${SD0:-?} -> ${SD1:-?} (baseline -> ${LAST_PROBE}) during the run; every pixel delta above is contaminated by world lighting drift"
 fi
 
 hdr "linkage-failure scan (in-world window only)"

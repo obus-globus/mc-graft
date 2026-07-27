@@ -1471,6 +1471,79 @@ public class RetransformConverter {
         return (n == 0 && e == 0) ? callerBytes : write(c, callerBytes);
     }
 
+    /** Redirect a WHOLE-defined target's references to members that ANOTHER class RELOCATED onto a sidecar.
+     *
+     *  <p>A future-loaded target is published WHOLE: its mixin-added members stay ON the class, so nothing inside it
+     *  needs a sidecar — <em>except</em> a reference to a member of a DIFFERENT target, which may well have taken the
+     *  other path. {@link #run} visits exactly those sites for every CONVERTED target ({@code addedFieldTarget} /
+     *  {@code addedCallTarget}, rewriteRefs); a WHOLE target skips {@code run()} entirely, so until this existed it
+     *  kept the raw reference and resolved it against a class the member is no longer on.
+     *
+     *  <p>The case that bites is an INHERITANCE EDGE, and it is not exotic. LiquidBounce's {@code MixinKeyboardInput
+     *  extends MixinClientInput}, so the woven {@code KeyboardInput.modifyInput} body carries
+     *  {@code PUTFIELD KeyboardInput.initial} — while {@code initial} is a mixin-added field of the SUPERCLASS
+     *  {@code ClientInput}, which adds a duck interface and therefore can never be WHOLE, so its instance fields
+     *  always move to {@code ClientInput$$Sidecar$<payload>$State}. JVMS 5.4.3.2 resolution walks the superclass
+     *  chain, finds {@code initial} on neither class, and throws {@code NoSuchFieldError} the first time that body
+     *  runs. {@link #gLookup} walks the same chain, so the redirect resolves for free; the site only had to be
+     *  VISITED. Measured: LiquidBounce, first entity tick after a world join.
+     *
+     *  <p>Members the WHOLE class DECLARES ITSELF are skipped. Those are its own kept mixin additions (already pruned
+     *  out of GADDED/GFIELD by the agent) and, per JVMS 5.4.3.2/5.4.3.3, a declaration on the referenced class wins
+     *  resolution over anything inherited — so redirecting them would be wrong even if a table still held an
+     *  ancestor's same-signature entry. This is the same guard {@code LateAttachVerifier.scan} applies, deliberately:
+     *  the gate that audits this rewrite must use the identical rule, or it flags sites the rewriter would not touch.
+     *
+     *  <p>{@code sites} collects a {@code from -> to} line per rewrite, for the injection log. */
+    public static byte[] rewriteWholeTarget(byte[] wholeBytes, PayloadScope scope, List<String> sites) {
+        ClassNode c = read(wholeBytes);
+        Set<String> ownFields = keysF(c), ownMethods = keysM(c);
+        int n = 0;
+        for (MethodNode m : c.methods) {
+            if (m.instructions == null) continue;
+            for (AbstractInsnNode p = m.instructions.getFirst(), nx; p != null; p = nx) {
+                nx = p.getNext();
+                if (p instanceof FieldInsnNode fi) {
+                    if (fi.owner.equals(c.name) && ownFields.contains(fi.name + " " + fi.desc)) continue;
+                    String[] gf = gLookup(GFIELD, scope, fi.owner, fi.name, fi.desc);
+                    if (gf == null) continue;
+                    String ot = gf[0], os = gf[1];
+                    if ("S".equals(gf[2])) m.instructions.set(p, new FieldInsnNode(fi.getOpcode(), os, fi.name, fi.desc));
+                    else if (fi.getOpcode() == Opcodes.GETFIELD)
+                        m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "get$" + fi.name, "(L" + ot + ";)" + fi.desc, false));
+                    else if (fi.getOpcode() == Opcodes.PUTFIELD)
+                        m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "set$" + fi.name, "(L" + ot + ";" + fi.desc + ")V", false));
+                    else continue;   // GETSTATIC/PUTSTATIC of an INSTANCE entry: not a form we can lower; leave it for the gate
+                    n++; sites.add(c.name + "." + m.name + ": " + fi.owner + "." + fi.name + " -> " + os);
+                } else if (p instanceof MethodInsnNode mi && mi.getOpcode() != Opcodes.INVOKEINTERFACE) {
+                    if (mi.owner.equals(c.name) && ownMethods.contains(mi.name + " " + mi.desc)) continue;
+                    String[] g = addedCallStatic(scope, mi.owner, mi.name, mi.desc, mi.getOpcode() == Opcodes.INVOKESTATIC);
+                    if (g == null) continue;
+                    String ot = g[0], os = g[1]; boolean gStatic = "1".equals(g[2]);
+                    String nd = eraseIfaceDesc(gStatic ? mi.desc : "(L" + ot + ";" + mi.desc.substring(1));
+                    m.instructions.set(p, new MethodInsnNode(Opcodes.INVOKESTATIC, os, "h$" + mi.name, nd, false));
+                    n++; sites.add(c.name + "." + m.name + ": " + mi.owner + "." + mi.name + " -> " + os);
+                } else if (p instanceof InvokeDynamicInsnNode idn) {
+                    // A lambda inside a woven body can capture a relocated member through a bootstrap Handle, which no
+                    // instruction-level branch above would see. METHOD handles only: a field handle (H_GETFIELD..
+                    // H_PUTSTATIC) has no accessor form to point at, and LateAttachVerifier.inspectConst checks those
+                    // against GFIELD — so one onto a relocated field fails the gate loudly instead of reaching the JVM.
+                    for (int k = 0; k < idn.bsmArgs.length; k++) {
+                        if (!(idn.bsmArgs[k] instanceof Handle h)) continue;
+                        if (h.getOwner().equals(c.name) && ownMethods.contains(h.getName() + " " + h.getDesc())) continue;
+                        String[] g = addedCallStatic(scope, h.getOwner(), h.getName(), h.getDesc(), h.getTag() == Opcodes.H_INVOKESTATIC);
+                        if (g == null) continue;
+                        boolean gStatic = "1".equals(g[2]);
+                        String nd = gStatic ? h.getDesc() : "(L" + g[0] + ";" + h.getDesc().substring(1);
+                        idn.bsmArgs[k] = new Handle(Opcodes.H_INVOKESTATIC, g[1], "h$" + h.getName(), nd, false);
+                        n++; sites.add(c.name + "." + m.name + ": handle " + h.getOwner() + "." + h.getName() + " -> " + g[1]);
+                    }
+                }
+            }
+        }
+        return n == 0 ? wholeBytes : write(c, wholeBytes);
+    }
+
     /** Field.get/set accessor names routed through the $State reflection shim. */
     private static final Set<String> REFLECT_FIELD_OPS = Set.of("get","set","getBoolean","setBoolean","getInt","setInt",
         "getLong","setLong","getFloat","setFloat","getDouble","setDouble","getByte","setByte","getShort","setShort","getChar","setChar");

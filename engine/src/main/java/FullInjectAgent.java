@@ -347,10 +347,21 @@ public class FullInjectAgent {
         int conv=0, eager=0; List<String> skipped=new ArrayList<>();
         LinkedHashMap<String,Conv> pendingConv=new LinkedHashMap<>();
         Map<String,List<String[]>> pendingIfaces=new HashMap<>();
+        List<String> wholeRedirects=new ArrayList<>();
         for (var e : txMap.entrySet()) { String internal = e.getKey(); try {
             byte[] O = e.getValue()[0], X = e.getValue()[1];
             if (wholeTargets.contains(internal)) {   // define the full mixin output at (future) load time — no sidecar/state
-                Conv cw = new Conv(); cw.whole = true; cw.target = X; cw.scope = scope; pendingConv.put(internal, cw); conv++; continue;
+                // ...but its added members are only ITS OWN. A reference to a member some OTHER target relocated onto a
+                // sidecar still has to be redirected, exactly as a converted target's body is — most sharply across an
+                // inheritance edge, where a mixin on a subclass writes a field its superclass's mixin declared and the
+                // superclass took the relocation path. See RetransformConverter.rewriteWholeTarget.
+                Conv cw = new Conv(); cw.whole = true; cw.scope = scope;
+                cw.target = RetransformConverter.rewriteWholeTarget(X, scope, wholeRedirects);
+                // A WHOLE target is handed straight to the JVM, never to defineClass, so -Dmcgraft.agent.dumpDir has
+                // always been blind to it — the one artifact with no offline representation was the one that failed.
+                dump(internal.replace('/','.')+".whole-in", X); dump(internal.replace('/','.')+".whole-out", cw.target);
+                if (!LateAttachVerifier.verifyWhole(internal, cw.target, gadded, gfield)) { skipped.add(internal); continue; }
+                pendingConv.put(internal, cw); conv++; continue;
             }
             RetransformConverter c = new RetransformConverter(scope, internal); RetransformConverter.Result res = c.run(O, X);
             Conv cv = new Conv(); cv.scope=scope; cv.target=res.target; cv.sidecar=res.sidecar; cv.state=c.stateBytes(); cv.sidecarName=res.sidecarName; cv.stateName=c.stateName();
@@ -384,6 +395,13 @@ public class FullInjectAgent {
             throw new IllegalStateException("Late-attach sidecar definition gate failed");
         }
         InjectionLogger.info("converted "+conv+" targets ("+eager+" sidecars eager-defined); ifaceMap="+ifaceMap.size()+" interfaces; skipped="+skipped.size()+(skipped.isEmpty()?"":" "+skipped));
+        // A WHOLE target referencing a member some OTHER target relocated is the failure mode this redirect exists for,
+        // and it is otherwise invisible until the woven body executes. Report it, with a sample, so the count is a live
+        // observable rather than something only a crash reveals.
+        if (!wholeRedirects.isEmpty()) {
+            InjectionLogger.info("whole targets: "+wholeRedirects.size()+" reference(s) to relocated members redirected to sidecars"
+                +" (sample: "+wholeRedirects.subList(0, Math.min(4, wholeRedirects.size()))+")");
+        }
         InjectionLogger.info("type-flow gate: "+TypeFlowGate.cost());
         InjectionLogger.info("ifaceMap keys: " + ifaceMap.keySet());
         for (var ie : ifaceMap.entrySet()) for (String[] impl : ie.getValue())
@@ -848,10 +866,17 @@ public class FullInjectAgent {
     /** define into the app loader with the given PD (matches signer of signed target packages); true on success or
      *  benign already-defined, false on a real ClassFormat/Verify defect. */
     static boolean define(String dotted, byte[] b, ProtectionDomain pd){
-        if (DUMP_DIR != null) try { Path d = Path.of(DUMP_DIR); Files.createDirectories(d); Files.write(d.resolve(dotted+".class"), b); } catch(Throwable ignored){}
+        dump(dotted, b);
         return PLATFORM.defineClass(dotted, b, pd); }
+    /** Write {@code b} to the dump dir under {@code name}.class when -Dmcgraft.agent.dumpDir is set; no-op otherwise. */
+    static void dump(String name, byte[] b){
+        if (DUMP_DIR == null || b == null) return;
+        try { Path d = Path.of(DUMP_DIR); Files.createDirectories(d); Files.write(d.resolve(name+".class"), b); } catch(Throwable ignored){}
+    }
     /** -Dmcgraft.agent.dumpDir=<dir> on the TARGET jvm: write every class the agent defines (sidecar/state/synthetic)
-     *  to <dir> for offline inspection. Diagnostic only; unset by default. */
+     *  to <dir> for offline inspection, plus the WHOLE-target bytes before and after the relocated-member redirect
+     *  ({@code <target>.whole-in.class} / {@code .whole-out.class}) — those are returned from the CFT rather than
+     *  defined, so they were the one emitted artifact with no offline representation. Diagnostic; unset by default. */
     static final String DUMP_DIR = System.getProperty("mcgraft.agent.dumpDir");
     static synchronized boolean defineSynthetics(byte[] cb, ProtectionDomain pd){
         boolean ok=true;
