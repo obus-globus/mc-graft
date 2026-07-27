@@ -1451,6 +1451,20 @@ public class RetransformConverter {
                     n++;
                 } else if (p instanceof MethodInsnNode mi && rewriteReflectSite(m, mi, scopeKey)) {
                     n++;   // route a reflective added-field access (getDeclaredField + Field.get/set) to $State
+                } else if (p instanceof InvokeDynamicInsnNode idn) {
+                    // A method-ref / lambda carries its target as a bootstrap Handle, which NO instruction-level branch
+                    // above can see: an `InvokeDynamicInsnNode` is neither a MethodInsnNode nor a TypeInsnNode.
+                    // rewriteWholeTarget and rewriteRefs both visit these; this method did not, so a `Duck::m` method
+                    // reference — or a `Target::mixinAddedMethod` one — survived every rewrite and reached the JVM
+                    // naming a de-implemented interface / a member that is no longer on that class.
+                    // (docs/liquidbounce-mixin-audit.md H2.)
+                    for (int k = 0; k < idn.bsmArgs.length; k++) {
+                        if (!(idn.bsmArgs[k] instanceof Handle h)) continue;
+                        Handle nh = rewriteCallerHandle(h, ifaceMap, scope, c.name);
+                        if (nh == null) continue;
+                        idn.bsmArgs[k] = nh; n++;
+                        recordCallerIndy(c.name + "." + m.name + ": " + h.getOwner() + "." + h.getName() + " -> " + nh.getOwner());
+                    }
                 }
             }
         }
@@ -1465,10 +1479,65 @@ public class RetransformConverter {
             if (m.instructions != null) for (AbstractInsnNode p = m.instructions.getFirst(); p != null; p = p.getNext()) {
                 if (p instanceof FieldInsnNode fi) { String d = eraseIfaceType(fi.desc); if (!d.equals(fi.desc)) { fi.desc = d; e++; } }
                 else if (p instanceof MethodInsnNode mi) { String d = eraseIfaceDesc(mi.desc); if (!d.equals(mi.desc)) { mi.desc = d; e++; } }
+                else if (p instanceof InvokeDynamicInsnNode idn) {
+                    // Same erasure, on the two places an invokedynamic names a type: its OWN descriptor (which types
+                    // the CAPTURED arguments — including a receiver whose CHECKCAST the collapse above just retyped to
+                    // the implementor) and LambdaMetafactory's instantiatedMethodType argument (which types the
+                    // lambda's parameters). Left naming a de-implemented interface these are DROPPED_INTERFACE_DESCRIPTOR
+                    // residue, and after the bootstrap-Handle rewrite the implementation method's descriptor names the
+                    // implementor — so the two must agree or LambdaMetafactory rejects the call site at link time.
+                    String d = eraseIfaceDesc(idn.desc);
+                    if (!d.equals(idn.desc)) { recordCallerIndy(c.name+"."+m.name+": indy desc "+idn.desc+" -> "+d); idn.desc = d; e++; }
+                    for (int k = 0; k < idn.bsmArgs.length; k++) {
+                        if (!(idn.bsmArgs[k] instanceof Type t)) continue;
+                        Type et = t.getSort() == Type.METHOD ? Type.getMethodType(eraseIfaceDesc(t.getDescriptor())) : eraseIfaceType(t);
+                        if (!et.getDescriptor().equals(t.getDescriptor())) {
+                            recordCallerIndy(c.name+"."+m.name+": indy bsmArg "+t+" -> "+et); idn.bsmArgs[k] = et; e++; }
+                    }
+                }
             }
             if (m.localVariables != null) for (var lv : m.localVariables) { String d = eraseIfaceType(lv.desc); if (d != null && !d.equals(lv.desc)) { lv.desc = d; lv.signature = null; } }
         }
         return (n == 0 && e == 0) ? callerBytes : write(c, callerBytes);
+    }
+
+    /** Every {@code invokedynamic} bootstrap Handle {@link #rewriteCaller} redirected, {@code from -> to}. This path is
+     *  shared with EVERY payload class, so "adding it changed nothing for LiquidBounce/Wurst/Zoomify" has to be an
+     *  observation, not an assumption — an empty list in the injection log IS that observation. */
+    static final List<String> CALLER_INDY = java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Bounded: this is a log sample, and the transformer keeps running for the life of the JVM. */
+    static void recordCallerIndy(String site) { if (CALLER_INDY.size() < 64) CALLER_INDY.add(site); }
+    public static List<String> callerIndyRewrites() { synchronized (CALLER_INDY) { return List.copyOf(CALLER_INDY); } }
+
+    /** The Handle a bootstrap argument should carry instead, or null to leave it alone.
+     *
+     *  <p>Two shapes, in the order the instruction-level branches above use:
+     *  <ol><li>a handle onto a mixin-ADDED method that was relocated onto a sidecar -> the sidecar's {@code h$} static.
+     *      LambdaMetafactory adapts a captured receiver to a leading static parameter identically to an instance
+     *      receiver, which is what makes the same descriptor surgery {@code rewriteRefs} does legal here.</li>
+     *  <li>a handle onto a method of a DROPPED duck interface, where that interface collapses to one nameable
+     *      implementor -> that implementor's {@code h$} static.</li></ol>
+     *
+     *  <p>A non-collapsible duck handle is deliberately NOT rewritten: there is no receiver-independent target to point
+     *  it at (the collapsed form names one implementor; the trampoline form needs a sidecar this class has none of),
+     *  and {@code DuckDispatch} is a call, not a linkage-time constant. It is left for
+     *  {@code LateAttachVerifier.inspectConst} to fail closed on as {@code BOOTSTRAP_RESIDUAL_REF} — loudly broken
+     *  beats silently broken, which is what it was. */
+    static Handle rewriteCallerHandle(Handle h, Map<String,List<String[]>> ifaceMap, PayloadScope scope, String self) {
+        boolean hStatic = h.getTag() == Opcodes.H_INVOKESTATIC;
+        if (h.getTag() >= Opcodes.H_GETFIELD && h.getTag() <= Opcodes.H_PUTSTATIC) return null;   // field handles: no accessor form to point at
+        if (h.getName().charAt(0) == '<') return null;                                            // <init>/<clinit>: never relocated
+        String[] g = addedCallStatic(scope, h.getOwner(), h.getName(), h.getDesc(), hStatic);
+        if (g != null) {
+            boolean gStatic = "1".equals(g[2]);
+            String nd = gStatic ? h.getDesc() : "(L" + g[0] + ";" + h.getDesc().substring(1);
+            return new Handle(Opcodes.H_INVOKESTATIC, g[1], "h$" + h.getName(), nd, false);
+        }
+        List<String[]> impls = ifaceMap.get(h.getOwner());
+        if (impls == null || !canCollapse(h.getOwner(), impls)) return null;
+        if (descHasUnnameable(h.getDesc(), self)) return null;   // same rule as the INVOKEINTERFACE branch above
+        String[] ts = impls.get(0);
+        return new Handle(Opcodes.H_INVOKESTATIC, ts[1], "h$" + h.getName(), "(L" + ts[0] + ";" + h.getDesc().substring(1), false);
     }
 
     /** Redirect a WHOLE-defined target's references to members that ANOTHER class RELOCATED onto a sidecar.
@@ -1795,6 +1864,84 @@ public class RetransformConverter {
         while(!ifaces.isEmpty()){String c=ifaces.removeFirst();if(!seen.add(c))continue;try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)continue;ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);for(MethodNode m:n.methods)if(m.name.equals(name)&&m.desc.equals(desc))return Optional.of(enforcedOr(c,n.access,name,desc,m.access));ifaces.addAll(n.interfaces);}catch(Throwable ignored){}}
         return Optional.empty();
     }
+    /** Field counterpart of {@link #resolveMethodAccess}: the DECLARER of {@code owner.name:desc} plus the access flags
+     *  the JVM enforces for it. {@link #nonPublicField} answers only "is it non-public" and throws the declarer away,
+     *  but JVMS 5.4.4 is a question about the declarer's PACKAGE and NEST as much as about the flags, so the whole-target
+     *  resolver below needs both. Class chain first, then superinterfaces (JVMS 5.4.3.2 orders C, then C's
+     *  superinterfaces, then C's superclass; the flattened order here differs only for a field hidden by an interface
+     *  constant, which is always {@code public static final} and therefore never denied either way). */
+    static Optional<MethodAccess> resolveFieldAccess(String owner,String name,String desc){
+        return FIELD_ACCESS.computeIfAbsent(owner+'\0'+name+' '+desc,k->{
+            ArrayDeque<String> ifaces=new ArrayDeque<>(); int guard=0;
+            for(String c=owner;c!=null&&guard++<256;){try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)break;
+                ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
+                for(FieldNode f:n.fields)if(f.name.equals(name)&&f.desc.equals(desc)){
+                    Integer enforced=enforcedFieldAccess(c,name,desc);
+                    return Optional.of(new MethodAccess(c,effectiveClassAccess(c,n.access),enforced!=null?enforced:f.access));}
+                ifaces.addAll(n.interfaces);c=n.superName;}catch(Throwable ignored){break;}}
+            HashSet<String> seen=new HashSet<>();
+            while(!ifaces.isEmpty()){String c=ifaces.removeFirst();if(!seen.add(c))continue;try{byte[] b=CLASS_BYTES==null?null:CLASS_BYTES.apply(c);if(b==null)continue;
+                ClassNode n=new ClassNode();new ClassReader(b).accept(n,ClassReader.SKIP_CODE|ClassReader.SKIP_DEBUG|ClassReader.SKIP_FRAMES);
+                for(FieldNode f:n.fields)if(f.name.equals(name)&&f.desc.equals(desc)){
+                    Integer enforced=enforcedFieldAccess(c,name,desc);
+                    return Optional.of(new MethodAccess(c,effectiveClassAccess(c,n.access),enforced!=null?enforced:f.access));}
+                ifaces.addAll(n.interfaces);}catch(Throwable ignored){}}
+            return Optional.<MethodAccess>empty();});
+    }
+    static final java.util.concurrent.ConcurrentHashMap<String,Optional<MethodAccess>> FIELD_ACCESS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // ---- WHOLE-target access lowering (docs/liquidbounce-mixin-audit.md H1) -----------------------------------------
+    // A future-loaded target is published WHOLE, and the argument for exempting it from the AccessWidener lowering was
+    // "it genuinely receives the widened bytes on load". That is true of the members it DECLARES and false of the
+    // members it REFERENCES: an already-loaded class never received the widening at all (retransform cannot change
+    // modifiers), so a woven handler body that touches a widened member of one keeps a raw GETFIELD/INVOKE and throws
+    // IllegalAccessError the first time that instruction executes — the same first-execution failure the sidecar path
+    // has had a lowering for since the access gate was written.
+    //
+    // What a WHOLE target is NOT is a sidecar or a payload class, and neither of those rules can be borrowed:
+    //   * `illegalSidecarMethod` denies EVERY private access, because a sidecar is provably not a nestmate. A WHOLE
+    //     target is the real class, so its own nest is intact — LiquidBounce's 31 WHOLE targets carry 35 non-public
+    //     references and every one is a nestmate access into its own outer class. Borrowing the sidecar rule would
+    //     reflect-lower all 35 for nothing.
+    //   * the payload Resolver's `isPreloadedMc(o) && methodNonPublic(o,n,d)` is inheritance-agnostic, because a
+    //     payload class is (almost) never a subclass of its MC owner. A WHOLE target usually IS one, and lowering a
+    //     `super.protectedMethod()` through AwReflect.inv means Method.invoke, which RE-DISPATCHES VIRTUALLY
+    //     (JLS 15.12.4.4) — i.e. silent infinite recursion. That is hazard H10, and borrowing that rule would have
+    //     instantiated it on this path.
+    // So the rule is JVMS 5.4.4 itself, with the WHOLE class as the accessor: public, or nestmate-private, or
+    // same-package, or protected-and-a-subclass. It is deliberately the SAME predicate
+    // `LateAttachVerifier.accessDenial` uses for the gate that audits this rewrite, minus the places that one has to
+    // answer "cannot disprove it" because it has no live Class to read — here the class bytes answer those.
+    /** Is a reference from {@code accessor} to {@code declarer.member} (flags {@code memberAccess}) denied by
+     *  JVMS 5.4.4? Nest membership is approximated by the top-level class, as the access gate does. */
+    static boolean memberDeniedFrom(String accessor,String declarer,int memberAccess){
+        if((memberAccess&Opcodes.ACC_PUBLIC)!=0)return false;
+        if((memberAccess&Opcodes.ACC_PRIVATE)!=0)return !topLevelOf(declarer).equals(topLevelOf(accessor));
+        if(pkg(declarer).equals(pkg(accessor)))return false;                       // protected and package-private are both fine in-package
+        if((memberAccess&Opcodes.ACC_PROTECTED)!=0)return !isAssignable(accessor,declarer);
+        return true;                                                              // package-private, different package
+    }
+    static String topLevelOf(String internal){int i=internal.indexOf('$');return i<0?internal:internal.substring(0,i);}
+
+    /** The {@link Resolver} for a target being published WHOLE under the internal name {@code whole}. */
+    public static Resolver wholeTargetResolver(String whole){
+        return new Resolver(){
+            public boolean fieldNeedsReflect(String o,String n,String d){
+                if(o.equals(whole))return false;                                   // its own members really do arrive widened
+                if(!typeNameableFrom(o,whole))return true;                         // the OWNER class is unnameable from here
+                var a=resolveFieldAccess(o,n,d);
+                return a.isPresent()&&memberDeniedFrom(whole,a.get().owner(),a.get().memberAccess());
+            }
+            public boolean methodNeedsReflect(String o,String n,String d){
+                if(o.equals(whole))return false;
+                if(!typeNameableFrom(o,whole))return true;
+                var a=METHOD_ACCESS.computeIfAbsent(o+'\0'+n+d,k->resolveMethodAccess(o,n,d));
+                return a.isPresent()&&memberDeniedFrom(whole,a.get().owner(),a.get().memberAccess());
+            }
+            public boolean typeInaccessible(String in){ return !typeNameableFrom(in,whole); }
+        };
+    }
+
     /** The declarer's access as the JVM enforces it: the pre-widener flags when {@code owner} was already loaded (its
      *  widening was inert), the widened bytes otherwise. */
     static MethodAccess enforcedOr(String owner,int ownerAccessFromBytes,String name,String desc,int memberAccessFromBytes){

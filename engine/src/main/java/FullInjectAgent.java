@@ -361,7 +361,9 @@ public class FullInjectAgent {
                 // A WHOLE target is handed straight to the JVM, never to defineClass, so -Dmcgraft.agent.dumpDir has
                 // always been blind to it — the one artifact with no offline representation was the one that failed.
                 dump(internal.replace('/','.')+".whole-in", X); dump(internal.replace('/','.')+".whole-out", cw.target);
-                if (!LateAttachVerifier.verifyWhole(internal, cw.target, gadded, gfield)) { skipped.add(internal); continue; }
+                // droppedIfaces is empty HERE on purpose (ifaceMap is being built by this very loop); the duck-interface
+                // half of this artifact's residual scan runs in finalizeWholeTargets, once the map is complete.
+                if (!LateAttachVerifier.verifyWhole(internal, cw.target, gadded, gfield, Map.of())) { skipped.add(internal); continue; }
                 pendingConv.put(internal, cw); conv++; continue;
             }
             RetransformConverter c = new RetransformConverter(scope, internal); RetransformConverter.Result res = c.run(O, X);
@@ -574,8 +576,12 @@ public class FullInjectAgent {
             else InjectionLogger.warn("keybinding registry class not modifiable; late keybinds may fail");
         }catch(Throwable e){ InjectionLogger.warn("reopenKeyBindings failed (late keybinds may throw): "+rootMsg(e)); }
 
+        finalizeWholeTargets(gadded, gfield);
         verifyMemberAccessGate(inst);
         preflightPayloadClasses(payloadBundle,scope,awRes,gadded,gfield,ifaceMap);
+        if (!RetransformConverter.callerIndyRewrites().isEmpty())
+            InjectionLogger.info("caller invokedynamic: "+RetransformConverter.callerIndyRewrites().size()
+                +" bootstrap handle(s) redirected "+RetransformConverter.callerIndyRewrites());
         // Second contract sweep. The gate above the conversion covers the calls the CONVERTER emitted; the caller
         // rewrite emits its own mcgraft.rt.* call sites (StateReflect), and the preflight just ran it over the whole
         // payload jar, so anything it emitted is recorded by now. Still before any target' is published.
@@ -1258,6 +1264,73 @@ public class FullInjectAgent {
         }
         return b;
     }
+    /** Finish a WHOLE target's bytes, and check the half of them nothing checked, BEFORE anything is published.
+     *
+     *  <p>A target published WHOLE was exempt from three gates on one argument — "it genuinely receives the widened
+     *  bytes on load". That argument is true of the members it DECLARES and false of the members it REFERENCES, and
+     *  the exemption is the same shape that let {@code 540fbc5}'s {@code NoSuchFieldError} through: a WHOLE-only path
+     *  with nothing over it. Two concrete gaps (docs/liquidbounce-mixin-audit.md H1, H2), neither instantiated in
+     *  LiquidBounce or Wurst today:
+     *
+     *  <ul><li><b>H1</b> — no AccessWidener lowering. {@code rewriteWholeTarget} redirects references to members
+     *      another target RELOCATED and nothing else; {@code rewriteFieldAw}/{@code rewriteAwMethodInline} only ever
+     *      ran under {@code rewriteRefs(inSidecar=true)}. A woven handler body touching a widened member of an
+     *      ALREADY-LOADED class (which never received the widening — retransform cannot change modifiers) kept a raw
+     *      GETFIELD/INVOKE and would throw {@code IllegalAccessError} on first execution. Lowered here with
+     *      {@link RetransformConverter#wholeTargetResolver}, whose rule is JVMS 5.4.4 with the WHOLE class as the
+     *      accessor — NOT the sidecar rule (which denies all private access and would reflect-lower LiquidBounce's 35
+     *      harmless nestmate references) and NOT the payload-caller rule (which is inheritance-agnostic and would turn
+     *      {@code super.protectedMethod()} into a virtually re-dispatched {@code Method.invoke}, i.e. hazard H10).</li>
+     *  <li><b>H2</b> — the duck-interface residual checks were never evaluated on WHOLE bytes at all, because the one
+     *      {@code verifyWhole} call passed {@code droppedIfaces = Map.of()}. The map is complete by the time this
+     *      runs, so they are evaluated here, on the bytes as rewritten.</li></ul>
+     *
+     *  <p>Placement: after {@code ifaceMap} is complete and after {@code refreshLoadedAccessState} (so {@code INACC}
+     *  and {@code preLoaded} are as fresh as they get), and before {@code verifyMemberAccessGate}, which now audits
+     *  what this produced. Everything recorded from here is FATAL — this is all pre-publish, so an abort costs a failed
+     *  injection rather than a client that dies on first execution, and {@code 540fbc5} already chose fail-closed for
+     *  {@code verifyWhole}. That is the opposite trade from the caller-path {@code TypeFlowGate}, which is non-fatal
+     *  because rejecting a caller rewrite is worse than the fault it reports; here there is no partial state to be
+     *  worse than.
+     *
+     *  <p>Idempotent, and it has to be: a SECOND payload injecting into the same JVM re-runs this over payload A's
+     *  WHOLE targets with the now-larger {@code ifaceMap}, which is the only pre-publish look B's duck interfaces ever
+     *  get at A's not-yet-loaded targets. Re-running the rewrites finds nothing left to rewrite (the AW lowering has
+     *  already replaced those instructions with {@code AwReflect} calls; the duck collapse has already renamed those
+     *  owners), so the bytes converge. */
+    static void finalizeWholeTargets(Map<String,String[]> gadded, Map<String,String[]> gfield) {
+        int n = 0, lowered = 0;
+        for (var e : convMap.entrySet()) {
+            Conv cv = e.getValue();
+            if (!cv.whole || cv.target == null) continue;
+            String internal = e.getKey();
+            n++;
+            try {
+                byte[] t = cv.target;
+                if (!ifaceMap.isEmpty()) t = RetransformConverter.rewriteCaller(t, ifaceMap, cv.scope);
+                byte[] aw = RetransformConverter.rewritePayloadAw(t, RetransformConverter.wholeTargetResolver(internal));
+                if (aw != t) lowered++;
+                cv.target = t = aw;
+                // `.whole-out` is dumped at STAGING, so it would stop describing the published bytes the moment this
+                // pass existed. Dump what is actually handed to the JVM as well.
+                dump(internal.replace('/','.')+".whole-final", t);
+                LateAttachVerifier.verifyWhole(internal, t, gadded, gfield, ifaceMap);
+                // Type flow, for the same reason the sidecar gets it and FATAL for the same reason: this pass is the
+                // first thing that ever erases a CHECKCAST out of WHOLE bytes (a type the WHOLE class may not name),
+                // and the other half of that erasure — every CONSUMER of the value also accepting an Object — is
+                // exactly what a VerifyError at class load would be. A WHOLE target's VerifyError is unrecoverable:
+                // there is no pristine fallback once the JVM has rejected the bytes we returned.
+                TypeFlowGate.check(internal, "whole", t);
+            } catch (Throwable x) {
+                LateAttachVerifier.error("WHOLE_FINALIZE_FAILURE", internal, "whole", rootMsg(x));
+                InjectionLogger.error("whole finalize fail "+internal+" -> "+rootMsg(x));
+            }
+        }
+        if (n > 0) InjectionLogger.info("whole-target finalize: "+n+" target(s) rewritten against the complete ifaceMap ("
+            +ifaceMap.size()+" dropped interface(s)); "+lowered+" needed AccessWidener lowering for a reference to an"
+            +" already-loaded class");
+    }
+
     /** Pre-publish ACCESS gate — see {@link LateAttachVerifier#verifyMemberAccess}. Checks every member reference the
      *  emitted SIDECAR bytes actually contain against the LIVE class, i.e. the modifiers the JVM will enforce, and
      *  fails the injection before any target is retransformed.
@@ -1284,7 +1357,15 @@ public class FullInjectAgent {
         int mark = LateAttachVerifier.issueMark(), errs0 = LateAttachVerifier.errorCount();
         int loaded0 = inst.getAllLoadedClasses().length;
         for (var e : convMap.entrySet()) { Conv cv = e.getValue();
-            if (cv.whole) continue;   // future-loaded and defined WHOLE: it genuinely receives the widened bytes on load
+            // WHOLE targets used to be skipped here, on the reasoning "it genuinely receives the widened bytes on
+            // load". True of its OWN members; false of its REFERENCES — an already-loaded class it touches never got
+            // the widening, and no rewrite lowered that reference (H1). finalizeWholeTargets now lowers exactly those
+            // sites; this scans what it produced, so the two agree by construction and a site the rewriter declined
+            // (a super-shaped invokespecial, a ctor with no NEW/DUP prologue to lower) is reported rather than
+            // published. The false positives that made scanning a converted target' useless — a record's super() into
+            // protected Record.<init>, a nested record reading its outer class's private fields — are answered by
+            // accessDenial's self==null rules, not by skipping the artifact.
+            if (cv.whole) { LateAttachVerifier.verifyMemberAccess(e.getKey(), "whole", cv.target, live::get); continue; }
             LateAttachVerifier.verifyMemberAccess(e.getKey(), "sidecar", cv.sidecar, live::get);
         }
         List<String> found = LateAttachVerifier.issuesSince(mark);

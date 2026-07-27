@@ -44,13 +44,19 @@ public final class LateAttachVerifier {
      *  residual-reference scan every other emitted artifact gets, run over the bytes after
      *  {@link RetransformConverter#rewriteWholeTarget} has redirected them.
      *
-     *  <p>{@code droppedIfaces} is deliberately EMPTY: a whole target's duck-interface sites are rewritten later, in
-     *  the CFT, once {@code ifaceMap} is complete, so flagging them here would abort on work that has not happened
-     *  yet. This checks the two classes of residual the rewrite above is responsible for, and no more. */
+     *  <p>Called TWICE, with a different {@code droppedIfaces} each time, because the two residual classes become
+     *  checkable at different moments:
+     *  <ul><li>at STAGING, with {@code Map.of()} — {@code ifaceMap} is still being built by the very loop that calls
+     *      this, so flagging a duck-interface site there would abort on work that has not happened yet;</li>
+     *  <li>at FINALIZE ({@code FullInjectAgent.finalizeWholeTargets}), with the complete map, after the duck rewrite
+     *      and the AccessWidener lowering have both run and before anything is published. Passing {@code Map.of()}
+     *      was the ONLY call for the whole path, so {@code DROPPED_INTERFACE_INVOKE/CAST/INSTANCEOF/DESCRIPTOR} and
+     *      {@code BOOTSTRAP_RESIDUAL_REF} were never evaluated on WHOLE bytes at all
+     *      (docs/liquidbounce-mixin-audit.md H2).</li></ul> */
     public static boolean verifyWhole(String owner, byte[] whole, Map<String,String[]> removedMethods,
-            Map<String,String[]> removedFields) {
+            Map<String,String[]> removedFields, Map<String,List<String[]>> droppedIfaces) {
         int before = localErrors();
-        scan(owner, "whole", whole, removedMethods, removedFields, Map.of());
+        scan(owner, "whole", whole, removedMethods, removedFields, droppedIfaces);
         return localErrors() == before;
     }
 

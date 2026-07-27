@@ -217,6 +217,13 @@ done
 # ---- start ONE client -------------------------------------------------------------------------------------------
 hdr "starting client"
 pkill -9 -f "knot.KnotClient" 2>/dev/null; pkill -9 -f jcef_helper 2>/dev/null; pkill -9 -f zenity 2>/dev/null; sleep 4
+# Drop the saved player so every run starts alive at spawn. The inventory step needs SURVIVAL (creative opens a
+# different screen class), and a death there is written into the save — after which every later run joins straight
+# into a DeathScreen, E does nothing, and INVENTORY_OPENED fails for a reason that has nothing to do with the
+# engine. Observed exactly that: two consecutive LiquidBounce runs failed on a fixture poisoned by an earlier one.
+# Deleting the player NBT is deterministic; respawning through the UI is not (the death screen's button is not
+# keyboard-activated). The world itself, its gamerules and its terrain are untouched.
+rm -f "$GAME_DIR/saves/$WORLD_NAME"/players/data/*.dat 2>/dev/null || true
 mkdir -p "$XDG_RT"
 nohup env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u XAUTHORITY DISPLAY="$MC_DISPLAY" XDG_RUNTIME_DIR="$XDG_RT" \
     "$JAVA" -Xmx2G --enable-native-access=ALL-UNNAMED -Djava.awt.headless=false \
@@ -492,8 +499,12 @@ mc_cmd() {
     xdotool type --delay 30 "$1"; sleep 0.8
     xdotool key Return; sleep 1.5
 }
+# Peaceful stops the fixture dying in the first place: the inventory step sits in survival for tens of seconds per
+# pass and the player has no food, so hunger (and any hostile that wandered in) eventually kills it. The saved
+# player is also deleted before launch — see the client-start block — so a death in one run cannot poison the next.
 mc_cmd "/gamerule advance_time false"
 mc_cmd "/gamerule advance_weather false"
+mc_cmd "/difficulty peaceful"
 mc_cmd "/time set 6000"
 mc_cmd "/weather clear"
 mc_cmd "/kill @e[type=!player]"
