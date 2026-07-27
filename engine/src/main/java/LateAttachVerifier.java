@@ -18,6 +18,8 @@ public final class LateAttachVerifier {
     // holder rather than ThreadLocal<Integer>: no boxing, and the single reused array means no per-thread leak growth.
     private static final ThreadLocal<int[]> LOCAL_ERRORS = ThreadLocal.withInitial(() -> new int[1]);
     private static volatile boolean REPORT_STARTED;
+    /** The report file for the CURRENT injection, chosen once and rewritten in place. See {@link #writeReport}. */
+    private static volatile Path REPORT_PATH;
 
     private LateAttachVerifier() {}
 
@@ -77,10 +79,56 @@ public final class LateAttachVerifier {
     }
 
     public static boolean hasErrors() { return errorCount() > 0; }
+
+    /** Targets that ended up with NO hooks from a payload that asked for one: internal name -> "<payload>: <reason>".
+     *  See {@link #inert}. */
+    private static final Map<String,String> INERT = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** A target the payload asked to hook that ended up with NONE of that payload's hooks on it, for the rest of the
+     *  session. This is the one outcome that used to be indistinguishable from success.
+     *
+     *  <p>Every route to it — the retransform of an already-loaded target being refused by JVMTI (a class whose
+     *  {@code <clinit>} already FAILED cannot be retransformed at all), a conversion that could not be published over
+     *  the live class, a WHOLE target that loaded inside the attach window, a sidecar that could not be defined —
+     *  was previously either a bare {@code [WARN]} or a report-only SOFT error. Both harnesses assert on
+     *  {@code [ERROR]} lines in the injection log, so a 1-in-151 dead hook passed every assertion this repo had
+     *  (docs/liquidbounce-mixin-audit.md H3/H11, VERIFIED by execution on `ServerNameResolver`).
+     *
+     *  <p>It stays NON-FATAL on purpose. Most of these fire from the class-file transformer, after the payload has
+     *  bootstrapped on the game thread and 150 other targets are live, where aborting cannot undo anything and would
+     *  only leave the join gate shut; the one that fires earlier (phase A) is a target this payload was never going to
+     *  get, and losing the other 150 over it is strictly worse for the user than one dead hook. Aborting a 151-target
+     *  injection over one is a trade nobody has measured to be worth it, so the choice is to be loud, not to abort.
+     *  The contract is loud-and-continue: an {@code [ERROR]} line the log grep sees,
+     *  an issue in the JSON report the report reader sees, and a distinct {@code inertTargets} count in the report
+     *  summary so a harness does not have to know the code taxonomy.
+     *
+     *  <p>Deliberately NOT this: a mixin target that is simply absent from this installation
+     *  ({@code mixin target not present in this installation}). Nothing was asked for and nothing was lost — mixin
+     *  configs routinely carry compat mixins for optional mods and Mixin itself just skips them. That stays a WARN. */
+    public static void inert(String code, String owner, String payload, String detail) {
+        // Keyed by target, but two payloads can each lose their hooks on the SAME class, so the reasons accumulate
+        // rather than the second overwriting the first.
+        String entry = (payload == null ? "?" : payload) + ": " + detail;
+        INERT.merge(owner, entry, (a, b) -> a.contains(b) ? a : a + " | " + b);
+        InjectionLogger.error("INERT TARGET " + owner + " — payload '" + (payload == null ? "?" : payload)
+            + "' has NO hooks on this class for the rest of this session: " + detail);
+        add("ERROR", code, owner, "target", "", "INERT: payload '" + (payload == null ? "?" : payload)
+            + "' has no hooks on this target this session — " + detail);
+    }
+    /** Targets recorded by {@link #inert}, in insertion-independent name order. */
+    public static java.util.SortedMap<String,String> inertTargets() { return new java.util.TreeMap<>(INERT); }
+    /** True once {@code owner} has been reported inert. Callers on a path that can fire repeatedly for one class (the
+     *  transformer runs again on every retransform attempt) use this so one dead hook is one log line, not N. */
+    public static boolean alreadyInert(String owner) { return INERT.containsKey(owner); }
+
     /** Clear the accumulated issue list so a SECOND injection is gated on its OWN findings. The list is static and was
      *  never reset, so injection A's residue would abort injection B at the conversion gate for reasons that have
      *  nothing to do with B. A's report has already been written by the time this runs. */
-    public static synchronized void reset() { ISSUES.clear(); DEDUP.clear(); LOCAL_ERRORS.get()[0] = 0; }
+    public static synchronized void reset() { ISSUES.clear(); DEDUP.clear(); INERT.clear(); LOCAL_ERRORS.get()[0] = 0;
+        // ...and give injection B its OWN report file. Without this the memoized path from A would be REWRITTEN with
+        // B's (reset) issue list, so the path A's log printed would silently stop describing A.
+        REPORT_PATH = null; }
     public static int issueMark(){ return ISSUES.size(); }
     public static java.util.List<String> issuesSince(int mark){ java.util.List<String> out=new java.util.ArrayList<>();
         for(int i=Math.max(0,mark);i<ISSUES.size();i++){ Issue is=ISSUES.get(i); out.add(is.code()+"/"+is.artifact()+": "+is.message()); } return out; }
@@ -92,7 +140,11 @@ public final class LateAttachVerifier {
         // TARGET_PUBLISH_FAILURE is soft for the same reason: it is only reachable AFTER the payload has bootstrapped
         // on the game thread, so aborting undoes nothing and would only leave the join gate shut. It is still an
         // ERROR line naming every payload involved — see FullInjectAgent.publishFailed.
-        "TARGET_RETRANSFORM_FAILURE", "CALLER_RETRANSFORM_FAILURE", "TRANSFORM_FAILURE", "TARGET_PUBLISH_FAILURE");
+        // TARGET_INERT is soft for the same reason and is argued in full on LateAttachVerifier.inert: one target the
+        // payload cannot have is not worth throwing away the other 150 it can. Soft here means "does not abort"; it
+        // does NOT mean quiet — inert() logs an [ERROR] line and bumps the report's inertTargets count.
+        "TARGET_RETRANSFORM_FAILURE", "CALLER_RETRANSFORM_FAILURE", "TRANSFORM_FAILURE", "TARGET_PUBLISH_FAILURE",
+        "TARGET_INERT");
     /** True only if a FATAL error was recorded (any ERROR whose code is not in {@link #SOFT_ERROR_CODES}). Bootstrap/
      *  activation/gate decisions use this so tolerable residue does not block init or lock the join gate closed. */
     public static boolean hasFatalErrors() { for(Issue i:ISSUES) if(i.severity.equals("ERROR")&&!SOFT_ERROR_CODES.contains(i.code)) return true; return false; }
@@ -384,10 +436,28 @@ public final class LateAttachVerifier {
             // Default: a random-named temp file (createTempFile = O_EXCL + owner-only), not a fixed
             // /tmp/liquidbounce-lateattach-verification-<pid>.json a local attacker could pre-plant a symlink at (the
             // path is printed to the injection log, so a fixed name buys nothing). An explicit override is the caller's.
-            Path out=override==null||override.isBlank()?Files.createTempFile("mcgraft-lateattach-verification-"+ProcessHandle.current().pid()+"-",".json"):Path.of(override);
+            //
+            // MEMOIZED. writeReport() is called again from add() on every new issue, and it used to mint a FRESH
+            // temp file each time — measured: injection B of one zoomify+wurst run printed 48 different
+            // `verification report:` paths. A harness reads the path out of the log (`grep -m1`), so it read the
+            // FIRST file: a snapshot taken at the injection's first issue, containing 1 of the eventual 47. Every
+            // error recorded after that, including every TARGET_RETRANSFORM_FAILURE, landed in a file nothing ever
+            // opened. Reading the JSON report is only worth anything if the path stays put, so it does.
+            Path out=REPORT_PATH;
+            if(out==null){
+                out=override==null||override.isBlank()?Files.createTempFile("mcgraft-lateattach-verification-"+ProcessHandle.current().pid()+"-",".json"):Path.of(override);
+                REPORT_PATH=out;
+            }
             Path tmp=out.resolveSibling(out.getFileName()+".tmp");
-            StringBuilder j=new StringBuilder("{\"schemaVersion\":1,\"status\":\"").append(hasErrors()?"error":"ok").append("\",\"summary\":{\"errors\":").append(errorCount()).append(",\"issues\":").append(ISSUES.size()).append("},\"issues\":[");
+            // schemaVersion 2 adds summary.inertTargets + the `inert` array: the count of targets a payload asked to
+            // hook and did not get. A consumer must not have to know which issue CODES imply a dead hook to answer
+            // "did anything go permanently inert", so the report answers it directly.
+            java.util.SortedMap<String,String> inert=inertTargets();
+            StringBuilder j=new StringBuilder("{\"schemaVersion\":2,\"status\":\"").append(hasErrors()?"error":"ok").append("\",\"summary\":{\"errors\":").append(errorCount()).append(",\"issues\":").append(ISSUES.size()).append(",\"inertTargets\":").append(inert.size()).append("},\"issues\":[");
             for(int i=0;i<ISSUES.size();i++){if(i>0)j.append(',');Issue x=ISSUES.get(i);j.append('{').append(json("severity",x.severity)).append(',').append(json("code",x.code)).append(',').append(json("class",x.owner)).append(',').append(json("artifact",x.artifact)).append(',').append(json("method",x.method)).append(',').append(json("message",x.message)).append('}');}
+            j.append("],\"inert\":[");
+            boolean first=true;
+            for(var e:inert.entrySet()){if(!first)j.append(',');first=false;j.append('{').append(json("class",e.getKey())).append(',').append(json("reason",e.getValue())).append('}');}
             j.append("]}");Files.writeString(tmp,j,StandardCharsets.UTF_8);
             try{Files.move(tmp,out,StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);}
             catch(AtomicMoveNotSupportedException e){Files.move(tmp,out,StandardCopyOption.REPLACE_EXISTING);}

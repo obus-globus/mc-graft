@@ -265,7 +265,39 @@ inject_and_assert() {
         fi
     fi
 
-    # A7 — cross-payload contamination: did this run mention a mixin config that is not this payload's?
+    # A7 — NO TARGET WENT INERT.
+    #
+    # The one outcome that used to be indistinguishable from success. An INERT target is one the payload asked to hook
+    # that ends up carrying NONE of its hooks for the rest of the session: a retransform JVMTI refused (a class whose
+    # <clinit> had already failed is in the erroneous state and answers JVMTI_ERROR_INVALID_CLASS), a conversion that
+    # could not be published over the live class, a WHOLE-staged target that loaded inside the attach window, a sidecar
+    # that could not be defined. Every route to it was a [WARN] and/or a SOFT report entry, so NO_AGENT_ERRORS passed
+    # and the run read as PASS with a dead hook in it (docs/liquidbounce-mixin-audit.md H3, VERIFIED by execution).
+    #
+    # Checked in BOTH channels on purpose, because they fail differently: the log grep catches an inert target the
+    # verifier never recorded, and the report count catches one recorded after the last log line this harness waited
+    # for. (The report path is memoized by the engine, so `grep -m1` above really is the final report — it used to be a
+    # fresh temp file per issue, i.e. a snapshot from the injection's FIRST issue.)
+    #
+    # NOT counted here, and it must stay that way: `mixin target not present in this installation`. Nothing was asked
+    # for and nothing was lost — LiquidBounce skips 6 Sodium/Lithium/ViaVersion targets on every single run.
+    local inert_log inert_rep
+    inert_log="$(grep -cE "INERT TARGET" "$log")"
+    inert_rep=""
+    [ -n "$rep" ] && [ -f "$rep" ] && inert_rep="$(grep -oE '"inertTargets":[0-9]+' "$rep" | head -1 | cut -d: -f2)"
+    if [ "$inert_log" != 0 ]; then
+        bad "$slot/NO_INERT_TARGETS" "$inert_log log line(s) report an inert target:"
+        grep -m2 -E "INERT TARGET" "$log" | cut -c1-220 | sed 's/^/        /'
+    elif [ -z "$inert_rep" ]; then
+        bad "$slot/NO_INERT_TARGETS" "no inertTargets count in the verification report (engine predates it?): ${rep:-<no report>}"
+    elif [ "$inert_rep" != 0 ]; then
+        bad "$slot/NO_INERT_TARGETS" "the report records $inert_rep inert target(s) that no log line named: $rep"
+        grep -oE '"inert":\[.*' "$rep" | cut -c1-300 | sed 's/^/        /'
+    else
+        ok "$slot/NO_INERT_TARGETS" "0 inert targets (injection log and verification report agree)"
+    fi
+
+    # A8 — cross-payload contamination: did this run mention a mixin config that is not this payload's?
     # (the wurst.mixins.json question — see docs/multi-payload.md §1.6)
     local foreign
     foreign="$(grep -oE '[a-z0-9_.-]+\.mixins\.json' "$log" "$HOST_LOG" 2>/dev/null | sed 's/^[^:]*://' | sort -u \
@@ -324,6 +356,16 @@ if grep -iE "A fatal error|Minecraft has crashed|Exception in thread" "$HOST_LOG
 else
     ok "NO_CLIENT_FAULT" "no fatal error on a game thread"
 fi
+# Inert targets, re-checked across BOTH logs after both injections. The per-slot assertion cannot see a target that
+# goes inert later — including one of payload A's that only dies while payload B is being composed onto it.
+LATE_INERT="$(grep -hE "INERT TARGET" "$OUT"/inject-*.log 2>/dev/null)"
+if [ -n "$LATE_INERT" ]; then
+    bad "NO_LATE_INERT_TARGETS" "$(printf '%s\n' "$LATE_INERT" | wc -l) inert-target line(s) across both injection logs:"
+    printf '%s\n' "$LATE_INERT" | head -5 | cut -c1-220 | sed 's/^/        /'
+else
+    ok "NO_LATE_INERT_TARGETS" "no target went inert in either injection"
+fi
+
 if grep -q 'Exception in thread "Attach Listener"' "$HOST_LOG"; then
     say "  [note] the client logged an Attach Listener exception — that is a refused/failed agentmain, see above"
 fi

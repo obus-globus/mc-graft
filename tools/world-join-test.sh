@@ -335,6 +335,46 @@ inject_and_assert() {
 
     if [ -n "$marker" ] && grep -qE "$marker" "$log"; then ok "$slot/BOOTSTRAP_RAN" "entrypoint ran"
     else bad "$slot/BOOTSTRAP_RAN" "no line matching /$marker/"; fi
+
+    # VERIFY_REPORT — the agent's own JSON verification report. This file existed all along and this harness never
+    # looked at it; only tools/multi-payload-test.sh did. A log grep and a report read miss DIFFERENT things (an issue
+    # recorded but never logged vs. a line logged but never recorded), so a harness that runs one of them is running
+    # half the check. The engine memoizes the report path, so the first `verification report:` line is the final file.
+    local rep; rep="$(grep -m1 -oE "verification report: .*" "$log" | sed 's/^verification report: //')"
+    if [ -z "$rep" ] || [ ! -f "$rep" ]; then
+        bad "$slot/VERIFY_REPORT" "no verification report was written"
+    else
+        local status nerr
+        status="$(grep -oE '"status":"[a-z]+"' "$rep" | head -1)"
+        nerr="$(grep -oE '"errors":[0-9]+' "$rep" | head -1)"
+        if [ "$status" = '"status":"ok"' ] && [ "$nerr" = '"errors":0' ]; then ok "$slot/VERIFY_REPORT" "$status $nerr ($rep)"
+        else bad "$slot/VERIFY_REPORT" "$status $nerr ($rep)"; fi
+    fi
+
+    # NO_INERT_TARGETS — a target the payload asked to hook that ends up carrying NONE of its hooks for the rest of
+    # the session (JVMTI refusing to retransform a class whose <clinit> already failed; a conversion that could not be
+    # published; a WHOLE-staged target that loaded inside the attach window; a sidecar that could not be defined).
+    # This is the outcome that used to read as success: every route to it was a [WARN] and/or a SOFT report entry, and
+    # this harness asserted only on [ERROR] lines. Measured: a LiquidBounce run with ServerNameResolver's <clinit>
+    # already failed drops that target and still reported RESULT: PASS (docs/liquidbounce-mixin-audit.md H3).
+    #
+    # `mixin target not present in this installation` is NOT this and is deliberately not counted: nothing was asked
+    # for and nothing was lost. LiquidBounce skips 6 Sodium/Lithium/ViaVersion targets on every run and must still pass.
+    local inert_log inert_rep
+    inert_log="$(grep -cE "INERT TARGET" "$log")"
+    inert_rep=""
+    [ -n "$rep" ] && [ -f "$rep" ] && inert_rep="$(grep -oE '"inertTargets":[0-9]+' "$rep" | head -1 | cut -d: -f2)"
+    if [ "$inert_log" != 0 ]; then
+        bad "$slot/NO_INERT_TARGETS" "$inert_log log line(s) report an inert target:"
+        grep -m2 -E "INERT TARGET" "$log" | cut -c1-220 | sed 's/^/        /'
+    elif [ -z "$inert_rep" ]; then
+        bad "$slot/NO_INERT_TARGETS" "no inertTargets count in the verification report (engine predates it?): ${rep:-<no report>}"
+    elif [ "$inert_rep" != 0 ]; then
+        bad "$slot/NO_INERT_TARGETS" "the report records $inert_rep inert target(s) that no log line named: $rep"
+        grep -oE '"inert":\[.*' "$rep" | cut -c1-300 | sed 's/^/        /'
+    else
+        ok "$slot/NO_INERT_TARGETS" "0 inert targets (injection log and verification report agree)"
+    fi
 }
 
 # PRELOAD_CLASSES=<comma-separated dotted names> — force those classes into the client BEFORE injecting.
@@ -696,6 +736,31 @@ else
 fi
 if kill -0 "$MC_PID" 2>/dev/null; then ok "CLIENT_ALIVE" "pid $MC_PID still running after the whole in-world run"
 else bad "CLIENT_ALIVE" "client died; tail: $(tail -3 "$HOST_LOG" | tr '\n' ' ')"; fi
+
+# ---- inert targets, re-checked after the client actually played -------------------------------------------------
+# The per-injection NO_INERT_TARGETS assertion above structurally cannot see this one. A target staged WHOLE goes
+# inert at the moment its class LOADS, and for a multiplayer / inventory / sign-editing class that is minutes after
+# the injection finished — H11's shape exactly. Same for a publish failure on a class first touched in world. So
+# re-scan every injection log and every verification report now that a world has been joined and an inventory opened.
+hdr "inert targets (re-checked after the world join)"
+LATE_INERT="$(grep -hE "INERT TARGET" "$OUT"/inject-*.log 2>/dev/null)"
+LATE_REP_N=0; LATE_REP_FILES=""
+for f in "$OUT"/inject-*.log; do
+    [ -f "$f" ] || continue
+    r="$(grep -m1 -oE 'verification report: .*' "$f" 2>/dev/null | sed 's/^verification report: //')"
+    [ -n "$r" ] && [ -f "$r" ] || continue
+    n="$(grep -oE '"inertTargets":[0-9]+' "$r" | head -1 | cut -d: -f2)"
+    [ -n "$n" ] || continue
+    LATE_REP_N=$(( LATE_REP_N + n )); LATE_REP_FILES="$LATE_REP_FILES $r"
+done
+if [ -n "$LATE_INERT" ]; then
+    bad "NO_LATE_INERT_TARGETS" "$(printf '%s\n' "$LATE_INERT" | wc -l) inert-target line(s) across the injection logs:"
+    printf '%s\n' "$LATE_INERT" | head -5 | cut -c1-220 | sed 's/^/        /'
+elif [ "$LATE_REP_N" != 0 ]; then
+    bad "NO_LATE_INERT_TARGETS" "the verification report(s) record $LATE_REP_N inert target(s):$LATE_REP_FILES"
+else
+    ok "NO_LATE_INERT_TARGETS" "still 0 inert targets after the world join and the inventory screen"
+fi
 
 # ---- POSITIVE CONTROL -------------------------------------------------------------------------------------------
 # Prove the scanner above is not simply blind. This kills the client, so it is last.

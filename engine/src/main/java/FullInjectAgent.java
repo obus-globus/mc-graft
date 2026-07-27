@@ -294,9 +294,10 @@ public class FullInjectAgent {
             // UNTESTED: no measured instance of this exists; the overlap pairs run so far are all pre-loaded targets.
             String wholeBy = WHOLE_PUBLISHED.get(internal);
             if (wholeBy != null && !wholeBy.equals(scope.key) && loadedMap.containsKey(internal)) {
-                InjectionLogger.warn("target "+internal+" was converted WHOLE by payload '"+wholeBy+"' and has since loaded; "
-                    +"its schema is frozen with that payload's members on it, so '"+scope.id+"' hooks on this target are "
-                    +"inert this session (restart the client and inject '"+scope.id+"' first to get them)");
+                LateAttachVerifier.inert("TARGET_INERT", internal, scope.id,
+                    "an earlier payload ('"+wholeBy+"') converted this target WHOLE and it has since loaded, so its "
+                    +"schema is frozen with that payload's members on it and retransform can neither remove them nor "
+                    +"add ours (restart the client and inject '"+scope.id+"' first to get these hooks)");
                 continue;
             }
             byte[] X = PLATFORM.transform(internal.replace('/','.'), O);
@@ -382,7 +383,11 @@ public class FullInjectAgent {
             LateAttachVerifier.error("RT_CONTRACT_UNRESOLVED", bad, "runtime", "emitted call does not resolve");
             InjectionLogger.error("runtime contract broken: " + bad);
         }
-        if(!phaseFailures.isEmpty()||!skipped.isEmpty()||LateAttachVerifier.hasErrors()){
+        // hasFatalErrors, not hasErrors: this gate exists so a conversion that FAILED never gets partially published,
+        // and a SOFT code is by definition one that must not abort. The only soft code reachable before this line is
+        // TARGET_INERT from the whole-published-by-an-earlier-payload skip above — one dead hook, on a target this
+        // payload was never going to get, must not throw away the other 150 it can still have.
+        if(!phaseFailures.isEmpty()||!skipped.isEmpty()||LateAttachVerifier.hasFatalErrors()){
             LateAttachVerifier.writeReport();
             throw new IllegalStateException("Late-attach conversion gate failed; no partial conversion was published");
         }
@@ -447,7 +452,34 @@ public class FullInjectAgent {
                     // Whole future-loaded target: define the full mixin output, with its references to OTHER (dropped)
                     // targets caller-rewritten. If it somehow already loaded (c!=null), a schema-adding redefine is
                     // illegal — let the JVM keep the pristine class (that mod hook is inert this session).
-                    if (c != null) { InjectionLogger.warn("whole target "+n+" was already loaded; cannot add its mixin members via retransform (inert this session)"); return null; }
+                    // H11: `preLoaded` is snapshotted before staging, but staging + phase A load hundreds of classes,
+                    // so a target can be classified future-loaded, staged WHOLE, and then load inside the attach
+                    // window. The class then loads with NO hooks at all. This used to be a bare [WARN] that was not
+                    // even a verifier issue — weaker signalling than H3, on the same outcome.
+                    if (c != null) {
+                        // Two different situations reach here and only ONE of them is a dead hook:
+                        //
+                        //   PUBLISHED -> the class DID load through this transformer and got the whole bytes. What is
+                        //     happening now is a LATER retransform of it (a second payload's activateLoadedTargets
+                        //     sweeps every convMap target that is loaded), and declining is correct and harmless.
+                        //     MEASURED, because the obvious reading is the opposite one: a member probe over wurst's 7
+                        //     published-WHOLE targets, before and after a second payload injected into the same JVM,
+                        //     returns byte-identical member sets (CreativeModeInventoryScreen 89 members / 7 woven
+                        //     handlers, StatsScreen 53 / 4 incl. the added `wurstOptionsButton` field, ...). The added
+                        //     members survive. Reporting this as inert was a false positive and failed a clean run.
+                        //
+                        //   never PUBLISHED -> the class was defined from its pristine bytes before this transformer
+                        //     existed, so the hooks were never on it. That is H11, and it is reported — but by the
+                        //     sweep in activateLoadedTargets, which asks the same question of EVERY whole target
+                        //     rather than only the ones something happens to retransform.
+                        if (DEBUG && PUBLISHED.containsKey(n))
+                            InjectionLogger.info("whole target "+n+" retransform declined; it keeps the bytes published at load");
+                        else if (!PUBLISHED.containsKey(n) && !LateAttachVerifier.alreadyInert(n))
+                            LateAttachVerifier.inert("TARGET_INERT", n, cv.scope == null ? null : cv.scope.id,
+                                "staged WHOLE as a future-loaded target but the class had already loaded by the time "
+                                + "the transformer saw it; a schema-adding redefine is illegal, so it keeps its "
+                                + "pristine bytes");
+                        return null; }
                     byte[] t = ifaceMap.isEmpty() ? cv.target : RetransformConverter.rewriteCaller(cv.target, ifaceMap, cv.scope);
                     if(connect) t = JoinGateRewriter.rewrite(n, t);
                     byte[] w = awApply(n, t); if (w != null) t = w;
@@ -468,7 +500,9 @@ public class FullInjectAgent {
                         // Future-loaded target (c==null) can hit this AFTER the join gate opened; the JVM then defines the
                         // pristine original with NO the payload hooks, so the feature backing this target is silently inert for the
                         // session. Surface it to the live injection log (not just the verifier report) so it is observable.
-                        InjectionLogger.error("sidecar/state define failed for "+n+" — it will load WITHOUT payload hooks (that feature is inert this session; restart the client to retry)");
+                        LateAttachVerifier.inert("TARGET_INERT", n, cv.scope == null ? null : cv.scope.id,
+                            "the sidecar/$State classes this conversion needs could not be defined, so the class loads "
+                            + "with its pristine bytes (restart the client to retry)");
                         return null;
                     }
                     if (c==null) { byte[] w=awApply(n,t); if(w!=null) t=w; }
@@ -770,8 +804,11 @@ public class FullInjectAgent {
                 +"class ("+detail+"), and there are no previously published bytes to fall back to, so this class reverts "
                 +"to its pre-injection state and EVERY payload's hooks on it are inert this session.");
         }
-        LateAttachVerifier.error("TARGET_PUBLISH_FAILURE", internal, "target",
-            "payload '"+failing+"' could not be published over the live class ("+detail+")"
+        // Whichever branch above ran, the OUTCOME for `failing` is identical and is the one this repo used to be
+        // unable to distinguish from success: that payload has no hooks on this class. Route it through inert() so it
+        // is counted alongside every other way a target dies, not just described in prose above.
+        LateAttachVerifier.inert("TARGET_PUBLISH_FAILURE", internal, failing,
+            "the conversion could not be published over the live class ("+detail+")"
             +(keep!=null ? "; kept previously published bytes, hooks live from ["+live+"]" : "; NO fallback bytes, class reverted"));
         return keep;   // null only when nothing was ever published for this target
     }
@@ -779,6 +816,31 @@ public class FullInjectAgent {
     /** Publish all already-loaded target/caller rewrites from the Minecraft thread after bootstrap readiness. */
     static void activateLoadedTargets(Instrumentation inst) throws Exception {
         long t0=System.nanoTime();
+        // H11 sweep, and the reason it needs its own pass: `preLoaded` is snapshotted BEFORE the payload bundle is
+        // staged, but staging + phase A load hundreds of classes. A target can therefore be classified future-loaded,
+        // staged WHOLE, and then load inside that window — before the transformer that would have given it the whole
+        // bytes was installed. Nothing asks about it again in a single-payload session: it is not in `preLoaded`, so
+        // the retransform below skips it, and it never loads a second time. So it sits there with pristine bytes and
+        // no hooks, and the only reason the audit measured "0 occurrences" is that nothing ever looked.
+        //
+        // Ask directly, and positively: a WHOLE-staged target is inert iff it is loaded now AND we never published
+        // bytes for it. PUBLISHED is written by the transformer at the moment it hands the whole bytes over, so
+        // "loaded but absent from PUBLISHED" means the class was defined from something other than our bytes.
+        int wholeInert = 0, wholeLive = 0;
+        for (Class<?> c : inst.getAllLoadedClasses()) {
+            String in = c.getName().replace('.','/');
+            Conv cv = convMap.get(in);
+            if (cv == null || !cv.whole) continue;
+            if (PUBLISHED.containsKey(in)) { wholeLive++; continue; }
+            wholeInert++;
+            if (!LateAttachVerifier.alreadyInert(in))
+                LateAttachVerifier.inert("TARGET_INERT", in, cv.scope == null ? null : cv.scope.id,
+                    "staged WHOLE as a future-loaded target, but the class had already loaded by the time the "
+                    + "transformer was installed, so it was defined from its pristine bytes and never received the "
+                    + "mixin members");
+        }
+        InjectionLogger.info("whole-target sweep: "+wholeLive+" published WHOLE and loaded, "+wholeInert
+            +" loaded without our bytes (inert)");
         List<Class<?>> targets=new ArrayList<>();
         for (Class<?> c : inst.getAllLoadedClasses()) { String in=c.getName().replace('.','/');
             if (convMap.containsKey(in)&&preLoaded.contains(in)&&!in.equals(JoinGateRewriter.CONNECT_SCREEN)&&inst.isModifiableClass(c)) targets.add(c); }
@@ -790,6 +852,14 @@ public class FullInjectAgent {
         for (Class<?> c : inst.getAllLoadedClasses()) if (preBootstrapPayload.contains(c.getName())&&inst.isModifiableClass(c)) callers.add(c);
         batchRetransform(inst, callers, "caller");
         reportComposition();
+        // State the inert-target count POSITIVELY on every run. An assertion that only ever looks for the absence of a
+        // string cannot tell "nothing went wrong" from "the line was renamed and nobody noticed", so the clean case
+        // gets its own observable. Targets can still go inert AFTER this point (a WHOLE target loading later, a
+        // publish failure on a second payload), which is why the per-target line is the thing harnesses grep for.
+        var inert = LateAttachVerifier.inertTargets();
+        if (inert.isEmpty()) InjectionLogger.info("inert targets: 0 (every target this payload asked for received its hooks)");
+        else InjectionLogger.error("INERT TARGETS: "+inert.size()+" target(s) carry NO hooks from the payload that asked "
+            +"for them and will not until the client is restarted: "+inert.keySet());
         LateAttachVerifier.writeReport();
         // Only a FATAL error aborts here; tolerable per-target/caller residue must not force the join gate closed.
         if(LateAttachVerifier.hasFatalErrors())throw new IllegalStateException("Late-attach verification failed during target activation; see report");
@@ -857,8 +927,22 @@ public class FullInjectAgent {
             int ok=0;
             for (Class<?> c : cs) { String in=c.getName().replace('.','/');
                 try { inst.retransformClasses(c); ok++; }
-                catch (Throwable e) { LateAttachVerifier.error(kind.toUpperCase()+"_RETRANSFORM_FAILURE",in,kind,rootMsg(e));
-                    InjectionLogger.warn("retransform fail "+in+" -> "+rootMsg(e));
+                catch (Throwable e) {
+                    // A TARGET that cannot be retransformed keeps its pre-injection bytes for the rest of the session,
+                    // i.e. that payload's hooks on it are gone. That is the H3 outcome and it must not be a bare
+                    // [WARN] — route it through inert() so it is an [ERROR] line AND a counted inert target.
+                    // (The measured instance: a class whose <clinit> already threw is in the JVM's erroneous state and
+                    // JVMTI answers JVMTI_ERROR_INVALID_CLASS -> "class redefinition failed: invalid class".)
+                    if ("target".equals(kind)) {
+                        Conv cv = convMap.get(in);
+                        LateAttachVerifier.inert("TARGET_RETRANSFORM_FAILURE", in,
+                            cv == null || cv.scope == null ? null : cv.scope.id,
+                            "retransform of the already-loaded class was refused (" + rootMsg(e) + "), so it keeps its "
+                            + "pre-injection bytes");
+                    } else {
+                        LateAttachVerifier.error(kind.toUpperCase()+"_RETRANSFORM_FAILURE",in,kind,rootMsg(e));
+                        InjectionLogger.warn("retransform fail "+in+" -> "+rootMsg(e));
+                    }
                     if("caller".equals(kind)) diagCallerSchema(in); } }
             return ok;
         }
